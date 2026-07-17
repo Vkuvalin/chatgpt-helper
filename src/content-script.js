@@ -1,9 +1,12 @@
-(function initChatGptTemplatesOverlay() {
+(function initChatGptHelperOverlay() {
   "use strict";
 
-  const GLOBAL_KEY = "__chatgptTemplatesOverlayV1__";
-  const HOST_ID = "chatgpt-templates-overlay-root";
-  const TOGGLE_MESSAGE = "chatgpt-templates:toggle-panel";
+  const contract = globalThis.ChatGPTHelperAnalysisContract;
+  const analysisControllerModule = globalThis.ChatGPTHelperAnalysisController;
+  const analysisUiModule = globalThis.ChatGPTHelperAnalysisUi;
+  const GLOBAL_KEY = "__chatgptHelperOverlayV1__";
+  const HOST_ID = "chatgpt-helper-overlay-root";
+  const TOGGLE_MESSAGE = contract.MESSAGE_TYPES.TOGGLE_PANEL;
   const MAX_WALLPAPER_BYTES = 3 * 1024 * 1024;
   const RECENT_HOVER_DELAY_MS = 500;
   const RECENT_CLOSE_DELAY_MS = 120;
@@ -41,6 +44,7 @@
       wallpaperDataUrl: null,
       closePanelAfterRun: true,
       recentTemplatesHoverEnabled: true,
+      analysis: contract.DEFAULT_ANALYSIS_SETTINGS,
     },
     recentTemplateIds: [],
     editing: null,
@@ -51,6 +55,17 @@
     busyTemplateId: null,
     quickBusy: false,
     status: { kind: "", text: "" },
+    glossaryEntries: [],
+    glossarySearch: "",
+    glossaryDeleteMode: false,
+    glossaryConfirmDeleteId: null,
+    glossaryDraggingId: null,
+    keyConfigured: false,
+    shortcutRecording: false,
+    shortcutWarning: "",
+    analysisBusy: false,
+    analysisController: null,
+    analysisUi: null,
     host: null,
     shadow: null,
     shell: null,
@@ -95,7 +110,7 @@
 
   function normalizeSettings(value) {
     const settings = value && typeof value === "object" ? value : {};
-    return {
+    return contract.normalizeAnalysisSettings({
       ...settings,
       theme: VALID_THEMES.has(settings.theme) ? settings.theme : "system",
       wallpaperDataUrl: typeof settings.wallpaperDataUrl === "string" && settings.wallpaperDataUrl.startsWith("data:image/")
@@ -103,7 +118,7 @@
         : null,
       closePanelAfterRun: settings.closePanelAfterRun !== false,
       recentTemplatesHoverEnabled: settings.recentTemplatesHoverEnabled !== false,
-    };
+    });
   }
 
   function normalizeRecentTemplateIds(value) {
@@ -367,6 +382,7 @@
       "  .theme-system { --bg: #17191d; --surface: #22262d; --surface-hover: #2c323b; --text: #edf1f7; --muted: #aab2bf; --border: #3c434e; --accent: #66cfc0; --accent-contrast: #101514; --danger: #ff938c; }",
       "}",
       "@media (prefers-reduced-motion: reduce) { .rail, .quick-action { transition: none; } .recent-popup { animation: none; } }",
+      analysisUiModule.styles(),
     ].join("\n");
   }
 
@@ -377,12 +393,12 @@
       '  <button class="quick-action" type="button" data-action="quick-next" title="Отправить «Далее», если поле пусто" aria-label="Отправить «Далее», если поле пусто">' + ICONS.quick + '</button>',
       '  <button class="panel-opener" type="button" data-action="open-panel" title="Открыть меню шаблонов" aria-label="Открыть меню шаблонов" aria-haspopup="menu" aria-expanded="false">' + ICONS.opener + '</button>',
       '  <div class="recent-popup" role="menu" aria-label="Последние запущенные шаблоны" hidden></div>',
-      '  <nav class="rail" aria-label="Разделы ChatGPT Templates" hidden>',
+      '  <nav class="rail" aria-label="Разделы chatgpt-helper" hidden>',
       '    <button class="rail-button" type="button" data-section="templates" title="Шаблоны" aria-label="Шаблоны">' + ICONS.templates + '</button>',
       '    <button class="rail-button" type="button" data-section="analysis" title="Анализ текста" aria-label="Анализ текста">' + ICONS.analysis + '</button>',
       '    <button class="rail-button" type="button" data-section="settings" title="Настройки" aria-label="Настройки">' + ICONS.settings + '</button>',
       '  </nav>',
-      '  <section class="panel" aria-label="ChatGPT Templates" hidden>',
+      '  <section class="panel" aria-label="chatgpt-helper" hidden>',
       '    <div class="panel-wallpaper" aria-hidden="true"></div>',
       '    <div class="panel-scrim" aria-hidden="true"></div>',
       '    <div class="panel-content">',
@@ -566,7 +582,7 @@
   }
 
   function analysisMarkup() {
-    return '<p class="placeholder">Раздел анализа текста будет добавлен позже.</p>' + statusMarkup();
+    return analysisUiModule.analysisMarkup(state) + statusMarkup();
   }
 
   function settingsMarkup() {
@@ -596,6 +612,7 @@
       '  <input class="file-input" type="file" accept="image/*" data-action="wallpaper">',
       state.settings.wallpaperDataUrl ? '  <button class="button danger" type="button" data-action="remove-wallpaper">Удалить обои</button>' : "",
       '</section>',
+      analysisUiModule.settingsMarkup(state),
       statusMarkup(),
     ].join("");
   }
@@ -610,16 +627,27 @@
 
   function openSection(section) {
     if (!SECTION_TITLES[section]) return;
+    if (section !== "settings" && state.shortcutRecording) {
+      state.shortcutRecording = false;
+      state.analysisController?.setShortcutRecording(false);
+      state.shortcutWarning = "Запись сочетания отменена.";
+    }
     closeRecentPopup();
     state.activeSection = section;
     state.open = true;
     clearStatus();
     renderSection();
+    if (section === "analysis" || section === "settings") void refreshKeyStatus();
   }
 
   function closePanel() {
     closeRecentPopup();
     if (!state.open) return;
+    if (state.shortcutRecording) {
+      state.shortcutRecording = false;
+      state.analysisController?.setShortcutRecording(false);
+      state.shortcutWarning = "Запись сочетания отменена.";
+    }
     state.open = false;
     applyShellState();
   }
@@ -658,6 +686,80 @@
       setStatus("error", error?.message || "Не удалось сохранить настройки.");
       return false;
     }
+  }
+
+  async function refreshKeyStatus() {
+    if (!state.analysisController) return;
+    try {
+      const configured = await state.analysisController.getKeyStatus();
+      updateKeyStatus(configured);
+    } catch (_) {
+      state.keyConfigured = false;
+    }
+  }
+
+  function updateKeyStatus(configured) {
+    if (typeof configured !== "boolean" || state.keyConfigured === configured) return;
+    state.keyConfigured = configured;
+    if (state.open && (state.activeSection === "analysis" || state.activeSection === "settings")) renderSection();
+  }
+
+  function refreshKeyStatusWhenVisible() {
+    if (document.visibilityState === "visible") void refreshKeyStatus();
+  }
+
+  function updateGlossaryEntries(value) {
+    state.glossaryEntries = analysisUiModule.normalizeGlossaryEntries(value);
+    if (state.open && state.activeSection === "analysis") renderSection();
+  }
+
+  function likelyBrowserConflict(shortcut) {
+    if (!shortcut.ctrl || shortcut.alt || shortcut.meta) return false;
+    return new Set(["KeyD", "KeyF", "KeyL", "KeyN", "KeyP", "KeyS", "KeyT", "KeyU"]).has(shortcut.code);
+  }
+
+  function handleShortcutCandidate(validation) {
+    if (!validation?.ok) {
+      state.shortcutWarning = validation?.reason || "Не удалось записать сочетание.";
+      if (state.open && state.activeSection === "settings") renderSection();
+      return;
+    }
+    state.shortcutRecording = false;
+    state.shortcutWarning = likelyBrowserConflict(validation.shortcut)
+      ? "Сочетание сохранено, но может конфликтовать с командой браузера."
+      : "Сочетание сохранено.";
+    void saveSettings({
+      ...state.settings,
+      analysis: { ...state.settings.analysis, shortcut: validation.shortcut },
+    }, state.shortcutWarning);
+  }
+
+  function cancelShortcutRecording() {
+    state.shortcutRecording = false;
+    state.shortcutWarning = "Запись сочетания отменена.";
+    if (state.open && state.activeSection === "settings") renderSection();
+  }
+
+  async function deleteGlossaryEntry(id) {
+    const response = await state.analysisController?.deleteGlossaryEntry(id);
+    if (!response?.ok) {
+      setStatus("error", response?.error?.message || contract.ERROR_MESSAGES.GLOSSARY_STORAGE_FAILED);
+      return;
+    }
+    state.glossaryConfirmDeleteId = null;
+    updateGlossaryEntries(response.glossaryEntries);
+    setStatus("success", "Термин удалён.");
+  }
+
+  async function reorderGlossaryEntries(sourceId, beforeEntryId) {
+    if (!sourceId || sourceId === beforeEntryId || state.glossarySearch) return;
+    const response = await state.analysisController?.moveGlossaryEntry(sourceId, beforeEntryId);
+    if (!response?.ok) {
+      setStatus("error", response?.error?.message || contract.ERROR_MESSAGES.GLOSSARY_STORAGE_FAILED);
+      return;
+    }
+    updateGlossaryEntries(response.glossaryEntries);
+    setStatus("success", "Порядок терминов сохранён.");
   }
 
   async function recordRecentTemplate(id) {
@@ -837,7 +939,54 @@
     const action = actionButton.dataset.action;
     const id = actionButton.dataset.id;
 
-    if (action === "open-panel") {
+    if (action === "open-analysis-options") {
+      await state.analysisController?.openOptions();
+    } else if (action === "record-analysis-shortcut") {
+      state.shortcutRecording = true;
+      state.shortcutWarning = "Нажмите основную клавишу вместе с Ctrl, Shift, Alt или Meta. Esc отменяет запись.";
+      state.analysisController?.setShortcutRecording(true);
+      renderSection();
+    } else if (action === "toggle-analysis-shortcut") {
+      const shortcut = contract.normalizeShortcut(state.settings.analysis?.shortcut);
+      await saveSettings({
+        ...state.settings,
+        analysis: { ...state.settings.analysis, shortcut: { ...shortcut, enabled: !shortcut.enabled } },
+      }, shortcut.enabled ? "Сочетание отключено." : "Сочетание включено.");
+    } else if (action === "reset-analysis-shortcut") {
+      state.shortcutRecording = false;
+      state.analysisController?.setShortcutRecording(false);
+      state.shortcutWarning = "Сочетание сброшено на Ctrl + D.";
+      await saveSettings({
+        ...state.settings,
+        analysis: { ...state.settings.analysis, shortcut: { ...contract.DEFAULT_SHORTCUT } },
+      }, state.shortcutWarning);
+    } else if (action === "reset-analysis-appearance") {
+      await saveSettings({
+        ...state.settings,
+        analysis: {
+          ...state.settings.analysis,
+          termColorMode: contract.DEFAULT_ANALYSIS_SETTINGS.termColorMode,
+          customTermColor: contract.DEFAULT_ANALYSIS_SETTINGS.customTermColor,
+          glossaryTextSize: contract.DEFAULT_ANALYSIS_SETTINGS.glossaryTextSize,
+        },
+      }, "Вид словаря сброшен.");
+    } else if (action === "clear-glossary-search") {
+      state.glossarySearch = "";
+      renderSection();
+      state.body.querySelector('[data-action="glossary-search"]')?.focus();
+    } else if (action === "toggle-glossary-delete-mode") {
+      state.glossaryDeleteMode = !state.glossaryDeleteMode;
+      if (!state.glossaryDeleteMode) state.glossaryConfirmDeleteId = null;
+      renderSection();
+    } else if (action === "ask-glossary-delete") {
+      state.glossaryConfirmDeleteId = id;
+      renderSection();
+    } else if (action === "cancel-glossary-delete") {
+      state.glossaryConfirmDeleteId = null;
+      renderSection();
+    } else if (action === "confirm-glossary-delete") {
+      await deleteGlossaryEntry(id);
+    } else if (action === "open-panel") {
       closeRecentPopup();
       openSection(state.activeSection);
     }
@@ -900,12 +1049,40 @@
       await saveSettings({ ...state.settings, closePanelAfterRun: event.target.checked }, "Настройка запуска сохранена.");
     } else if (action === "recent-templates-hover") {
       await saveSettings({ ...state.settings, recentTemplatesHoverEnabled: event.target.checked }, "Настройка последних шаблонов сохранена.");
+    } else if (action === "analysis-term-color-mode") {
+      await saveSettings({
+        ...state.settings,
+        analysis: { ...state.settings.analysis, termColorMode: event.target.value === "custom" ? "custom" : "theme" },
+      }, "Цвет терминов сохранён.");
+    } else if (action === "analysis-custom-term-color") {
+      await saveSettings({
+        ...state.settings,
+        analysis: { ...state.settings.analysis, customTermColor: event.target.value },
+      }, "Цвет терминов сохранён.");
+    } else if (action === "analysis-text-size") {
+      await saveSettings({
+        ...state.settings,
+        analysis: { ...state.settings.analysis, glossaryTextSize: event.target.value },
+      }, "Размер текста сохранён.");
     } else if (action === "wallpaper") {
       await updateWallpaper(event.target);
     }
   }
 
   function onShadowInput(event) {
+    if (event.target.dataset.action === "analysis-custom-term-color" && /^#[0-9a-f]{6}$/i.test(event.target.value)) {
+      state.body.querySelector(".glossary-preview")?.style.setProperty("--term-color", event.target.value);
+      return;
+    }
+    if (event.target.dataset.action === "glossary-search") {
+      state.glossarySearch = event.target.value;
+      const cursor = event.target.selectionStart;
+      renderSection();
+      const search = state.body.querySelector('[data-action="glossary-search"]');
+      search?.focus();
+      if (Number.isInteger(cursor)) search?.setSelectionRange(cursor, cursor);
+      return;
+    }
     if (!state.editing || !event.target.matches("[data-field]")) return;
     const field = event.target.dataset.field;
     if (field === "name" || field === "content") {
@@ -914,6 +1091,18 @@
   }
 
   function onDragStart(event) {
+    const glossaryHandle = event.target.closest("[data-glossary-drag-id]");
+    if (glossaryHandle) {
+      if (state.glossarySearch) {
+        event.preventDefault();
+        return;
+      }
+      state.glossaryDraggingId = glossaryHandle.dataset.glossaryDragId;
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", state.glossaryDraggingId);
+      glossaryHandle.closest(".glossary-card")?.classList.add("is-dragging");
+      return;
+    }
     const handle = event.target.closest("[data-drag-id]");
     if (!handle) return;
     state.draggingId = handle.dataset.dragId;
@@ -923,17 +1112,36 @@
   }
 
   function onDragEnd(event) {
+    event.target.closest(".glossary-card")?.classList.remove("is-dragging");
+    state.glossaryDraggingId = null;
     event.target.closest(".template-card")?.classList.remove("is-dragging");
     state.draggingId = null;
   }
 
   function onDragOver(event) {
+    if (state.glossaryDraggingId && event.target.closest("[data-glossary-id]")) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      return;
+    }
     if (!state.draggingId || !event.target.closest("[data-template-id]")) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
   }
 
   function onDrop(event) {
+    const glossaryTarget = event.target.closest("[data-glossary-id]");
+    if (glossaryTarget && state.glossaryDraggingId) {
+      event.preventDefault();
+      const sourceId = state.glossaryDraggingId;
+      const cards = Array.from(state.body.querySelectorAll("[data-glossary-id]"));
+      const targetIndex = cards.indexOf(glossaryTarget);
+      const afterTarget = event.clientY > glossaryTarget.getBoundingClientRect().top + glossaryTarget.getBoundingClientRect().height / 2;
+      const beforeEntryId = afterTarget ? (cards[targetIndex + 1]?.dataset.glossaryId || null) : glossaryTarget.dataset.glossaryId;
+      state.glossaryDraggingId = null;
+      void reorderGlossaryEntries(sourceId, beforeEntryId).catch(handleUiError);
+      return;
+    }
     const target = event.target.closest("[data-template-id]");
     if (!target || !state.draggingId) return;
     event.preventDefault();
@@ -963,6 +1171,13 @@
     state.wallpaper = shadow.querySelector(".panel-wallpaper");
     state.title = shadow.querySelector(".panel-title");
     state.body = shadow.querySelector(".panel-body");
+    state.analysisUi = analysisUiModule.create({
+      getShell: function getShell() { return state.shell; },
+      getSettings: function getSettings() { return state.settings; },
+      onOpenOptions: function openAnalysisOptions() { return state.analysisController?.openOptions(); },
+      onReplace: function replaceGlossaryEntry(command) { return state.analysisController?.replaceGlossaryEntry(command); },
+      onGlossaryEntries: updateGlossaryEntries,
+    });
 
     shadow.addEventListener("click", function handleClick(event) { void onShadowClick(event).catch(handleUiError); });
     shadow.addEventListener("change", function handleChange(event) { void onShadowChange(event).catch(handleUiError); });
@@ -984,16 +1199,18 @@
 
   async function loadStorage() {
     try {
-      const stored = await chrome.storage.local.get(["templates", "settings", "recentTemplateIds"]);
+      const stored = await chrome.storage.local.get(["templates", "settings", "recentTemplateIds", "glossaryEntries"]);
       state.templates = normalizeTemplates(stored.templates);
       state.settings = normalizeSettings(stored.settings);
       state.recentTemplateIds = normalizeRecentTemplateIds(stored.recentTemplateIds);
+      state.glossaryEntries = analysisUiModule.normalizeGlossaryEntries(stored.glossaryEntries);
       await chrome.storage.local.set({
         templates: state.templates,
         settings: state.settings,
         recentTemplateIds: state.recentTemplateIds,
       });
       renderSection();
+      await refreshKeyStatus();
     } catch (error) {
       setStatus("error", error?.message || "Не удалось загрузить данные расширения.");
     }
@@ -1010,6 +1227,9 @@
     }
   });
 
+  window.addEventListener("focus", function handleWindowFocus() { void refreshKeyStatus(); });
+  document.addEventListener("visibilitychange", refreshKeyStatusWhenVisible);
+
   chrome.runtime.onMessage.addListener(function handleRuntimeMessage(message, _sender, sendResponse) {
     if (message?.type !== TOGGLE_MESSAGE) return false;
     ensureMounted();
@@ -1023,6 +1243,10 @@
     if (changes.templates) state.templates = normalizeTemplates(changes.templates.newValue);
     if (changes.settings) state.settings = normalizeSettings(changes.settings.newValue);
     if (changes.recentTemplateIds) state.recentTemplateIds = normalizeRecentTemplateIds(changes.recentTemplateIds.newValue);
+    if (changes.glossaryEntries) {
+      state.glossaryDraggingId = null;
+      state.glossaryEntries = analysisUiModule.normalizeGlossaryEntries(changes.glossaryEntries.newValue);
+    }
     closeRecentPopup();
     renderSection();
   });
@@ -1032,5 +1256,24 @@
 
   window[GLOBAL_KEY] = { ensureMounted: ensureMounted };
   ensureMounted();
+  state.analysisController = analysisControllerModule.create({
+    getShortcut: function getShortcut() { return state.settings.analysis?.shortcut; },
+    handleEscapeLayer: function handleEscapeLayer() { return state.analysisUi?.handleEscape() || false; },
+    onShortcutCandidate: handleShortcutCandidate,
+    onShortcutRecordingCancelled: cancelShortcutRecording,
+    onHint: function showAnalysisHint(text) { state.analysisUi?.showHint(text); },
+    onLoading: function showAnalysisLoading() { state.analysisUi?.showLoading(); },
+    onLoadingEnd: function hideAnalysisLoading() { state.analysisUi?.hideLoading(); },
+    onBusyChange: function setAnalysisBusy(value) { state.analysisBusy = value; },
+    onKeyStatusChanged: updateKeyStatus,
+    onError: function showAnalysisError(error) {
+      if (["API_KEY_MISSING", "API_KEY_INVALID"].includes(error?.code)) state.keyConfigured = false;
+      state.analysisUi?.showError(error);
+    },
+    onResult: function showAnalysisResult(response) {
+      if (response.glossaryEntries) updateGlossaryEntries(response.glossaryEntries);
+      state.analysisUi?.showResult(response);
+    },
+  });
   void loadStorage();
 })();

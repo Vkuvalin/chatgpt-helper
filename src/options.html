@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Настройки chatgpt-helper</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="page">
+    <header>
+      <p class="eyebrow">chatgpt-helper</p>
+      <h1>OpenRouter API key</h1>
+      <p class="intro">Ключ хранится только во внутренней базе расширения. После сохранения его нельзя показать или скопировать.</p>
+    </header>
+
+    <section class="card" aria-labelledby="key-title">
+      <h2 id="key-title">Ключ OpenRouter</h2>
+      <div id="status-view" hidden>
+        <div class="configured-row">
+          <span class="mask" aria-label="Сохранённый ключ скрыт">••••••••••••••••</span>
+          <strong>Ключ установлен</strong>
+        </div>
+        <div class="actions">
+          <button type="button" data-action="verify">Проверить ключ</button>
+          <button type="button" data-action="replace">Заменить ключ</button>
+          <button type="button" class="danger" data-action="ask-delete">Удалить ключ</button>
+        </div>
+      </div>
+
+      <form id="key-form" novalidate>
+        <label for="api-key">OpenRouter API key</label>
+        <input id="api-key" name="apiKey" type="password" autocomplete="new-password" minlength="20" maxlength="512" spellcheck="false" required>
+        <div class="actions">
+          <button type="submit" class="primary">Сохранить ключ</button>
+          <button type="button" data-action="cancel-replace" hidden>Отмена</button>
+        </div>
+      </form>
+
+      <div id="delete-confirm" class="inline-confirm" hidden>
+        <span>Удалить сохранённый ключ?</span>
+        <button type="button" data-action="cancel-delete">Нет</button>
+        <button type="button" class="danger" data-action="confirm-delete">Да</button>
+      </div>
+
+      <p id="message" class="message" role="status" aria-live="polite"></p>
+    </section>
+  </main>
+  <script src="analysis-contract.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT Templates",
-  "version": "1.0.2",
-  "description": "Добавляет в ChatGPT оверлей с шаблонами и быстрой отправкой.",
+  "name": "chatgpt-helper",
+  "version": "1.1.0",
+  "description": "Шаблоны, быстрые действия и анализ английских терминов для ChatGPT.",
   "icons": {
     "16": "icons/plan-runner-16.png",
     "32": "icons/plan-runner-32.png",
@@ -10,17 +10,23 @@
     "128": "icons/plan-runner-128.png"
   },
   "permissions": [
-    "storage"
+    "storage",
+    "contextMenus"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
-    "https://chat.openai.com/*"
+    "https://chat.openai.com/*",
+    "https://openrouter.ai/*"
   ],
   "background": {
     "service_worker": "src/service-worker.js"
   },
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": true
+  },
   "action": {
-    "default_title": "Шаблоны ChatGPT",
+    "default_title": "chatgpt-helper",
     "default_icon": {
       "16": "icons/plan-runner-16.png",
       "32": "icons/plan-runner-32.png"
@@ -34,6 +40,9 @@
       ],
       "js": [
         "src/chatgpt-dom.js",
+        "src/analysis-contract.js",
+        "src/analysis-controller.js",
+        "src/analysis-ui.js",
         "src/content-script.js"
       ],
       "run_at": "document_idle"
