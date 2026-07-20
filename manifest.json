@@ -4,10 +4,10 @@
   "version": "1.1.0",
   "description": "Шаблоны, быстрые действия и анализ английских терминов для ChatGPT.",
   "icons": {
-    "16": "icons/plan-runner-16.png",
-    "32": "icons/plan-runner-32.png",
-    "48": "icons/plan-runner-48.png",
-    "128": "icons/plan-runner-128.png"
+    "16": "icons/chatgpt-helper-16.png",
+    "32": "icons/chatgpt-helper-32.png",
+    "48": "icons/chatgpt-helper-48.png",
+    "128": "icons/chatgpt-helper-128.png"
   },
   "permissions": [
     "storage",
@@ -28,8 +28,21 @@
   "action": {
     "default_title": "chatgpt-helper",
     "default_icon": {
-      "16": "icons/plan-runner-16.png",
-      "32": "icons/plan-runner-32.png"
+      "16": "icons/chatgpt-helper-16.png",
+      "32": "icons/chatgpt-helper-32.png",
+      "48": "icons/chatgpt-helper-48.png",
+      "128": "icons/chatgpt-helper-128.png"
+    }
+  },
+  "commands": {
+    "analyze-selection": {
+      "description": "Анализировать выделенный текст"
+    },
+    "save-selection": {
+      "description": "Сохранить выделенный текст"
+    },
+    "normalize-composer": {
+      "description": "Нормализовать пустые строки в поле ввода"
     }
   },
   "content_scripts": [
@@ -39,10 +52,14 @@
         "https://chat.openai.com/*"
       ],
       "js": [
+        "src/workspace-contract.js",
+        "src/conversation-context.js",
+        "src/command-registry.js",
         "src/chatgpt-dom.js",
         "src/analysis-contract.js",
         "src/analysis-controller.js",
         "src/analysis-ui.js",
+        "src/workspace-ui.js",
         "src/content-script.js"
       ],
       "run_at": "document_idle"

@@ -1,7 +1,11 @@
 (function initChatGptTemplateDom() {
   "use strict";
 
-  if (window.ChatGPTTemplateDom?.version === 1) return;
+  if (window.ChatGPTTemplateDom?.version === 6) return;
+
+  const workspaceContract = window.ChatGPTHelperWorkspaceContract;
+  const normalizingComposers = new WeakSet();
+  const writingComposers = new WeakSet();
 
   function visible(element) {
     if (!element?.isConnected) return false;
@@ -26,9 +30,261 @@
     return null;
   }
 
+  const EDITABLE_BLOCK_TAGS = new Set([
+    "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "DIV", "FOOTER", "H1", "H2", "H3", "H4", "H5", "H6",
+    "HEADER", "LI", "MAIN", "NAV", "OL", "P", "PRE", "SECTION", "UL",
+  ]);
+
+  function editableIsBlock(node) {
+    return node?.nodeType === 1 && EDITABLE_BLOCK_TAGS.has(String(node.tagName || "").toUpperCase());
+  }
+
+  function editableIsBreak(node) {
+    return node?.nodeType === 1 && String(node.tagName || "").toUpperCase() === "BR";
+  }
+
+  function editableIsPlaceholderLine(node) {
+    const children = Array.from(node?.childNodes || []);
+    return children.length === 1 && editableIsBreak(children[0]);
+  }
+
+  function editableBoundaryBetween(left, right) {
+    return editableIsBlock(left) || editableIsBlock(right);
+  }
+
+  function editableNodeText(node) {
+    if (!node) return "";
+    if (node.nodeType === 3) return String(node.data ?? node.textContent ?? "");
+    if (editableIsBreak(node)) return "\n";
+    if (editableIsPlaceholderLine(node)) return "";
+    return editableChildrenText(node);
+  }
+
+  function editableChildrenText(container) {
+    const children = Array.from(container?.childNodes || []);
+    let text = "";
+    children.forEach((child, index) => {
+      if (index > 0 && editableBoundaryBetween(children[index - 1], child)) text += "\n";
+      text += editableNodeText(child);
+    });
+    return text;
+  }
+
+  function readEditableText(editor) {
+    return editableIsPlaceholderLine(editor) ? "" : editableChildrenText(editor);
+  }
+
   function readComposerText(composer = findComposer()) {
     if (!composer) return "";
-    return composer.tagName === "TEXTAREA" ? composer.value : composer.innerText || composer.textContent || "";
+    return composer.tagName === "TEXTAREA" ? composer.value : readEditableText(composer);
+  }
+
+  const SELECTION_PARAGRAPH_TAGS = new Set([
+    "BLOCKQUOTE", "H1", "H2", "H3", "H4", "H5", "H6", "P", "PRE",
+  ]);
+  const SELECTION_LINE_BLOCK_TAGS = new Set([
+    "ADDRESS", "ARTICLE", "ASIDE", "DIV", "FOOTER", "HEADER", "MAIN", "NAV", "SECTION",
+  ]);
+
+  function selectionTag(node) {
+    return node?.nodeType === 1 ? String(node.tagName || "").toUpperCase() : "";
+  }
+
+  function selectionIsList(node) {
+    return ["OL", "UL"].includes(selectionTag(node));
+  }
+
+  function selectionIsPlaceholderBlock(node) {
+    const children = Array.from(node?.childNodes || []);
+    return children.length === 1 && selectionTag(children[0]) === "BR";
+  }
+
+  function selectionClosest(node, tagName) {
+    let current = node?.nodeType === 1 ? node : node?.parentNode;
+    while (current) {
+      if (selectionTag(current) === tagName) return current;
+      current = current.parentNode;
+    }
+    return null;
+  }
+
+  function selectionFirstDescendant(node, tagName) {
+    for (const child of Array.from(node?.childNodes || [])) {
+      if (selectionTag(child) === tagName) return child;
+      const nested = selectionFirstDescendant(child, tagName);
+      if (nested) return nested;
+    }
+    return null;
+  }
+
+  function annotateClonedOrderedList(range, fragment) {
+    const sourceList = selectionClosest(range?.startContainer, "OL");
+    const sourceItem = selectionClosest(range?.startContainer, "LI");
+    const clonedList = selectionFirstDescendant(fragment, "OL");
+    if (!sourceList || !sourceItem || !clonedList || sourceItem.parentNode !== sourceList) return;
+    const startValue = Number.parseInt(sourceList.getAttribute?.("start"), 10);
+    let ordinal = Number.isInteger(startValue) ? startValue : 1;
+    for (const item of Array.from(sourceList.childNodes || []).filter((child) => selectionTag(child) === "LI")) {
+      const explicitValue = Number.parseInt(item.getAttribute?.("value"), 10);
+      if (Number.isInteger(explicitValue)) ordinal = explicitValue;
+      if (item === sourceItem) {
+        clonedList.setAttribute?.("start", String(ordinal));
+        return;
+      }
+      ordinal += 1;
+    }
+  }
+
+  function structuredSelectionText(fragment) {
+    let output = "";
+
+    function ensureNewlines(count) {
+      if (!output) return;
+      const match = /\n*$/.exec(output);
+      const present = match ? match[0].length : 0;
+      if (present < count) output += "\n".repeat(count - present);
+    }
+
+    function appendText(value) {
+      output += String(value ?? "")
+        .replace(/\r\n?/g, "\n")
+        .replace(/\u00a0/g, " ")
+        .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "");
+    }
+
+    function walkChildren(container) {
+      Array.from(container?.childNodes || []).forEach(walk);
+    }
+
+    function walkList(list, depth) {
+      const ordered = selectionTag(list) === "OL";
+      const startValue = Number.parseInt(list.getAttribute?.("start"), 10);
+      let ordinal = Number.isInteger(startValue) ? startValue : 1;
+      const items = Array.from(list?.childNodes || []).filter((child) => selectionTag(child) === "LI");
+      items.forEach((item) => {
+        ensureNewlines(output ? 1 : 0);
+        const explicitValue = Number.parseInt(item.getAttribute?.("value"), 10);
+        const markerValue = Number.isInteger(explicitValue) ? explicitValue : ordinal;
+        appendText(`${"  ".repeat(depth)}${ordered ? `${markerValue}.` : "•"} `);
+        let directBlockSeen = false;
+        const nestedLists = [];
+        Array.from(item.childNodes || []).forEach((child) => {
+          if (selectionIsList(child)) {
+            nestedLists.push(child);
+            return;
+          }
+          const tag = selectionTag(child);
+          if (SELECTION_PARAGRAPH_TAGS.has(tag) || SELECTION_LINE_BLOCK_TAGS.has(tag)) {
+            if (directBlockSeen) ensureNewlines(1);
+            if (selectionIsPlaceholderBlock(child)) ensureNewlines(1);
+            else walkChildren(child);
+            directBlockSeen = true;
+            return;
+          }
+          walk(child);
+        });
+        ordinal = markerValue + 1;
+        nestedLists.forEach((nested) => {
+          ensureNewlines(1);
+          walkList(nested, depth + 1);
+        });
+        ensureNewlines(1);
+      });
+    }
+
+    function walk(node) {
+      if (!node) return;
+      if (node.nodeType === 3) {
+        appendText(node.data ?? node.textContent ?? "");
+        return;
+      }
+      const tag = selectionTag(node);
+      if (tag === "BR") {
+        ensureNewlines(1);
+        return;
+      }
+      if (tag === "OL" || tag === "UL") {
+        walkList(node, 0);
+        return;
+      }
+      if (tag === "LI") {
+        walkList({ tagName: "UL", childNodes: [node], getAttribute() { return null; } }, 0);
+        return;
+      }
+      if (tag === "PRE") {
+        ensureNewlines(output ? 2 : 0);
+        appendText(node.textContent || "");
+        ensureNewlines(2);
+        return;
+      }
+      if (SELECTION_PARAGRAPH_TAGS.has(tag)) {
+        ensureNewlines(output ? 2 : 0);
+        if (selectionIsPlaceholderBlock(node)) ensureNewlines(2);
+        else walkChildren(node);
+        ensureNewlines(2);
+        return;
+      }
+      if (SELECTION_LINE_BLOCK_TAGS.has(tag)) {
+        if (selectionIsPlaceholderBlock(node)) {
+          ensureNewlines(output ? 2 : 0);
+          return;
+        }
+        ensureNewlines(output ? 1 : 0);
+        walkChildren(node);
+        ensureNewlines(1);
+        return;
+      }
+      walkChildren(node);
+    }
+
+    walkChildren(fragment);
+    return output.replace(/^\n+|\n+$/g, "");
+  }
+
+  function comparableSelectionText(value) {
+    return adaptLineEndings(value)
+      .replace(/^[\t ]*(?:•|[-*]|\d+[.)])[\t ]+/gm, "")
+      .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function readSelectionText(fallbackValue) {
+    const fallback = workspaceContract?.normalizeSelectedPlainText
+      ? workspaceContract.normalizeSelectedPlainText(fallbackValue)
+      : adaptLineEndings(fallbackValue);
+    try {
+      const selection = window.getSelection?.();
+      if (!selection?.rangeCount) return fallback;
+      const parts = [];
+      for (let index = 0; index < selection.rangeCount; index += 1) {
+        const range = selection.getRangeAt(index);
+        const fragment = range?.cloneContents?.();
+        if (fragment) annotateClonedOrderedList(range, fragment);
+        const text = fragment ? structuredSelectionText(fragment) : adaptLineEndings(range?.toString?.() || "");
+        if (containsMeaningfulText(text)) parts.push(text);
+      }
+      const structured = parts.join("\n");
+      if (!containsMeaningfulText(structured)) return fallback;
+      if (containsMeaningfulText(fallback)
+        && comparableSelectionText(structured) !== comparableSelectionText(fallback)) return fallback;
+      return structured;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function normalizeComposerPlainText(value) {
+    if (workspaceContract?.normalizeComposerPlainText) return workspaceContract.normalizeComposerPlainText(value);
+    if (workspaceContract?.normalizeComposerText) return workspaceContract.normalizeComposerText(value);
+    const text = String(value ?? "");
+    return { text, changed: false, edits: [] };
+  }
+
+  const normalizeComposerText = normalizeComposerPlainText;
+
+  function adaptLineEndings(value) {
+    return String(value ?? "").replace(/\r\n?/g, "\n");
   }
 
   function containsMeaningfulText(text) {
@@ -36,45 +292,191 @@
   }
 
   function comparableText(text) {
-    return String(text || "")
-      .replace(/\r\n?/g, "\n")
-      .replace(/\u00A0/g, " ")
-      .replace(/[\u200B-\u200D\uFEFF]/g, "")
-      .replace(/\n+/g, "\n")
-      .replace(/^\n|\n$/g, "");
+    return adaptLineEndings(text);
   }
 
   function setTextareaValue(textarea, text) {
     const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
     if (setter) setter.call(textarea, text);
     else textarea.value = text;
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
   }
 
   function setEditableValue(editor, text) {
-    editor.focus();
-    const selection = window.getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    selection.removeAllRanges();
-    selection.addRange(range);
+    const fragment = document.createDocumentFragment();
+    adaptLineEndings(text).split("\n").forEach((line) => {
+      const block = document.createElement("p");
+      if (line) block.appendChild(document.createTextNode(line));
+      else block.appendChild(document.createElement("br"));
+      fragment.appendChild(block);
+    });
+    editor.replaceChildren(fragment);
+  }
 
-    let inserted = false;
-    try {
-      inserted = document.execCommand("insertText", false, text);
-    } catch (_) {}
-    if (!inserted) editor.textContent = text;
-
+  function dispatchComposerInput(editor, text) {
     try {
       editor.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+      return true;
     } catch (_) {
-      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      try {
+        editor.dispatchEvent(new Event("input", { bubbles: true }));
+        return true;
+      } catch (_) {
+        return false;
+      }
     }
   }
 
-  function insertComposerText(composer, text) {
-    if (composer.tagName === "TEXTAREA") setTextareaValue(composer, text);
-    else setEditableValue(composer, text);
+  function editablePointOffsetWithin(root, container, offset) {
+    if (!root || !container) return null;
+    if (root === container) {
+      if (root.nodeType === 3) {
+        return Math.max(0, Math.min(String(root.data ?? root.textContent ?? "").length, Number(offset) || 0));
+      }
+      if (editableIsBreak(root) || editableIsPlaceholderLine(root)) return 0;
+      const children = Array.from(root.childNodes || []);
+      const count = Math.max(0, Math.min(children.length, Number(offset) || 0));
+      let total = 0;
+      for (let index = 0; index < count; index += 1) {
+        if (index > 0 && editableBoundaryBetween(children[index - 1], children[index])) total += 1;
+        total += editableNodeText(children[index]).length;
+      }
+      if (count > 0 && count < children.length
+        && editableBoundaryBetween(children[count - 1], children[count])) total += 1;
+      return total;
+    }
+
+    let child = container;
+    while (child && child.parentNode && child.parentNode !== root) child = child.parentNode;
+    if (!child || child.parentNode !== root) return null;
+    const children = Array.from(root.childNodes || []);
+    const index = children.indexOf(child);
+    if (index < 0) return null;
+    const before = editablePointOffsetWithin(root, root, index);
+    const within = editablePointOffsetWithin(child, container, offset);
+    return Number.isInteger(before) && Number.isInteger(within) ? before + within : null;
+  }
+
+  function editablePointOffset(editor, container, offset) {
+    const value = editablePointOffsetWithin(editor, container, offset);
+    if (!Number.isInteger(value)) return null;
+    return Math.max(0, Math.min(readEditableText(editor).length, value));
+  }
+
+  function editableSelectionOffsets(editor) {
+    const selection = window.getSelection?.();
+    if (!selection?.rangeCount) return null;
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return null;
+    const start = editablePointOffset(editor, range.startContainer, range.startOffset);
+    const end = editablePointOffset(editor, range.endContainer, range.endOffset);
+    if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+    return start <= end ? { start, end } : { start: end, end: start };
+  }
+
+  function editablePointForOffset(editor, offsetValue, text) {
+    const lines = adaptLineEndings(text).split("\n");
+    const maximum = lines.join("\n").length;
+    let offset = Math.max(0, Math.min(maximum, Number(offsetValue) || 0));
+    let lineIndex = 0;
+    while (lineIndex < lines.length - 1 && offset > lines[lineIndex].length) {
+      offset -= lines[lineIndex].length + 1;
+      lineIndex += 1;
+    }
+    const line = editor.childNodes?.[lineIndex] || editor;
+    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    let remaining = Math.min(offset, lines[lineIndex]?.length || 0);
+    while (node) {
+      if (remaining <= node.data.length) return { node, offset: remaining };
+      remaining -= node.data.length;
+      node = walker.nextNode();
+    }
+    return { node: line, offset: 0 };
+  }
+
+  function setEditableSelection(editor, startOffset, endOffset, text) {
+    const range = document.createRange();
+    const start = editablePointForOffset(editor, startOffset, text);
+    const end = editablePointForOffset(editor, endOffset, text);
+    try {
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, end.offset);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch (_) {}
+  }
+
+  function replaceComposerText(text, selectionValue) {
+    const composer = findComposer();
+    if (!composer) return { ok: false, error: "Поле ввода ChatGPT не найдено." };
+    if (writingComposers.has(composer)) return { ok: false, busy: true, error: "Поле ввода уже обновляется." };
+    const nextText = adaptLineEndings(text);
+    const currentText = adaptLineEndings(readComposerText(composer));
+    const selection = selectionValue || (composer.tagName === "TEXTAREA"
+      ? {
+        start: Number.isInteger(composer.selectionStart) ? composer.selectionStart : currentText.length,
+        end: Number.isInteger(composer.selectionEnd) ? composer.selectionEnd : currentText.length,
+      }
+      : editableSelectionOffsets(composer) || { start: currentText.length, end: currentText.length });
+    const start = Math.max(0, Math.min(nextText.length, Number(selection.start) || 0));
+    const end = Math.max(start, Math.min(nextText.length, Number(selection.end) || 0));
+    if (currentText === nextText) return { ok: true, changed: false, text: nextText, selection: { start, end } };
+
+    writingComposers.add(composer);
+    try {
+      composer.focus?.();
+      if (composer.tagName === "TEXTAREA") setTextareaValue(composer, nextText);
+      else setEditableValue(composer, nextText);
+      const inputDispatched = dispatchComposerInput(composer, nextText);
+      if (composer.tagName === "TEXTAREA") composer.setSelectionRange?.(start, end);
+      else setEditableSelection(composer, start, end, nextText);
+      return { ok: true, changed: true, inputDispatched, text: nextText, selection: { start, end } };
+    } finally {
+      writingComposers.delete(composer);
+    }
+  }
+
+  function isComposerTarget(target) {
+    const composer = findComposer();
+    return Boolean(composer && target && (target === composer || composer.contains?.(target)));
+  }
+
+  function normalizeComposer(options) {
+    let composer = null;
+    let acquired = false;
+    try {
+      composer = findComposer();
+      if (!composer) return { ok: false, error: "Поле ввода ChatGPT не найдено." };
+      if (options?.requireFocus && !isComposerTarget(document.activeElement)) {
+        return { ok: false, error: "Установите курсор в поле ввода ChatGPT." };
+      }
+      if (normalizingComposers.has(composer)) return { ok: false, busy: true, error: "Нормализация уже выполняется." };
+      normalizingComposers.add(composer);
+      acquired = true;
+      const currentText = readComposerText(composer);
+      const normalized = normalizeComposerPlainText(currentText);
+      if (!normalized.changed) return { ok: true, changed: false, text: currentText, edits: [] };
+
+      let offsets;
+      if (composer.tagName === "TEXTAREA") {
+        offsets = {
+          start: Number.isInteger(composer.selectionStart) ? composer.selectionStart : currentText.length,
+          end: Number.isInteger(composer.selectionEnd) ? composer.selectionEnd : currentText.length,
+        };
+      } else {
+        offsets = editableSelectionOffsets(composer) || { start: currentText.length, end: currentText.length };
+      }
+      const nextStart = workspaceContract.mapOffsetThroughEdits(offsets.start, normalized.edits);
+      const nextEnd = workspaceContract.mapOffsetThroughEdits(offsets.end, normalized.edits);
+      const write = replaceComposerText(normalized.text, { start: nextStart, end: nextEnd });
+      if (!write.ok) return write;
+      return { ok: true, changed: write.changed, text: write.text, edits: normalized.edits };
+    } catch (error) {
+      return { ok: false, error: error?.message || "Не удалось нормализовать пустые строки." };
+    } finally {
+      if (composer && acquired) normalizingComposers.delete(composer);
+    }
   }
 
   function findSendButton(composer) {
@@ -139,23 +541,69 @@
 
   async function insertTemplateText(text) {
     try {
-      const template = String(text ?? "");
-      if (!template.trim()) return { ok: false, error: "Пустой шаблон нельзя вставить." };
+      const template = adaptLineEndings(text);
+      if (!containsMeaningfulText(template)) {
+        return {
+          ok: false, inserted: false, unchanged: false, failed: true,
+          verified: false, verificationFailed: false,
+          sendAttempted: false, sent: false, sendFailed: false,
+          error: "Пустой шаблон нельзя вставить.",
+        };
+      }
 
       const composer = findComposer();
-      if (!composer) return { ok: false, error: "Поле ввода ChatGPT не найдено." };
+      if (!composer) {
+        return {
+          ok: false, inserted: false, unchanged: false, failed: true,
+          verified: false, verificationFailed: false,
+          sendAttempted: false, sent: false, sendFailed: false,
+          error: "Поле ввода ChatGPT не найдено.",
+        };
+      }
 
-      const existingText = readComposerText(composer);
-      const nextText = containsMeaningfulText(existingText)
+      const existingText = adaptLineEndings(readComposerText(composer));
+      const appended = containsMeaningfulText(existingText);
+      const nextText = appended
         ? `${existingText}\n\n${template}`
         : template;
-      insertComposerText(composer, nextText);
-      if (!await confirmComposerText(composer, nextText)) {
-        return { ok: false, error: "Не удалось вставить шаблон в поле ввода." };
+      const write = replaceComposerText(nextText, { start: nextText.length, end: nextText.length });
+      if (!write.ok) {
+        return {
+          ...write,
+          inserted: false,
+          unchanged: false,
+          failed: true,
+          verified: false,
+          verificationFailed: false,
+          sendAttempted: false,
+          sent: false,
+          sendFailed: false,
+        };
       }
-      return { ok: true, text: nextText, appended: containsMeaningfulText(existingText) };
+      const verified = await confirmComposerText(composer, nextText);
+      return {
+        ok: true,
+        inserted: write.changed,
+        unchanged: !write.changed,
+        failed: false,
+        verified,
+        verificationFailed: !verified,
+        sendAttempted: false,
+        sent: false,
+        sendFailed: false,
+        text: nextText,
+        appended,
+        changed: write.changed,
+        inputDispatched: write.inputDispatched,
+        ...(verified ? {} : { error: "Шаблон вставлен, но не удалось подтвердить содержимое." }),
+      };
     } catch (error) {
-      return { ok: false, error: error?.message || "Не удалось вставить шаблон." };
+      return {
+        ok: false, inserted: false, unchanged: false, failed: true,
+        verified: false, verificationFailed: false,
+        sendAttempted: false, sent: false, sendFailed: false,
+        error: error?.message || "Не удалось вставить шаблон.",
+      };
     }
   }
 
@@ -180,29 +628,42 @@
 
   async function executeTemplate(text, autoSend = false) {
     const insertion = await insertTemplateText(text);
-    if (!insertion.ok || !autoSend) return insertion;
+    if (insertion.failed || !autoSend) return insertion;
+    if (!insertion.verified) {
+      return {
+        ...insertion,
+        error: "Шаблон вставлен, но не удалось подтвердить содержимое. Автоотправка не выполнена.",
+      };
+    }
     const sent = await sendCurrentComposer();
-    return sent.ok ? { ...insertion, sent: true } : sent;
+    return {
+      ...insertion,
+      sendAttempted: true,
+      sent: sent.ok === true,
+      sendFailed: sent.ok !== true,
+      ...(sent.ok ? {} : { error: `Шаблон вставлен, но не удалось отправить. ${sent.error || ""}`.trim() }),
+    };
   }
 
   async function executeNextQuickAction() {
     try {
       const state = readComposer();
-      if (!state.ok) return state;
-      if (!state.empty) return { ok: true, noop: true };
-
-      const insertion = await insertTemplateText("Далее");
-      if (!insertion.ok) return insertion;
-      const sent = await sendCurrentComposer();
-      return sent.ok ? { ok: true, sent: true } : sent;
+      if (state.ok && !state.empty) return { ok: true, noop: true };
+      return executeTemplate("Далее", true);
     } catch (error) {
       return { ok: false, error: error?.message || "Не удалось выполнить быстрое действие." };
     }
   }
 
   window.ChatGPTTemplateDom = {
-    version: 1,
+    version: 6,
     readComposer,
+    readSelectionText,
+    normalizeComposerPlainText,
+    normalizeComposerText,
+    normalizeComposer,
+    isComposerTarget,
+    replaceComposerText,
     insertTemplateText,
     sendCurrentComposer,
     executeTemplate,

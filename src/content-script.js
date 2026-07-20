@@ -2,18 +2,23 @@
   "use strict";
 
   const contract = globalThis.ChatGPTHelperAnalysisContract;
+  const workspaceContract = globalThis.ChatGPTHelperWorkspaceContract;
+  const conversationContextModule = globalThis.ChatGPTHelperConversationContext;
+  const commandRegistry = globalThis.ChatGPTHelperCommandRegistry;
   const analysisControllerModule = globalThis.ChatGPTHelperAnalysisController;
   const analysisUiModule = globalThis.ChatGPTHelperAnalysisUi;
+  const workspaceUiModule = globalThis.ChatGPTHelperWorkspaceUi;
+  const chatGptDom = globalThis.ChatGPTTemplateDom;
   const GLOBAL_KEY = "__chatgptHelperOverlayV1__";
   const HOST_ID = "chatgpt-helper-overlay-root";
   const TOGGLE_MESSAGE = contract.MESSAGE_TYPES.TOGGLE_PANEL;
-  const MAX_WALLPAPER_BYTES = 3 * 1024 * 1024;
   const RECENT_HOVER_DELAY_MS = 500;
   const RECENT_CLOSE_DELAY_MS = 120;
-  const VALID_THEMES = new Set(["system", "graphite", "navy", "violet", "gold"]);
+  const VALID_THEMES = new Set(workspaceContract.VALID_THEMES);
   const SECTION_TITLES = {
     templates: "Шаблоны",
     analysis: "Анализ текста",
+    saved: "Сохранённое",
     settings: "Настройки",
   };
 
@@ -25,6 +30,7 @@
   const ICONS = {
     templates: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.75h12A2.25 2.25 0 0 1 20.25 6v12A2.25 2.25 0 0 1 18 20.25H6A2.25 2.25 0 0 1 3.75 18V6A2.25 2.25 0 0 1 6 3.75Zm1.5 4.5h9m-9 3.75h9m-9 3.75H13"/></svg>',
     analysis: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.75 19.25V12.5m4.75 6.75V7.75m4.75 11.5v-4.5M19 19.25V4.75"/></svg>',
+    saved: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.75h12A1.25 1.25 0 0 1 19.25 6v13.25L12 16l-7.25 3.25V6A1.25 1.25 0 0 1 6 4.75Z"/></svg>',
     settings: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.25A3.75 3.75 0 1 1 12 15.75 3.75 3.75 0 0 1 12 8.25Zm8 3.75-1.9-1.1.05-.9-1.7-2.95-.8.46-1.56-.9V5.7h-3.4v.91l-1.56.9-.8-.46L6.62 10l.79.46v1.8l-.79.46 1.7 2.95.8-.46 1.56.9v.91h3.4v-.91l1.56-.9.8.46 1.7-2.95-.79-.46v-1.8Z"/></svg>',
     plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
     trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14m-9-3h4l1 3H9l1-3Zm-3 3 1 13h8l1-13M10 10v6m4-6v6"/></svg>',
@@ -39,13 +45,7 @@
     activeSection: "templates",
     open: false,
     templates: [],
-    settings: {
-      theme: "system",
-      wallpaperDataUrl: null,
-      closePanelAfterRun: true,
-      recentTemplatesHoverEnabled: true,
-      analysis: contract.DEFAULT_ANALYSIS_SETTINGS,
-    },
+    settings: workspaceContract.normalizeActiveSettings(),
     recentTemplateIds: [],
     editing: null,
     editorError: "",
@@ -56,13 +56,26 @@
     quickBusy: false,
     status: { kind: "", text: "" },
     glossaryEntries: [],
+    glossaryRequestedMode: "local",
     glossarySearch: "",
     glossaryDeleteMode: false,
     glossaryConfirmDeleteId: null,
     glossaryDraggingId: null,
+    savedEntries: [],
+    savedRequestedMode: "local",
+    savedSearch: "",
+    savedConfirmDeleteId: null,
+    savedDraggingId: null,
+    workspaceContext: null,
+    workspaceStatus: { status: "loading", context: null, errorCode: null, message: null },
+    workspaceClient: null,
+    contextClient: null,
+    glossaryRequestToken: 0,
+    savedRequestToken: 0,
     keyConfigured: false,
-    shortcutRecording: false,
-    shortcutWarning: "",
+    keyChecking: true,
+    sidebarResizing: false,
+    sidebarResizeCleanup: null,
     analysisBusy: false,
     analysisController: null,
     analysisUi: null,
@@ -71,6 +84,7 @@
     shell: null,
     rail: null,
     panel: null,
+    sidebarHandle: null,
     opener: null,
     recentPopup: null,
     recentHoverTimer: null,
@@ -109,16 +123,7 @@
   }
 
   function normalizeSettings(value) {
-    const settings = value && typeof value === "object" ? value : {};
-    return contract.normalizeAnalysisSettings({
-      ...settings,
-      theme: VALID_THEMES.has(settings.theme) ? settings.theme : "system",
-      wallpaperDataUrl: typeof settings.wallpaperDataUrl === "string" && settings.wallpaperDataUrl.startsWith("data:image/")
-        ? settings.wallpaperDataUrl
-        : null,
-      closePanelAfterRun: settings.closePanelAfterRun !== false,
-      recentTemplatesHoverEnabled: settings.recentTemplatesHoverEnabled !== false,
-    });
+    return workspaceContract.normalizeActiveSettings(value);
   }
 
   function normalizeRecentTemplateIds(value) {
@@ -148,6 +153,36 @@
     renderSection();
   }
 
+  function setStatusInPlace(kind, text) {
+    state.status = { kind: kind || "", text: text || "" };
+    const statusView = state.body?.querySelector(".status");
+    if (!statusView) {
+      renderSection();
+      return;
+    }
+    statusView.className = ["status", state.status.kind].filter(Boolean).join(" ");
+    statusView.textContent = state.status.text;
+  }
+
+  function resetCopyFeedback(button) {
+    if (!button) return;
+    clearTimeout(button.copyFeedbackTimer);
+    button.copyFeedbackTimer = null;
+    button.classList.remove("is-copied");
+    button.title = "Скопировать сохранённый текст";
+    button.setAttribute("aria-label", "Скопировать сохранённый текст");
+  }
+
+  function showCopyFeedback(button) {
+    resetCopyFeedback(button);
+    button.classList.add("is-copied");
+    button.title = "Скопировано";
+    button.setAttribute("aria-label", "Скопировано");
+    button.copyFeedbackTimer = setTimeout(function clearCopyFeedback() {
+      if (button.isConnected) resetCopyFeedback(button);
+    }, 1500);
+  }
+
   function clearStatus() {
     state.status = { kind: "", text: "" };
   }
@@ -160,7 +195,7 @@
   function styles() {
     return [
       ":host {",
-      "  --panel-width: min(360px, calc(100vw - 48px));",
+      "  --sidebar-effective-width: 360px;",
       "  --rail-width: 48px;",
       "  all: initial;",
       "  position: fixed;",
@@ -183,22 +218,36 @@
       "  --accent: #167b72;",
       "  --accent-contrast: #ffffff;",
       "  --danger: #b42318;",
+      "  --scrollbar-track: color-mix(in srgb, var(--bg) 85%, transparent);",
+      "  --scrollbar-thumb: color-mix(in srgb, var(--muted) 58%, transparent);",
+      "  --scrollbar-thumb-hover: color-mix(in srgb, var(--muted) 82%, transparent);",
+      "  --scrollbar-corner: var(--bg);",
+      "  --separator-muted: color-mix(in srgb, var(--border) 65%, transparent);",
       "  --shadow: 0 18px 45px rgb(15 23 42 / 24%);",
-      "  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;",
-      "  color: var(--text);",
-      "}",
-      ".theme-graphite { --bg: #15171c; --surface: #1d2129; --surface-hover: #272d37; --text: #e8edf3; --muted: #a7b0bd; --border: #3a414d; --accent: #69d6c5; --accent-contrast: #11161c; --danger: #ff8b82; }",
-      ".theme-navy { --bg: #0b1220; --surface: #111c2e; --surface-hover: #182740; --text: #e5eefc; --muted: #9fb0ca; --border: #2a3c55; --accent: #55b7ff; --accent-contrast: #07111e; --danger: #ff8f8f; }",
-      ".theme-violet { --bg: #14101d; --surface: #20162e; --surface-hover: #2d2040; --text: #f4edff; --muted: #b9aacb; --border: #4d3a67; --accent: #b58cff; --accent-contrast: #160e22; --danger: #ff96a8; }",
-      ".theme-gold { --bg: #0b0b0b; --surface: #202020; --surface-hover: #2b2b2b; --text: #f4f4f0; --muted: #bdb9a6; --border: rgb(219 201 0 / 48%); --accent: rgba(219, 201, 0, 1); --accent-contrast: #090909; --danger: #ff8f85; }",
-      ".rail {",
       "  position: fixed;",
       "  top: 0;",
       "  right: 0;",
       "  bottom: 0;",
+      "  z-index: 2;",
+      "  display: flex;",
+      "  width: var(--sidebar-effective-width);",
+      "  min-width: 0;",
+      "  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;",
+      "  color: var(--text);",
+      "  pointer-events: none;",
+      "}",
+      ".shell.is-open { box-shadow: var(--shadow); }",
+      ".shell.is-resizing, .shell.is-resizing .rail, .shell.is-resizing .panel { transition: none !important; }",
+      ".theme-graphite { --bg: #15171c; --surface: #1d2129; --surface-hover: #272d37; --text: #e8edf3; --muted: #a7b0bd; --border: #3a414d; --accent: #69d6c5; --accent-contrast: #11161c; --danger: #ff8b82; --scrollbar-track: #171a20; --scrollbar-thumb: #596271; --scrollbar-thumb-hover: #778394; --scrollbar-corner: #15171c; --separator-muted: #303641; }",
+      ".theme-navy { --bg: #0b1220; --surface: #111c2e; --surface-hover: #182740; --text: #e5eefc; --muted: #9fb0ca; --border: #2a3c55; --accent: #55b7ff; --accent-contrast: #07111e; --danger: #ff8f8f; --scrollbar-track: #0d1727; --scrollbar-thumb: #425d7c; --scrollbar-thumb-hover: #5f7fa3; --scrollbar-corner: #0b1220; --separator-muted: #22344c; }",
+      ".theme-violet { --bg: #14101d; --surface: #20162e; --surface-hover: #2d2040; --text: #f4edff; --muted: #b9aacb; --border: #4d3a67; --accent: #b58cff; --accent-contrast: #160e22; --danger: #ff96a8; --scrollbar-track: #181121; --scrollbar-thumb: #66517d; --scrollbar-thumb-hover: #8669a4; --scrollbar-corner: #14101d; --separator-muted: #3b2e4d; }",
+      ".theme-gold { --bg: #0b0b0b; --surface: #202020; --surface-hover: #2b2b2b; --text: #f4f4f0; --muted: #bdb9a6; --border: rgb(219 201 0 / 48%); --accent: rgba(219, 201, 0, 1); --accent-contrast: #090909; --danger: #ff8f85; --scrollbar-track: #11110d; --scrollbar-thumb: #746d36; --scrollbar-thumb-hover: #9b9141; --scrollbar-corner: #0b0b0b; --separator-muted: rgb(219 201 0 / 28%); }",
+      ".rail {",
+      "  position: relative;",
       "  z-index: 3;",
       "  display: flex;",
-      "  width: var(--rail-width);",
+      "  height: 100%;",
+      "  flex: 0 0 var(--rail-width);",
       "  padding: 10px 6px;",
       "  flex-direction: column;",
       "  align-items: center;",
@@ -209,9 +258,7 @@
       "  box-shadow: -4px 0 14px rgb(15 23 42 / 10%);",
       "  backdrop-filter: blur(10px);",
       "  pointer-events: auto;",
-      "  transition: right 160ms ease;",
       "}",
-      ".is-open .rail { right: var(--panel-width); }",
       ".icon-button, .rail-button, .compact-button, .quick-action, .panel-opener {",
       "  display: inline-grid;",
       "  place-items: center;",
@@ -229,18 +276,19 @@
       "button:disabled { cursor: wait; opacity: .55; }",
       "svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }",
       ".panel {",
-      "  position: fixed;",
-      "  top: 0;",
-      "  right: 0;",
-      "  bottom: 0;",
+      "  position: relative;",
       "  z-index: 2;",
-      "  width: var(--panel-width);",
+      "  min-width: 0;",
+      "  height: 100%;",
+      "  flex: 1 1 auto;",
       "  overflow: hidden;",
       "  border-left: 1px solid var(--border);",
       "  background: var(--bg);",
-      "  box-shadow: var(--shadow);",
       "  pointer-events: auto;",
       "}",
+      ".panel-resize { position: absolute; top: 0; bottom: 0; left: 0; z-index: 5; width: 10px; cursor: ew-resize; touch-action: none; outline: 0; pointer-events: auto; }",
+      ".panel-resize::after { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: 1px; background: transparent; transition: background 120ms ease; }",
+      ".panel-resize:hover::after, .panel-resize:focus-visible::after, .panel-resize.is-resizing::after { background: var(--accent); }",
       ".panel-wallpaper, .panel-scrim { position: absolute; inset: 0; pointer-events: none; }",
       ".panel-wallpaper { background-position: center; background-size: cover; opacity: .58; }",
       ".panel-scrim { background: color-mix(in srgb, var(--bg) 90%, transparent); }",
@@ -249,6 +297,12 @@
       ".panel-header { display: flex; min-height: 58px; padding: 16px 18px 12px; align-items: center; border-bottom: 1px solid var(--border); }",
       ".panel-title { margin: 0; font-size: 17px; font-weight: 680; letter-spacing: -.01em; }",
       ".panel-body { min-height: 0; overflow: auto; padding: 16px; }",
+      ".panel-body, .recent-popup { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track); scrollbar-gutter: stable; }",
+      ".panel-body::-webkit-scrollbar, .recent-popup::-webkit-scrollbar { width: 10px; height: 10px; }",
+      ".panel-body::-webkit-scrollbar-track, .recent-popup::-webkit-scrollbar-track { background: var(--scrollbar-track); }",
+      ".panel-body::-webkit-scrollbar-thumb, .recent-popup::-webkit-scrollbar-thumb { border: 2px solid var(--scrollbar-track); border-radius: 999px; background: var(--scrollbar-thumb); }",
+      ".panel-body::-webkit-scrollbar-thumb:hover, .recent-popup::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }",
+      ".panel-body::-webkit-scrollbar-corner, .recent-popup::-webkit-scrollbar-corner { background: var(--scrollbar-corner); }",
       ".quick-action {",
       "  position: fixed;",
       "  right: 40px;",
@@ -369,8 +423,11 @@
       ".delete-confirm { display: flex; padding: 8px 10px 11px; align-items: center; justify-content: space-between; gap: 10px; border-top: 1px solid var(--border); color: var(--muted); }",
       ".delete-confirm .button { min-height: 29px; padding: 4px 9px; }",
       ".empty-state, .placeholder { margin: 0; padding: 22px 14px; border: 1px dashed var(--border); border-radius: 10px; color: var(--muted); text-align: center; background: color-mix(in srgb, var(--surface) 70%, transparent); }",
-      ".settings-group { display: grid; margin-bottom: 20px; gap: 9px; }",
+      ".settings-group { display: grid; margin: 0; padding: 0 0 18px; gap: 9px; }",
+      ".settings-group + .settings-group { padding-top: 18px; border-top: 1px solid var(--separator-muted); }",
       ".settings-group h3 { margin: 0; font-size: 14px; }",
+      ".settings-group h4 { margin: 4px 0 0; font-size: 12px; color: var(--muted); }",
+      ".command-list { display: grid; margin: 0; padding-left: 20px; gap: 5px; color: var(--text); }",
       ".theme-option { display: flex; min-height: 38px; padding: 8px 10px; align-items: center; gap: 9px; border: 1px solid var(--border); border-radius: 8px; background: color-mix(in srgb, var(--surface) 92%, transparent); cursor: pointer; }",
       ".theme-option input { margin: 0; accent-color: var(--accent); }",
       ".settings-help { margin: 0; color: var(--muted); font-size: 12px; }",
@@ -381,8 +438,9 @@
       "@media (prefers-color-scheme: dark) {",
       "  .theme-system { --bg: #17191d; --surface: #22262d; --surface-hover: #2c323b; --text: #edf1f7; --muted: #aab2bf; --border: #3c434e; --accent: #66cfc0; --accent-contrast: #101514; --danger: #ff938c; }",
       "}",
-      "@media (prefers-reduced-motion: reduce) { .rail, .quick-action { transition: none; } .recent-popup { animation: none; } }",
+      "@media (prefers-reduced-motion: reduce) { .quick-action { transition: none; } .recent-popup { animation: none; } }",
       analysisUiModule.styles(),
+      workspaceUiModule.styles(),
     ].join("\n");
   }
 
@@ -393,9 +451,11 @@
       '  <button class="quick-action" type="button" data-action="quick-next" title="Отправить «Далее», если поле пусто" aria-label="Отправить «Далее», если поле пусто">' + ICONS.quick + '</button>',
       '  <button class="panel-opener" type="button" data-action="open-panel" title="Открыть меню шаблонов" aria-label="Открыть меню шаблонов" aria-haspopup="menu" aria-expanded="false">' + ICONS.opener + '</button>',
       '  <div class="recent-popup" role="menu" aria-label="Последние запущенные шаблоны" hidden></div>',
+      '  <div class="panel-resize" role="separator" aria-label="Изменить ширину панели" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="720" aria-valuenow="360" tabindex="0" hidden></div>',
       '  <nav class="rail" aria-label="Разделы chatgpt-helper" hidden>',
       '    <button class="rail-button" type="button" data-section="templates" title="Шаблоны" aria-label="Шаблоны">' + ICONS.templates + '</button>',
       '    <button class="rail-button" type="button" data-section="analysis" title="Анализ текста" aria-label="Анализ текста">' + ICONS.analysis + '</button>',
+      '    <button class="rail-button" type="button" data-section="saved" title="Сохранённое" aria-label="Сохранённое">' + ICONS.saved + '</button>',
       '    <button class="rail-button" type="button" data-section="settings" title="Настройки" aria-label="Настройки">' + ICONS.settings + '</button>',
       '  </nav>',
       '  <section class="panel" aria-label="chatgpt-helper" hidden>',
@@ -412,9 +472,22 @@
 
   function applyShellState() {
     if (!state.shell) return;
-    state.shell.className = "shell theme-" + state.settings.theme + (state.open ? " is-open" : "") + (state.settings.wallpaperDataUrl ? " has-wallpaper" : "");
+    const effectiveSidebarWidth = workspaceContract.effectiveWidth(
+      "sidebarWidth",
+      state.settings.layout.sidebarWidth,
+      window.innerWidth,
+    );
+    state.host?.style.setProperty("--sidebar-effective-width", `${effectiveSidebarWidth}px`);
+    if (state.sidebarHandle) {
+      state.sidebarHandle.setAttribute("aria-valuenow", String(effectiveSidebarWidth));
+    }
+    state.shell.className = "shell theme-" + state.settings.theme
+      + (state.open ? " is-open" : "")
+      + (state.sidebarResizing ? " is-resizing" : "")
+      + (state.settings.wallpaperDataUrl ? " has-wallpaper" : "");
     state.panel.hidden = !state.open;
     state.rail.hidden = !state.open;
+    state.sidebarHandle.hidden = !state.open;
     state.opener.hidden = state.open;
     state.quickAction.hidden = state.open;
     state.title.textContent = SECTION_TITLES[state.activeSection];
@@ -429,6 +502,100 @@
     state.wallpaper.style.backgroundImage = state.settings.wallpaperDataUrl
       ? "url(" + JSON.stringify(state.settings.wallpaperDataUrl) + ")"
       : "";
+  }
+
+  function setSidebarWidthPreview(preferredWidth) {
+    const effective = workspaceContract.effectiveWidth("sidebarWidth", preferredWidth, window.innerWidth);
+    state.host?.style.setProperty("--sidebar-effective-width", `${effective}px`);
+    state.sidebarHandle?.setAttribute("aria-valuenow", String(effective));
+    return effective;
+  }
+
+  async function persistSidebarWidth(preferredWidth) {
+    const width = workspaceContract.clampPreferredWidth("sidebarWidth", preferredWidth);
+    if (width === state.settings.layout.sidebarWidth) {
+      setSidebarWidthPreview(width);
+      return true;
+    }
+    return saveSettings({
+      ...state.settings,
+      layout: { ...state.settings.layout, sidebarWidth: width },
+    }, "Ширина панели сохранена.");
+  }
+
+  function installSidebarResizer(handle) {
+    let drag = null;
+    let previousUserSelect = "";
+
+    function cleanupDrag() {
+      if (!drag) return;
+      try {
+        if (handle.hasPointerCapture?.(drag.pointerId)) handle.releasePointerCapture(drag.pointerId);
+      } catch (_) {}
+      document.documentElement.style.userSelect = previousUserSelect;
+      handle.classList.remove("is-resizing");
+      state.sidebarResizing = false;
+      state.shell?.classList.remove("is-resizing");
+      drag = null;
+    }
+
+    function finishDrag(commit) {
+      if (!drag) return;
+      const width = drag.width;
+      cleanupDrag();
+      if (commit) void persistSidebarWidth(width);
+      else applyShellState();
+    }
+
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || drag) return;
+      event.preventDefault();
+      previousUserSelect = document.documentElement.style.userSelect;
+      document.documentElement.style.userSelect = "none";
+      drag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startWidth: state.settings.layout.sidebarWidth,
+        width: state.settings.layout.sidebarWidth,
+      };
+      state.sidebarResizing = true;
+      handle.classList.add("is-resizing");
+      state.shell?.classList.add("is-resizing");
+      handle.setPointerCapture?.(event.pointerId);
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      drag.width = workspaceContract.resizePreferredWidth(
+        "sidebarWidth",
+        drag.startWidth,
+        event.clientX - drag.startX,
+        "left",
+      );
+      setSidebarWidthPreview(drag.width);
+    });
+    handle.addEventListener("pointerup", (event) => {
+      if (drag && event.pointerId === drag.pointerId) finishDrag(true);
+    });
+    handle.addEventListener("pointercancel", () => finishDrag(false));
+    handle.addEventListener("lostpointercapture", () => { if (drag) finishDrag(true); });
+    handle.addEventListener("dblclick", (event) => {
+      event.preventDefault();
+      void persistSidebarWidth(workspaceContract.LAYOUT.sidebarWidth.default);
+    });
+    handle.addEventListener("keydown", (event) => {
+      const current = state.settings.layout.sidebarWidth;
+      const step = event.shiftKey ? 50 : 10;
+      let next = null;
+      if (event.key === "ArrowLeft") next = current + step;
+      else if (event.key === "ArrowRight") next = current - step;
+      else if (event.key === "Home") next = workspaceContract.LAYOUT.sidebarWidth.min;
+      else if (event.key === "End") next = workspaceContract.LAYOUT.sidebarWidth.max;
+      else if (event.key === "Enter") next = current;
+      if (next === null) return;
+      event.preventDefault();
+      void persistSidebarWidth(next);
+    });
+    return cleanupDrag;
   }
 
   function clearRecentHoverTimer() {
@@ -582,7 +749,11 @@
   }
 
   function analysisMarkup() {
-    return analysisUiModule.analysisMarkup(state) + statusMarkup();
+    return workspaceUiModule.glossaryMarkup(state) + statusMarkup();
+  }
+
+  function savedMarkup() {
+    return workspaceUiModule.savedMarkup(state) + statusMarkup();
   }
 
   function settingsMarkup() {
@@ -598,21 +769,30 @@
     }).join("");
     return [
       '<section class="settings-group">',
-      '  <h3>Тема</h3>',
+      '  <h3>Внешний вид</h3>',
       themeOptions,
+      '  <h4>Обои панели</h4>',
+      '  <p class="settings-help">Локальное изображение применяется только к раскрытой панели. Максимум 6 МБ.</p>',
+      '  <input class="file-input" type="file" accept="image/*" data-action="wallpaper">',
+      state.settings.wallpaperDataUrl ? '  <button class="button danger" type="button" data-action="remove-wallpaper">Удалить обои</button>' : "",
+      analysisUiModule.settingsMarkup(state),
+      '  <button class="button" type="button" data-action="reset-interface-sizes">Сбросить размеры интерфейса</button>',
       '</section>',
       '<section class="settings-group">',
-      '  <h3>Поведение</h3>',
+      '  <h3>Поведение панели</h3>',
       '  <label class="setting-option"><input type="checkbox" data-action="close-panel-after-run"' + (state.settings.closePanelAfterRun ? " checked" : "") + '><span>Закрывать панель после запуска шаблона</span></label>',
+      '  <label class="setting-option"><input type="checkbox" data-action="close-panel-on-outside-click"' + (state.settings.closePanelOnOutsideClick ? " checked" : "") + '><span>Закрывать панель при клике вне неё</span></label>',
       '  <label class="setting-option"><input type="checkbox" data-action="recent-templates-hover"' + (state.settings.recentTemplatesHoverEnabled ? " checked" : "") + '><span>Показывать последние шаблоны при наведении</span></label>',
       '</section>',
       '<section class="settings-group">',
-      '  <h3>Обои панели</h3>',
-      '  <p class="settings-help">Локальное изображение применяется только к раскрытой панели. Максимум 3 МБ.</p>',
-      '  <input class="file-input" type="file" accept="image/*" data-action="wallpaper">',
-      state.settings.wallpaperDataUrl ? '  <button class="button danger" type="button" data-action="remove-wallpaper">Удалить обои</button>' : "",
+      '  <h3>Горячие клавиши</h3>',
+      '  <p class="settings-help">Сочетания назначаются на странице горячих клавиш расширений браузера.</p>',
+      '  <ul class="command-list"><li>Активировать расширение</li><li>Анализировать выделенный текст</li><li>Сохранить выделенный текст</li><li>Нормализовать пустые строки</li></ul>',
       '</section>',
-      analysisUiModule.settingsMarkup(state),
+      '<section class="settings-group">',
+      '  <h3>Резервное копирование</h3>',
+      '  <button class="button" type="button" data-action="open-backup-options">Открыть резервное копирование</button>',
+      '</section>',
       statusMarkup(),
     ].join("");
   }
@@ -622,32 +802,25 @@
     applyShellState();
     if (state.activeSection === "templates") state.body.innerHTML = templatesMarkup();
     else if (state.activeSection === "analysis") state.body.innerHTML = analysisMarkup();
+    else if (state.activeSection === "saved") state.body.innerHTML = savedMarkup();
     else state.body.innerHTML = settingsMarkup();
   }
 
   function openSection(section) {
     if (!SECTION_TITLES[section]) return;
-    if (section !== "settings" && state.shortcutRecording) {
-      state.shortcutRecording = false;
-      state.analysisController?.setShortcutRecording(false);
-      state.shortcutWarning = "Запись сочетания отменена.";
-    }
     closeRecentPopup();
     state.activeSection = section;
     state.open = true;
     clearStatus();
     renderSection();
     if (section === "analysis" || section === "settings") void refreshKeyStatus();
+    if (section === "analysis") void refreshGlossary().catch(handleUiError);
+    if (section === "saved") void refreshSaved().catch(handleUiError);
   }
 
   function closePanel() {
     closeRecentPopup();
     if (!state.open) return;
-    if (state.shortcutRecording) {
-      state.shortcutRecording = false;
-      state.analysisController?.setShortcutRecording(false);
-      state.shortcutWarning = "Запись сочетания отменена.";
-    }
     state.open = false;
     applyShellState();
   }
@@ -659,10 +832,12 @@
     if (state.open) renderSection();
   }
 
-  async function saveTemplates(nextTemplates) {
+  async function saveTemplateMutation(message) {
     try {
-      await chrome.storage.local.set({ templates: nextTemplates });
-      state.templates = nextTemplates;
+      const response = await chrome.runtime.sendMessage(message);
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось сохранить шаблоны.");
+      state.templates = normalizeTemplates(response.templates);
+      state.recentTemplateIds = normalizeRecentTemplateIds(response.recentTemplateIds);
       return true;
     } catch (error) {
       setStatus("error", error?.message || "Не удалось сохранить шаблоны.");
@@ -670,37 +845,48 @@
     }
   }
 
-  async function saveSettings(nextSettings, successText) {
-    const previous = state.settings;
+  async function saveSettings(nextSettings, successText, failureText) {
     const normalizedSettings = normalizeSettings(nextSettings);
-    state.settings = normalizedSettings;
-    if (!normalizedSettings.recentTemplatesHoverEnabled) closeRecentPopup();
-    applyShellState();
+    const patch = workspaceContract.createActiveSettingsPatch(state.settings, normalizedSettings);
+    if (!Object.keys(patch).length) return true;
     try {
-      await chrome.storage.local.set({ settings: normalizedSettings });
+      const response = await chrome.runtime.sendMessage({
+        type: workspaceContract.MESSAGE_TYPES.SETTINGS_UPDATE,
+        patch,
+      });
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось сохранить настройки.");
+      state.settings = normalizeSettings(response.settings);
+      if (!state.settings.recentTemplatesHoverEnabled) closeRecentPopup();
+      applyShellState();
       setStatus("success", successText || "Настройки сохранены.");
       return true;
     } catch (error) {
-      state.settings = previous;
       applyShellState();
-      setStatus("error", error?.message || "Не удалось сохранить настройки.");
+      renderSection();
+      setStatus("error", failureText || error?.message || "Не удалось сохранить настройки.");
       return false;
     }
   }
 
   async function refreshKeyStatus() {
     if (!state.analysisController) return;
+    state.keyChecking = true;
+    if (state.open && state.activeSection === "analysis") renderSection();
     try {
       const configured = await state.analysisController.getKeyStatus();
       updateKeyStatus(configured);
     } catch (_) {
       state.keyConfigured = false;
+    } finally {
+      state.keyChecking = false;
+      if (state.open && state.activeSection === "analysis") renderSection();
     }
   }
 
   function updateKeyStatus(configured) {
     if (typeof configured !== "boolean" || state.keyConfigured === configured) return;
     state.keyConfigured = configured;
+    state.keyChecking = false;
     if (state.open && (state.activeSection === "analysis" || state.activeSection === "settings")) renderSection();
   }
 
@@ -708,66 +894,167 @@
     if (document.visibilityState === "visible") void refreshKeyStatus();
   }
 
+  function retryWorkspaceWhenVisible() {
+    if (document.visibilityState === "visible" && state.workspaceStatus.status === "unavailable") {
+      void state.contextClient?.retry();
+    }
+  }
+
   function updateGlossaryEntries(value) {
-    state.glossaryEntries = analysisUiModule.normalizeGlossaryEntries(value);
+    state.glossaryEntries = workspaceUiModule.normalizeGlossaryEntries(value);
     if (state.open && state.activeSection === "analysis") renderSection();
   }
 
-  function likelyBrowserConflict(shortcut) {
-    if (!shortcut.ctrl || shortcut.alt || shortcut.meta) return false;
-    return new Set(["KeyD", "KeyF", "KeyL", "KeyN", "KeyP", "KeyS", "KeyT", "KeyU"]).has(shortcut.code);
+  function updateSavedEntries(value) {
+    state.savedEntries = workspaceUiModule.normalizeSavedEntries(value);
+    if (state.open && state.activeSection === "saved") renderSection();
   }
 
-  function handleShortcutCandidate(validation) {
-    if (!validation?.ok) {
-      state.shortcutWarning = validation?.reason || "Не удалось записать сочетание.";
-      if (state.open && state.activeSection === "settings") renderSection();
-      return;
+  async function refreshGlossary() {
+    if (!state.workspaceClient || !state.workspaceContext) return;
+    const token = ++state.glossaryRequestToken;
+    const effectiveMode = workspaceUiModule.activeSearchMode(state.glossaryRequestedMode, state.glossarySearch);
+    const response = await state.workspaceClient.queryGlossary(effectiveMode, state.glossarySearch);
+    if (token !== state.glossaryRequestToken) return;
+    if (!response?.ok) throw new Error(response?.error?.message || "Не удалось загрузить словарь.");
+    updateGlossaryEntries(response.entries);
+  }
+
+  async function refreshSaved() {
+    if (!state.workspaceClient || !state.workspaceContext) return;
+    const token = ++state.savedRequestToken;
+    const effectiveMode = workspaceUiModule.activeSearchMode(state.savedRequestedMode, state.savedSearch);
+    const response = await state.workspaceClient.querySaved(effectiveMode, state.savedSearch);
+    if (token !== state.savedRequestToken) return;
+    if (!response?.ok) throw new Error(response?.error?.message || "Не удалось загрузить сохранённое.");
+    updateSavedEntries(response.entries);
+  }
+
+  function handleWorkspaceContextChange(context) {
+    state.workspaceContext = context;
+    state.glossaryRequestedMode = "local";
+    state.glossarySearch = "";
+    state.savedRequestedMode = "local";
+    state.savedSearch = "";
+    state.glossaryConfirmDeleteId = null;
+    state.savedConfirmDeleteId = null;
+    void Promise.all([refreshGlossary(), refreshSaved()]).catch(handleUiError);
+  }
+
+  function handleWorkspaceStatusChange(status) {
+    const previous = state.workspaceStatus;
+    state.workspaceStatus = status;
+    if (status.status === "unavailable") {
+      state.workspaceContext = null;
+      state.glossaryEntries = [];
+      state.savedEntries = [];
+      state.glossaryConfirmDeleteId = null;
+      state.savedConfirmDeleteId = null;
     }
-    state.shortcutRecording = false;
-    state.shortcutWarning = likelyBrowserConflict(validation.shortcut)
-      ? "Сочетание сохранено, но может конфликтовать с командой браузера."
-      : "Сочетание сохранено.";
-    void saveSettings({
-      ...state.settings,
-      analysis: { ...state.settings.analysis, shortcut: validation.shortcut },
-    }, state.shortcutWarning);
-  }
-
-  function cancelShortcutRecording() {
-    state.shortcutRecording = false;
-    state.shortcutWarning = "Запись сочетания отменена.";
-    if (state.open && state.activeSection === "settings") renderSection();
+    if (state.open && ["analysis", "saved"].includes(state.activeSection)
+      && (previous.status !== status.status || previous.message !== status.message)) {
+      renderSection();
+    }
   }
 
   async function deleteGlossaryEntry(id) {
-    const response = await state.analysisController?.deleteGlossaryEntry(id);
+    const response = await state.workspaceClient?.deleteGlossary(id);
     if (!response?.ok) {
       setStatus("error", response?.error?.message || contract.ERROR_MESSAGES.GLOSSARY_STORAGE_FAILED);
       return;
     }
     state.glossaryConfirmDeleteId = null;
-    updateGlossaryEntries(response.glossaryEntries);
-    setStatus("success", "Термин удалён.");
+    await refreshGlossary();
+    setStatus("success", "Значение удалено глобально.");
   }
 
   async function reorderGlossaryEntries(sourceId, beforeEntryId) {
-    if (!sourceId || sourceId === beforeEntryId || state.glossarySearch) return;
-    const response = await state.analysisController?.moveGlossaryEntry(sourceId, beforeEntryId);
+    const effectiveMode = workspaceUiModule.activeSearchMode(state.glossaryRequestedMode, state.glossarySearch);
+    if (!sourceId || sourceId === beforeEntryId || state.glossarySearch.trim() || effectiveMode !== "local") return;
+    const response = await state.workspaceClient?.moveGlossary(sourceId, beforeEntryId);
     if (!response?.ok) {
       setStatus("error", response?.error?.message || contract.ERROR_MESSAGES.GLOSSARY_STORAGE_FAILED);
       return;
     }
-    updateGlossaryEntries(response.glossaryEntries);
+    await refreshGlossary();
     setStatus("success", "Порядок терминов сохранён.");
+  }
+
+  async function reorderSavedEntries(sourceId, beforeItemId) {
+    const effectiveMode = workspaceUiModule.activeSearchMode(state.savedRequestedMode, state.savedSearch);
+    if (!sourceId || sourceId === beforeItemId || state.savedSearch.trim() || effectiveMode !== "local") return;
+    const response = await state.workspaceClient?.moveSaved(sourceId, beforeItemId);
+    if (!response?.ok) throw new Error(response?.error?.message || "Не удалось изменить порядок.");
+    await refreshSaved();
+    setStatus("success", "Порядок сохранённого обновлён.");
+  }
+
+  function readSelectedTextSnapshot(fallbackValue) {
+    const fallback = typeof fallbackValue === "string"
+      ? fallbackValue
+      : String(window.getSelection?.().toString() || "");
+    const structured = chatGptDom.readSelectionText?.(fallback);
+    return typeof structured === "string" ? structured : fallback;
+  }
+
+  async function saveSelectionSnapshot(text, successText) {
+    const snapshot = String(text || "");
+    if (state.workspaceStatus.status === "unavailable") {
+      const response = {
+        ok: false,
+        error: { code: "WORKSPACE_MIGRATION_FAILED", message: "Workspace недоступен. Выделение не было сохранено." },
+      };
+      state.analysisUi?.showHint(response.error.message);
+      return response;
+    }
+    let response;
+    try {
+      response = await state.workspaceClient?.saveSelection(snapshot);
+    } catch (error) {
+      response = { ok: false, error: { message: error?.message || "Контекст чата ещё не готов." } };
+    }
+    if (!response?.ok) {
+      state.analysisUi?.showHint(response?.error?.message || "Не удалось сохранить выделенный текст.");
+      return response;
+    }
+    await refreshSaved();
+    state.analysisUi?.showHint(successText || (response.changed ? "Выделенный текст сохранён." : "Этот текст уже сохранён в текущем чате."));
+    return response;
+  }
+
+  async function runAnalysis(trigger, selectionText, pageUrl) {
+    const snapshot = typeof selectionText === "string" ? selectionText : String(window.getSelection?.().toString() || "");
+    const response = await state.analysisController?.start(snapshot, trigger, pageUrl || location.href);
+    if (response?.mutationBusy) state.analysisUi?.showHint("Импорт выполняется. Повторите сохранение терминов позже.");
+    return response;
+  }
+
+  async function runSaveSelection(trigger, selectionText, pageUrl) {
+    if (!new Set(["browser-command", "context-menu"]).has(trigger)) return { ok: false };
+    const snapshot = readSelectedTextSnapshot(selectionText);
+    await state.contextClient?.sync(pageUrl || location.href);
+    return saveSelectionSnapshot(snapshot);
+  }
+
+  function runNormalizeComposer(trigger) {
+    if (!new Set(["browser-command", "context-menu"]).has(trigger)) return { ok: false };
+    const result = chatGptDom.normalizeComposer({ requireFocus: true });
+    state.analysisUi?.showHint(result.ok
+      ? (result.changed ? "Пустые строки нормализованы." : "Изменений не требуется.")
+      : result.error);
+    return result;
   }
 
   async function recordRecentTemplate(id) {
     const previous = state.recentTemplateIds;
-    const next = normalizeRecentTemplateIds([id].concat(previous));
-    state.recentTemplateIds = next;
     try {
-      await chrome.storage.local.set({ recentTemplateIds: next });
+      const response = await chrome.runtime.sendMessage({
+        type: workspaceContract.MESSAGE_TYPES.RECENT_TEMPLATE_TOUCH,
+        templateId: id,
+      });
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось обновить историю шаблонов.");
+      state.templates = normalizeTemplates(response.templates);
+      state.recentTemplateIds = normalizeRecentTemplateIds(response.recentTemplateIds);
     } catch (error) {
       state.recentTemplateIds = previous;
       throw error;
@@ -793,7 +1080,10 @@
       const result = adapter?.executeTemplate
         ? await adapter.executeTemplate(template.content, template.autoSend)
         : { ok: false, error: "Адаптер ChatGPT недоступен." };
-      if (!result?.ok) {
+      const execution = workspaceContract.interpretTemplateExecutionResult(result, {
+        requireSent: template.autoSend === true,
+      });
+      if (execution.insertionFailed) {
         showTemplateRunError(result?.error || "Не удалось выполнить шаблон.");
         return;
       }
@@ -803,6 +1093,15 @@
       } catch (error) {
         console.warn("ChatGPT Templates recent history update failed.", error);
         showTemplateRunError("Шаблон выполнен, но не удалось обновить историю запусков.");
+        return;
+      }
+
+      if (execution.verificationFailed) {
+        showTemplateRunError(result.error || "Шаблон вставлен, но не удалось подтвердить содержимое.");
+        return;
+      }
+      if (execution.sendFailed) {
+        showTemplateRunError(result.error || "Шаблон вставлен, но не удалось отправить.");
         return;
       }
 
@@ -832,7 +1131,8 @@
       const result = adapter?.executeNextQuickAction
         ? await adapter.executeNextQuickAction()
         : { ok: false };
-      if (!result?.ok && !result?.noop) {
+      const execution = workspaceContract.interpretTemplateExecutionResult(result, { requireSent: true });
+      if (!execution.accepted && !execution.noop) {
         console.warn("ChatGPT Templates quick action failed.", result?.error || "Unknown error");
       }
     } catch (error) {
@@ -855,29 +1155,37 @@
       return;
     }
 
-    let next;
     if (state.editing.id === null) {
-      next = state.templates.concat({
-        id: createStableId(),
-        name: name,
-        content: content,
-        autoSend: false,
-      });
+      if (await saveTemplateMutation({
+        type: workspaceContract.MESSAGE_TYPES.TEMPLATE_CREATE,
+        template: { id: createStableId(), name, content, autoSend: false },
+      })) {
+        state.editing = null;
+        state.editorError = "";
+        setStatus("success", "Шаблон сохранён.");
+      }
     } else {
-      next = state.templates.map(function updateTemplate(template) {
-        return template.id === state.editing.id ? { ...template, name: name, content: content } : template;
-      });
-    }
-    if (await saveTemplates(next)) {
-      state.editing = null;
-      state.editorError = "";
-      setStatus("success", "Шаблон сохранён.");
+      const patch = workspaceContract.createTemplatePatch(state.editing.original, { name, content });
+      if (!Object.keys(patch).length) {
+        state.editing = null;
+        state.editorError = "";
+        setStatus("success", "Изменений нет.");
+        return;
+      }
+      if (await saveTemplateMutation({
+        type: workspaceContract.MESSAGE_TYPES.TEMPLATE_UPDATE,
+        templateId: state.editing.id,
+        patch,
+      })) {
+        state.editing = null;
+        state.editorError = "";
+        setStatus("success", "Шаблон сохранён.");
+      }
     }
   }
 
   async function deleteTemplate(id) {
-    const next = state.templates.filter(function keepTemplate(template) { return template.id !== id; });
-    if (await saveTemplates(next)) {
+    if (await saveTemplateMutation({ type: workspaceContract.MESSAGE_TYPES.TEMPLATE_DELETE, templateId: id })) {
       if (state.editing?.id === id) state.editing = null;
       state.confirmingDeleteId = null;
       setStatus("success", "Шаблон удалён.");
@@ -892,7 +1200,10 @@
     const next = state.templates.slice();
     const moved = next.splice(sourceIndex, 1)[0];
     next.splice(targetIndex, 0, moved);
-    if (await saveTemplates(next)) setStatus("success", "Порядок шаблонов сохранён.");
+    if (await saveTemplateMutation({
+      type: workspaceContract.MESSAGE_TYPES.TEMPLATE_REORDER,
+      templateIds: next.map((template) => template.id),
+    })) setStatus("success", "Порядок шаблонов сохранён.");
   }
 
   function fileToDataUrl(file) {
@@ -907,12 +1218,9 @@
   async function updateWallpaper(input) {
     const file = input.files?.[0];
     if (!file) return;
-    if (!file.type.startsWith("image/")) {
-      setStatus("error", "Выберите файл изображения.");
-      return;
-    }
-    if (file.size > MAX_WALLPAPER_BYTES) {
-      setStatus("error", "Изображение превышает лимит 3 МБ.");
+    const validation = workspaceContract.validateWallpaperSourceFile(file);
+    if (!validation.ok) {
+      setStatus("error", validation.message);
       return;
     }
     try {
@@ -921,7 +1229,11 @@
         setStatus("error", "Не удалось подготовить изображение.");
         return;
       }
-      await saveSettings({ ...state.settings, wallpaperDataUrl: dataUrl }, "Обои сохранены.");
+      await saveSettings(
+        { ...state.settings, wallpaperDataUrl: dataUrl },
+        "Обои сохранены.",
+        "Не удалось сохранить обои: хранилище недоступно или переполнено.",
+      );
     } catch (error) {
       setStatus("error", error?.message || "Не удалось сохранить обои.");
     }
@@ -941,25 +1253,16 @@
 
     if (action === "open-analysis-options") {
       await state.analysisController?.openOptions();
-    } else if (action === "record-analysis-shortcut") {
-      state.shortcutRecording = true;
-      state.shortcutWarning = "Нажмите основную клавишу вместе с Ctrl, Shift, Alt или Meta. Esc отменяет запись.";
-      state.analysisController?.setShortcutRecording(true);
-      renderSection();
-    } else if (action === "toggle-analysis-shortcut") {
-      const shortcut = contract.normalizeShortcut(state.settings.analysis?.shortcut);
+    } else if (action === "open-backup-options") {
+      await state.analysisController?.openOptions("backup");
+    } else if (action === "reset-interface-sizes") {
       await saveSettings({
         ...state.settings,
-        analysis: { ...state.settings.analysis, shortcut: { ...shortcut, enabled: !shortcut.enabled } },
-      }, shortcut.enabled ? "Сочетание отключено." : "Сочетание включено.");
-    } else if (action === "reset-analysis-shortcut") {
-      state.shortcutRecording = false;
-      state.analysisController?.setShortcutRecording(false);
-      state.shortcutWarning = "Сочетание сброшено на Ctrl + D.";
-      await saveSettings({
-        ...state.settings,
-        analysis: { ...state.settings.analysis, shortcut: { ...contract.DEFAULT_SHORTCUT } },
-      }, state.shortcutWarning);
+        layout: {
+          sidebarWidth: workspaceContract.LAYOUT.sidebarWidth.default,
+          analysisDialogWidth: workspaceContract.LAYOUT.analysisDialogWidth.default,
+        },
+      }, "Размеры интерфейса сброшены.");
     } else if (action === "reset-analysis-appearance") {
       await saveSettings({
         ...state.settings,
@@ -970,22 +1273,83 @@
           glossaryTextSize: contract.DEFAULT_ANALYSIS_SETTINGS.glossaryTextSize,
         },
       }, "Вид словаря сброшен.");
-    } else if (action === "clear-glossary-search") {
-      state.glossarySearch = "";
+    } else if (action === "glossary-mode-local") {
+      state.glossaryRequestedMode = "local";
+      await refreshGlossary();
+      renderSection();
+    } else if (action === "glossary-mode-global") {
+      state.glossaryRequestedMode = "global";
+      if (state.glossarySearch.trim()) {
+        await refreshGlossary();
+      }
       renderSection();
       state.body.querySelector('[data-action="glossary-search"]')?.focus();
-    } else if (action === "toggle-glossary-delete-mode") {
-      state.glossaryDeleteMode = !state.glossaryDeleteMode;
-      if (!state.glossaryDeleteMode) state.glossaryConfirmDeleteId = null;
-      renderSection();
-    } else if (action === "ask-glossary-delete") {
+    } else if (action === "attach-glossary") {
+      const response = await state.workspaceClient?.attachGlossary(id);
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось добавить термин в чат.");
+      await refreshGlossary();
+      setStatus("success", "Термин добавлен в текущий чат.");
+    } else if (action === "unlink-glossary") {
+      const response = await state.workspaceClient?.unlinkGlossary(id);
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось убрать термин из чата.");
+      await refreshGlossary();
+      setStatus("success", "Термин убран только из текущего чата.");
+    } else if (action === "ask-global-glossary-delete") {
       state.glossaryConfirmDeleteId = id;
       renderSection();
-    } else if (action === "cancel-glossary-delete") {
+    } else if (action === "cancel-global-glossary-delete") {
       state.glossaryConfirmDeleteId = null;
       renderSection();
-    } else if (action === "confirm-glossary-delete") {
+    } else if (action === "confirm-global-glossary-delete") {
       await deleteGlossaryEntry(id);
+    } else if (action === "saved-mode-local") {
+      state.savedRequestedMode = "local";
+      await refreshSaved();
+      renderSection();
+    } else if (action === "saved-mode-global") {
+      state.savedRequestedMode = "global";
+      if (state.savedSearch.trim()) {
+        await refreshSaved();
+      }
+      renderSection();
+      state.body.querySelector('[data-action="saved-search"]')?.focus();
+    } else if (action === "retry-workspace") {
+      await state.contextClient?.retry();
+    } else if (action === "copy-saved") {
+      const entry = state.savedEntries.find((item) => item.id === id);
+      if (!entry) throw new Error("Сохранённый текст не найден.");
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        throw new Error("Копирование в буфер обмена недоступно.");
+      }
+      resetCopyFeedback(actionButton);
+      try {
+        await navigator.clipboard.writeText(entry.text);
+      } catch (_error) {
+        throw new Error("Не удалось скопировать сохранённый текст.");
+      }
+      showCopyFeedback(actionButton);
+      setStatusInPlace("success", "Сохранённый текст скопирован.");
+    } else if (action === "attach-saved") {
+      const entry = state.savedEntries.find((item) => item.id === id);
+      if (!entry) throw new Error("Сохранённый текст не найден.");
+      await saveSelectionSnapshot(entry.text, "Текст добавлен в текущий чат.");
+    } else if (action === "unlink-saved") {
+      const response = await state.workspaceClient?.unlinkSaved(id);
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось убрать текст из чата.");
+      await refreshSaved();
+      setStatus("success", "Текст убран только из текущего чата.");
+    } else if (action === "ask-global-saved-delete") {
+      state.savedConfirmDeleteId = id;
+      renderSection();
+    } else if (action === "cancel-global-saved-delete") {
+      state.savedConfirmDeleteId = null;
+      renderSection();
+    } else if (action === "confirm-global-saved-delete") {
+      const response = await state.workspaceClient?.deleteSaved(id);
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось удалить сохранённый текст.");
+      state.savedConfirmDeleteId = null;
+      await refreshSaved();
+      setStatus("success", "Сохранённый текст удалён глобально.");
     } else if (action === "open-panel") {
       closeRecentPopup();
       openSection(state.activeSection);
@@ -1009,7 +1373,12 @@
       if (state.editing?.id === id) state.editing = null;
       else {
         const template = state.templates.find(function findTemplate(item) { return item.id === id; });
-        state.editing = template ? { id: template.id, name: template.name, content: template.content } : null;
+        state.editing = template ? {
+          id: template.id,
+          name: template.name,
+          content: template.content,
+          original: { name: template.name, content: template.content },
+        } : null;
       }
       state.editorError = "";
       state.confirmingDeleteId = null;
@@ -1035,10 +1404,12 @@
     const action = event.target.dataset.action;
     if (action === "auto-send") {
       const id = event.target.dataset.id;
-      const next = state.templates.map(function updateAutoSend(template) {
-        return template.id === id ? { ...template, autoSend: event.target.checked } : template;
-      });
-      if (await saveTemplates(next)) setStatus("success", "Автоотправка сохранена.");
+      const template = state.templates.find((item) => item.id === id);
+      if (template && await saveTemplateMutation({
+        type: workspaceContract.MESSAGE_TYPES.TEMPLATE_UPDATE,
+        templateId: id,
+        patch: { autoSend: event.target.checked },
+      })) setStatus("success", "Автоотправка сохранена.");
       else renderSection();
     } else if (action === "theme") {
       const theme = event.target.value;
@@ -1047,6 +1418,8 @@
       }
     } else if (action === "close-panel-after-run") {
       await saveSettings({ ...state.settings, closePanelAfterRun: event.target.checked }, "Настройка запуска сохранена.");
+    } else if (action === "close-panel-on-outside-click") {
+      await saveSettings({ ...state.settings, closePanelOnOutsideClick: event.target.checked }, "Настройка закрытия панели сохранена.");
     } else if (action === "recent-templates-hover") {
       await saveSettings({ ...state.settings, recentTemplatesHoverEnabled: event.target.checked }, "Настройка последних шаблонов сохранена.");
     } else if (action === "analysis-term-color-mode") {
@@ -1076,11 +1449,30 @@
     }
     if (event.target.dataset.action === "glossary-search") {
       state.glossarySearch = event.target.value;
+      state.glossaryRequestedMode = workspaceUiModule.requestedModeAfterQueryInput(
+        state.glossaryRequestedMode,
+        state.glossarySearch,
+      );
       const cursor = event.target.selectionStart;
-      renderSection();
-      const search = state.body.querySelector('[data-action="glossary-search"]');
-      search?.focus();
-      if (Number.isInteger(cursor)) search?.setSelectionRange(cursor, cursor);
+      void refreshGlossary().then(() => {
+        const search = state.body.querySelector('[data-action="glossary-search"]');
+        search?.focus();
+        if (Number.isInteger(cursor)) search?.setSelectionRange(cursor, cursor);
+      }).catch(handleUiError);
+      return;
+    }
+    if (event.target.dataset.action === "saved-search") {
+      state.savedSearch = event.target.value;
+      state.savedRequestedMode = workspaceUiModule.requestedModeAfterQueryInput(
+        state.savedRequestedMode,
+        state.savedSearch,
+      );
+      const cursor = event.target.selectionStart;
+      void refreshSaved().then(() => {
+        const search = state.body.querySelector('[data-action="saved-search"]');
+        search?.focus();
+        if (Number.isInteger(cursor)) search?.setSelectionRange(cursor, cursor);
+      }).catch(handleUiError);
       return;
     }
     if (!state.editing || !event.target.matches("[data-field]")) return;
@@ -1091,9 +1483,14 @@
   }
 
   function onDragStart(event) {
+    if (state.sidebarResizing) {
+      event.preventDefault();
+      return;
+    }
     const glossaryHandle = event.target.closest("[data-glossary-drag-id]");
     if (glossaryHandle) {
-      if (state.glossarySearch) {
+      if (state.glossarySearch.trim()
+        || workspaceUiModule.activeSearchMode(state.glossaryRequestedMode, state.glossarySearch) !== "local") {
         event.preventDefault();
         return;
       }
@@ -1101,6 +1498,19 @@
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", state.glossaryDraggingId);
       glossaryHandle.closest(".glossary-card")?.classList.add("is-dragging");
+      return;
+    }
+    const savedHandle = event.target.closest("[data-saved-drag-id]");
+    if (savedHandle) {
+      if (state.savedSearch.trim()
+        || workspaceUiModule.activeSearchMode(state.savedRequestedMode, state.savedSearch) !== "local") {
+        event.preventDefault();
+        return;
+      }
+      state.savedDraggingId = savedHandle.dataset.savedDragId;
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", state.savedDraggingId);
+      savedHandle.closest(".saved-card")?.classList.add("is-dragging");
       return;
     }
     const handle = event.target.closest("[data-drag-id]");
@@ -1114,12 +1524,19 @@
   function onDragEnd(event) {
     event.target.closest(".glossary-card")?.classList.remove("is-dragging");
     state.glossaryDraggingId = null;
+    event.target.closest(".saved-card")?.classList.remove("is-dragging");
+    state.savedDraggingId = null;
     event.target.closest(".template-card")?.classList.remove("is-dragging");
     state.draggingId = null;
   }
 
   function onDragOver(event) {
     if (state.glossaryDraggingId && event.target.closest("[data-glossary-id]")) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      return;
+    }
+    if (state.savedDraggingId && event.target.closest("[data-saved-id]")) {
       event.preventDefault();
       event.dataTransfer.dropEffect = "move";
       return;
@@ -1142,6 +1559,18 @@
       void reorderGlossaryEntries(sourceId, beforeEntryId).catch(handleUiError);
       return;
     }
+    const savedTarget = event.target.closest("[data-saved-id]");
+    if (savedTarget && state.savedDraggingId) {
+      event.preventDefault();
+      const sourceId = state.savedDraggingId;
+      const cards = Array.from(state.body.querySelectorAll("[data-saved-id]"));
+      const targetIndex = cards.indexOf(savedTarget);
+      const afterTarget = event.clientY > savedTarget.getBoundingClientRect().top + savedTarget.getBoundingClientRect().height / 2;
+      const beforeItemId = afterTarget ? (cards[targetIndex + 1]?.dataset.savedId || null) : savedTarget.dataset.savedId;
+      state.savedDraggingId = null;
+      void reorderSavedEntries(sourceId, beforeItemId).catch(handleUiError);
+      return;
+    }
     const target = event.target.closest("[data-template-id]");
     if (!target || !state.draggingId) return;
     event.preventDefault();
@@ -1152,6 +1581,8 @@
 
   function mount() {
     closeRecentPopup();
+    state.sidebarResizeCleanup?.();
+    state.analysisUi?.closeDialog(false);
     document.getElementById(HOST_ID)?.remove();
     const host = document.createElement("div");
     host.id = HOST_ID;
@@ -1165,19 +1596,34 @@
     state.shell = shadow.querySelector(".shell");
     state.rail = shadow.querySelector(".rail");
     state.panel = shadow.querySelector(".panel");
+    state.sidebarHandle = shadow.querySelector(".panel-resize");
     state.opener = shadow.querySelector(".panel-opener");
     state.recentPopup = shadow.querySelector(".recent-popup");
     state.quickAction = shadow.querySelector(".quick-action");
     state.wallpaper = shadow.querySelector(".panel-wallpaper");
     state.title = shadow.querySelector(".panel-title");
     state.body = shadow.querySelector(".panel-body");
+    if (!state.workspaceClient) {
+      state.workspaceClient = workspaceUiModule.createClient({
+        getContext: function getWorkspaceContext() { return state.workspaceContext; },
+        getStatus: function getWorkspaceStatus() { return state.workspaceStatus; },
+        send: function sendWorkspaceMessage(message) { return chrome.runtime.sendMessage(message); },
+      });
+    }
     state.analysisUi = analysisUiModule.create({
       getShell: function getShell() { return state.shell; },
       getSettings: function getSettings() { return state.settings; },
       onOpenOptions: function openAnalysisOptions() { return state.analysisController?.openOptions(); },
-      onReplace: function replaceGlossaryEntry(command) { return state.analysisController?.replaceGlossaryEntry(command); },
-      onGlossaryEntries: updateGlossaryEntries,
+      onReplace: function replaceGlossaryEntry(command) { return state.workspaceClient?.replaceGlossary(command); },
+      onGlossaryEntries: function refreshWorkspaceGlossary() { void refreshGlossary().catch(handleUiError); },
+      onDialogWidthChange: function persistDialogWidth(width) {
+        return saveSettings({
+          ...state.settings,
+          layout: { ...state.settings.layout, analysisDialogWidth: width },
+        }, "Ширина окна анализа сохранена.");
+      },
     });
+    state.sidebarResizeCleanup = installSidebarResizer(state.sidebarHandle);
 
     shadow.addEventListener("click", function handleClick(event) { void onShadowClick(event).catch(handleUiError); });
     shadow.addEventListener("change", function handleChange(event) { void onShadowChange(event).catch(handleUiError); });
@@ -1199,42 +1645,132 @@
 
   async function loadStorage() {
     try {
-      const stored = await chrome.storage.local.get(["templates", "settings", "recentTemplateIds", "glossaryEntries"]);
+      const stored = await chrome.storage.local.get(["templates", "settings", "recentTemplateIds"]);
       state.templates = normalizeTemplates(stored.templates);
       state.settings = normalizeSettings(stored.settings);
       state.recentTemplateIds = normalizeRecentTemplateIds(stored.recentTemplateIds);
-      state.glossaryEntries = analysisUiModule.normalizeGlossaryEntries(stored.glossaryEntries);
-      await chrome.storage.local.set({
-        templates: state.templates,
-        settings: state.settings,
-        recentTemplateIds: state.recentTemplateIds,
-      });
       renderSection();
       await refreshKeyStatus();
+      await state.contextClient?.sync(location.href);
     } catch (error) {
       setStatus("error", error?.message || "Не удалось загрузить данные расширения.");
     }
   }
 
   document.addEventListener("keydown", function handleEscape(event) {
-    if (event.key === "Escape") closePanel();
+    if (event.key !== "Escape") return;
+    if (state.analysisUi?.handleEscape()) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    closePanel();
   });
 
   document.addEventListener("pointerdown", function handleOutsidePointer(event) {
+    if (state.sidebarResizing) return;
     if (state.host && !event.composedPath().includes(state.host)) {
-      if (state.open) closePanel();
+      if (state.open && state.settings.closePanelOnOutsideClick) closePanel();
       else closeRecentPopup();
     }
   });
 
-  window.addEventListener("focus", function handleWindowFocus() { void refreshKeyStatus(); });
-  document.addEventListener("visibilitychange", refreshKeyStatusWhenVisible);
+  window.addEventListener("focus", function handleWindowFocus() {
+    void refreshKeyStatus();
+    if (state.workspaceStatus.status === "unavailable") void state.contextClient?.retry();
+  });
+  document.addEventListener("visibilitychange", function handleVisibilityChange() {
+    refreshKeyStatusWhenVisible();
+    retryWorkspaceWhenVisible();
+  });
+  window.addEventListener("resize", applyShellState);
 
   chrome.runtime.onMessage.addListener(function handleRuntimeMessage(message, _sender, sendResponse) {
-    if (message?.type !== TOGGLE_MESSAGE) return false;
-    ensureMounted();
-    togglePanel();
-    sendResponse({ ok: true, open: state.open });
+    if (message?.type === TOGGLE_MESSAGE) {
+      ensureMounted();
+      togglePanel();
+      sendResponse({ ok: true, open: state.open });
+      return false;
+    }
+    if (message?.type === commandRegistry.CONTENT_MESSAGE_TYPES.ANALYZE
+      || message?.type === contract.MESSAGE_TYPES.CONTEXT_MENU_SELECTION) {
+      const trigger = message.type === commandRegistry.CONTENT_MESSAGE_TYPES.ANALYZE ? "browser-command" : "context-menu";
+      const selectionText = trigger === "context-menu" ? String(message.selectionText || "") : String(window.getSelection?.().toString() || "");
+      const eligible = commandRegistry.selectionEligible({
+        supportedPage: conversationContextModule.isSupportedPage(location.href),
+        selectionText,
+        isEditable: commandRegistry.isTextEntryTarget(document.activeElement),
+      });
+      if (!eligible) {
+        state.analysisUi?.showHint("Выделите текст вне поля ввода ChatGPT.");
+        sendResponse({ ok: false });
+        return false;
+      }
+      void runAnalysis(trigger, selectionText, message.pageUrl || location.href)
+        .then((response) => sendResponse(response || { ok: false }))
+        .catch(() => sendResponse({ ok: false }));
+      return true;
+    }
+    if (message?.type === commandRegistry.CONTENT_MESSAGE_TYPES.SAVE
+      || message?.type === workspaceContract.MESSAGE_TYPES.CONTEXT_MENU_SAVE_SELECTION) {
+      const trigger = message.type === commandRegistry.CONTENT_MESSAGE_TYPES.SAVE ? "browser-command" : "context-menu";
+      const selectionText = trigger === "context-menu" ? String(message.selectionText || "") : String(window.getSelection?.().toString() || "");
+      const eligible = commandRegistry.selectionEligible({
+        supportedPage: conversationContextModule.isSupportedPage(location.href),
+        selectionText,
+        isEditable: commandRegistry.isTextEntryTarget(document.activeElement),
+      });
+      if (!eligible) {
+        state.analysisUi?.showHint("Выделите текст вне поля ввода ChatGPT.");
+        sendResponse({ ok: false });
+        return false;
+      }
+      void runSaveSelection(trigger, selectionText, message.pageUrl || location.href)
+        .then((response) => sendResponse(response || { ok: false }))
+        .catch((error) => sendResponse({ ok: false, error: { message: error?.message || "Не удалось сохранить текст." } }));
+      return true;
+    }
+    if (message?.type === commandRegistry.CONTENT_MESSAGE_TYPES.NORMALIZE
+      || message?.type === workspaceContract.MESSAGE_TYPES.CONTEXT_MENU_NORMALIZE_COMPOSER) {
+      const trigger = message.type === commandRegistry.CONTENT_MESSAGE_TYPES.NORMALIZE ? "browser-command" : "context-menu";
+      const result = runNormalizeComposer(trigger);
+      sendResponse(result);
+      return false;
+    }
+    if (message?.type === workspaceContract.MESSAGE_TYPES.CHANGED) {
+      if (!workspaceContract.validateInvalidation({
+        entityFamily: message.entityFamily,
+        conversationScope: message.conversationScope,
+        revision: message.revision,
+      })) return false;
+      if (message.entityFamily === workspaceContract.ENTITY_FAMILIES.ALL) {
+        state.glossaryEntries = [];
+        state.savedEntries = [];
+        void state.contextClient?.sync(location.href).then(() => {
+          if (!state.open) return;
+          if (state.activeSection === "analysis") return refreshGlossary();
+          if (state.activeSection === "saved") return refreshSaved();
+          return null;
+        }).catch(handleUiError);
+        return false;
+      }
+      const currentScope = state.workspaceContext?.scopeKey;
+      const relevantScope = message.conversationScope === null || message.conversationScope === currentScope;
+      if (message.entityFamily === workspaceContract.ENTITY_FAMILIES.GLOSSARY
+        && (relevantScope
+          || workspaceUiModule.activeSearchMode(state.glossaryRequestedMode, state.glossarySearch) === "global")) {
+        void refreshGlossary().catch(handleUiError);
+      }
+      if (message.entityFamily === workspaceContract.ENTITY_FAMILIES.SAVED
+        && (relevantScope
+          || workspaceUiModule.activeSearchMode(state.savedRequestedMode, state.savedSearch) === "global")) {
+        void refreshSaved().catch(handleUiError);
+      }
+      if (message.entityFamily === workspaceContract.ENTITY_FAMILIES.CONVERSATIONS) {
+        void state.contextClient?.sync(location.href).catch(handleUiError);
+      }
+      return false;
+    }
     return false;
   });
 
@@ -1243,10 +1779,6 @@
     if (changes.templates) state.templates = normalizeTemplates(changes.templates.newValue);
     if (changes.settings) state.settings = normalizeSettings(changes.settings.newValue);
     if (changes.recentTemplateIds) state.recentTemplateIds = normalizeRecentTemplateIds(changes.recentTemplateIds.newValue);
-    if (changes.glossaryEntries) {
-      state.glossaryDraggingId = null;
-      state.glossaryEntries = analysisUiModule.normalizeGlossaryEntries(changes.glossaryEntries.newValue);
-    }
     closeRecentPopup();
     renderSection();
   });
@@ -1257,10 +1789,6 @@
   window[GLOBAL_KEY] = { ensureMounted: ensureMounted };
   ensureMounted();
   state.analysisController = analysisControllerModule.create({
-    getShortcut: function getShortcut() { return state.settings.analysis?.shortcut; },
-    handleEscapeLayer: function handleEscapeLayer() { return state.analysisUi?.handleEscape() || false; },
-    onShortcutCandidate: handleShortcutCandidate,
-    onShortcutRecordingCancelled: cancelShortcutRecording,
     onHint: function showAnalysisHint(text) { state.analysisUi?.showHint(text); },
     onLoading: function showAnalysisLoading() { state.analysisUi?.showLoading(); },
     onLoadingEnd: function hideAnalysisLoading() { state.analysisUi?.hideLoading(); },
@@ -1271,9 +1799,15 @@
       state.analysisUi?.showError(error);
     },
     onResult: function showAnalysisResult(response) {
-      if (response.glossaryEntries) updateGlossaryEntries(response.glossaryEntries);
+      void refreshGlossary().catch(handleUiError);
       state.analysisUi?.showResult(response);
     },
   });
+  state.contextClient = conversationContextModule.createClient({
+    send: function sendContextMessage(message) { return chrome.runtime.sendMessage(message); },
+    onChange: handleWorkspaceContextChange,
+    onStatusChange: handleWorkspaceStatusChange,
+  });
+  state.contextClient.start();
   void loadStorage();
 })();

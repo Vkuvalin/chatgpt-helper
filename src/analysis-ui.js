@@ -3,6 +3,7 @@
 
   if (root.ChatGPTHelperAnalysisUi) return;
   const contract = root.ChatGPTHelperAnalysisContract;
+  const workspaceContract = root.ChatGPTHelperWorkspaceContract;
   const DIALOG_HEADING_ID = "chatgpt-helper-analysis-dialog-title";
   const FOCUSABLE_SELECTOR = [
     "a[href]", "button:not([disabled])", "input:not([disabled])", "select:not([disabled])",
@@ -52,6 +53,80 @@
     return (currentIndex + (backwards ? -1 : 1) + count) % count;
   }
 
+  function replacementCommandForTerm(term) {
+    const candidate = term?.replacementCandidate;
+    if (term?.status !== "duplicate" || candidate?.status !== "single"
+      || typeof candidate.targetSenseId !== "string" || !candidate.targetSenseId
+      || typeof candidate.newSenseId !== "string" || !candidate.newSenseId
+      || !Number.isFinite(candidate.expectedUpdatedAt)) return null;
+    return Object.freeze({
+      entryId: candidate.targetSenseId,
+      sourceSenseId: candidate.newSenseId,
+      expectedUpdatedAt: candidate.expectedUpdatedAt,
+    });
+  }
+
+  function comparableReplacementText(value) {
+    return String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
+  }
+
+  function refreshReplacementCandidate(term, current) {
+    const candidate = term?.replacementCandidate;
+    const sourceSenseId = candidate?.newSenseId;
+    const targetSenseId = current?.senseId || current?.id;
+    const currentTranslation = comparableReplacementText(current?.translation);
+    const sourceTranslation = comparableReplacementText(term?.translation);
+    const currentDefinition = comparableReplacementText(current?.definition);
+    const sourceDefinition = comparableReplacementText(term?.definition);
+    const compatibleConcept = !term?.conceptId || !current?.conceptId || term.conceptId === current.conceptId;
+    const valid = candidate?.status === "single"
+      && typeof sourceSenseId === "string" && Boolean(sourceSenseId)
+      && typeof targetSenseId === "string" && Boolean(targetSenseId)
+      && targetSenseId !== sourceSenseId
+      && Number.isFinite(current?.updatedAt)
+      && compatibleConcept
+      && Boolean(currentTranslation) && currentTranslation === sourceTranslation
+      && Boolean(currentDefinition) && currentDefinition !== sourceDefinition;
+
+    if (current && typeof current === "object") term.savedEntry = current;
+    if (!valid) {
+      term.replacementCandidate = {
+        status: "invalid",
+        ...(typeof sourceSenseId === "string" && sourceSenseId ? { newSenseId: sourceSenseId } : {}),
+      };
+      return false;
+    }
+    term.replacementCandidate = {
+      status: "single",
+      targetSenseId,
+      newSenseId: sourceSenseId,
+      expectedUpdatedAt: current.updatedAt,
+      current: {
+        translation: current.translation,
+        definition: current.definition,
+      },
+    };
+    return true;
+  }
+
+  async function runReplacementAction(term, onReplace) {
+    const command = replacementCommandForTerm(term);
+    if (!command || typeof onReplace !== "function") return { status: "invalid", response: null };
+    const response = await Promise.resolve(onReplace(command)).catch(() => null);
+    if (response?.ok) {
+      term.status = "replaced";
+      term.savedEntry = response.entry;
+      return { status: "replaced", response };
+    }
+    if (response?.error?.code === "GLOSSARY_ENTRY_CHANGED") {
+      return {
+        status: refreshReplacementCandidate(term, response.current) ? "stale" : "invalid",
+        response,
+      };
+    }
+    return { status: "error", response };
+  }
+
   function styles() {
     return [
       ".analysis-key-row { display: flex; margin-bottom: 12px; padding: 9px 10px; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid var(--border); border-radius: 9px; background: color-mix(in srgb, var(--surface) 90%, transparent); }",
@@ -60,8 +135,6 @@
       ".analysis-search-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }",
       ".analysis-search-wrap { position: relative; }",
       ".analysis-search { width: 100%; min-height: 36px; padding: 7px 34px 7px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }",
-      ".analysis-search-clear { position: absolute; top: 4px; right: 4px; width: 28px; height: 28px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }",
-      ".analysis-search-clear:hover { background: var(--surface-hover); color: var(--text); }",
       ".analysis-counter { margin: 0; color: var(--muted); font-size: 12px; }",
       ".glossary-list { display: grid; gap: 9px; }",
       ".glossary-list.size-compact { font-size: 12px; }",
@@ -74,9 +147,6 @@
       ".glossary-translation { font-style: italic; }",
       ".glossary-definition { margin: 5px 0 0; color: var(--text); }",
       ".glossary-delete-confirm { display: flex; padding: 8px 10px; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--border); color: var(--muted); }",
-      ".shortcut-display { display: flex; align-items: center; justify-content: space-between; gap: 10px; }",
-      ".shortcut-value { padding: 5px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); font-weight: 700; }",
-      ".analysis-settings-actions { display: flex; flex-wrap: wrap; gap: 7px; }",
       ".appearance-grid { display: grid; gap: 8px; }",
       ".color-row, .size-row { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }",
       ".color-row input[type='color'] { width: 44px; height: 32px; padding: 2px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }",
@@ -89,15 +159,26 @@
       ".analysis-loading::before { content: ''; display: inline-block; width: 9px; height: 9px; margin-right: 8px; border: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: analysis-spin .8s linear infinite; }",
       "@keyframes analysis-spin { to { transform: rotate(360deg); } }",
       ".analysis-backdrop { position: fixed; inset: 0; z-index: 11; display: flex; padding: 32px 16px; align-items: flex-start; justify-content: center; background: color-mix(in srgb, var(--bg) 22%, transparent); pointer-events: auto; }",
-      ".analysis-dialog { position: relative; width: min(360px, calc(100vw - 32px)); max-height: calc(100vh - 64px); overflow-y: auto; border: 1px solid var(--border); border-radius: 14px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); }",
+      ".analysis-dialog { position: relative; width: var(--analysis-dialog-width, 560px); max-height: calc(100vh - 64px); overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); container-type: inline-size; }",
       ".analysis-dialog-wallpaper { position: absolute; inset: 0; border-radius: inherit; background-position: center; background-size: cover; opacity: .34; pointer-events: none; }",
       ".analysis-dialog-scrim { position: absolute; inset: 0; border-radius: inherit; background: color-mix(in srgb, var(--bg) 88%, transparent); pointer-events: none; }",
-      ".analysis-dialog-content { position: relative; z-index: 1; padding: 16px; }",
+      ".analysis-dialog-content { position: relative; z-index: 1; max-height: calc(100vh - 66px); overflow-y: auto; padding: 16px; scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track); scrollbar-gutter: stable; }",
+      ".analysis-dialog-content::-webkit-scrollbar { width: 10px; height: 10px; }",
+      ".analysis-dialog-content::-webkit-scrollbar-track { background: var(--scrollbar-track); }",
+      ".analysis-dialog-content::-webkit-scrollbar-thumb { border: 2px solid var(--scrollbar-track); border-radius: 999px; background: var(--scrollbar-thumb); }",
+      ".analysis-dialog-content::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }",
+      ".analysis-dialog-content::-webkit-scrollbar-corner { background: var(--scrollbar-corner); }",
+      ".analysis-dialog-resize { position: absolute; top: 0; bottom: 0; z-index: 4; width: 10px; cursor: ew-resize; touch-action: none; outline: 0; }",
+      ".analysis-dialog-resize.left { left: 0; }",
+      ".analysis-dialog-resize.right { right: 0; }",
+      ".analysis-dialog-resize::after { content: ''; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px; background: transparent; }",
+      ".analysis-dialog-resize:hover::after, .analysis-dialog-resize:focus-visible::after, .analysis-dialog-resize.is-resizing::after { background: var(--accent); }",
       ".analysis-dialog-header { display: flex; margin-bottom: 12px; align-items: center; justify-content: space-between; gap: 10px; }",
       ".analysis-dialog-title { margin: 0; font-size: 16px; }",
       ".analysis-dialog-close { width: 30px; height: 30px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }",
       ".analysis-dialog-close:hover { background: var(--surface-hover); color: var(--text); }",
       ".analysis-result-list { display: grid; gap: 9px; }",
+      "@container (min-width: 680px) { .analysis-result-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }",
       ".analysis-result-list.size-compact { font-size: 12px; }",
       ".analysis-result-list.size-large { font-size: 15px; }",
       ".analysis-result-card { position: relative; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: color-mix(in srgb, var(--surface) 92%, transparent); }",
@@ -119,7 +200,14 @@
     const analysis = contract.normalizeAnalysisSettings(state.settings).analysis;
     const termColor = analysis.termColorMode === "custom" ? analysis.customTermColor : "var(--accent)";
     const count = query ? `Найдено: ${filtered.length} из ${entries.length}` : `${entries.length} терминов`;
-    const keyText = state.keyConfigured ? "Ключ установлен" : "Ключ не установлен";
+    const keyOnboarding = !state.keyChecking && !state.keyConfigured
+      ? [
+        '<div class="analysis-key-row">',
+        '  <span class="analysis-key-state">OpenRouter не подключён</span>',
+        '  <button class="button" type="button" data-action="open-analysis-options">Настроить</button>',
+        "</div>",
+      ].join("")
+      : "";
     const cards = filtered.map((entry) => {
       const confirming = state.glossaryConfirmDeleteId === entry.id;
       const dragTitle = query ? "Очистите поиск, чтобы изменить порядок" : "Перетащить термин";
@@ -148,21 +236,17 @@
 
     let empty = "";
     if (!entries.length) {
-      empty = `<p class="empty-state">Словарь пока пуст.<br><br>Выделите текст на странице и нажмите ${escapeHtml(contract.formatShortcut(analysis.shortcut))}<br>или выберите «Разобрать английские термины»<br>в контекстном меню.</p>`;
+      empty = '<p class="empty-state">Словарь пока пуст.<br><br>Выделите текст и используйте назначенную в браузере команду<br>или пункт «Разобрать английские термины» в контекстном меню.</p>';
     } else if (!filtered.length) {
       empty = '<p class="empty-state">По запросу ничего не найдено.</p>';
     }
 
     return [
-      '<div class="analysis-key-row">',
-      `  <span class="analysis-key-state">${keyText}</span>`,
-      '  <button class="button" type="button" data-action="open-analysis-options">Управление ключом</button>',
-      "</div>",
+      keyOnboarding,
       '<div class="analysis-toolbar">',
       '  <div class="analysis-search-row">',
       '    <div class="analysis-search-wrap">',
       `      <input class="analysis-search" type="search" data-action="glossary-search" placeholder="Поиск по словарю" value="${escapeHtml(query)}">`,
-      query ? '      <button class="analysis-search-clear" type="button" data-action="clear-glossary-search" title="Очистить поиск" aria-label="Очистить поиск">×</button>' : "",
       "    </div>",
       `    <button class="compact-button${state.glossaryDeleteMode ? " is-active" : ""}" type="button" data-action="toggle-glossary-delete-mode" title="Режим удаления" aria-label="Режим удаления" aria-pressed="${state.glossaryDeleteMode ? "true" : "false"}">${TRASH_ICON}</button>`,
       "  </div>",
@@ -176,19 +260,8 @@
     const analysis = contract.normalizeAnalysisSettings(state.settings).analysis;
     const custom = analysis.termColorMode === "custom";
     return [
-      '<section class="settings-group">',
-      "  <h3>Анализ текста</h3>",
-      `  <div class="shortcut-display"><span>Сочетание клавиш</span><span class="shortcut-value">${state.shortcutRecording ? "Нажмите сочетание…" : escapeHtml(contract.formatShortcut(analysis.shortcut))}</span></div>`,
-      '  <div class="analysis-settings-actions">',
-      `    <button class="button" type="button" data-action="record-analysis-shortcut">${state.shortcutRecording ? "Ожидание…" : "Записать новое"}</button>`,
-      `    <button class="button" type="button" data-action="toggle-analysis-shortcut">${analysis.shortcut.enabled ? "Отключить" : "Включить"}</button>`,
-      '    <button class="button" type="button" data-action="reset-analysis-shortcut">Сбросить на Ctrl + D</button>',
-      "  </div>",
-      `  <p class="settings-help">${escapeHtml(state.shortcutWarning || "Esc отменяет запись. Некоторые сочетания могут конфликтовать с браузером.")}</p>`,
-      "</section>",
-      '<section class="settings-group">',
-      "  <h3>Вид словаря</h3>",
       '  <div class="appearance-grid">',
+      '    <h4>Вид словаря</h4>',
       '    <div class="color-row">',
       `      <label><input type="radio" name="term-color-mode" data-action="analysis-term-color-mode" value="theme"${custom ? "" : " checked"}> Цвет темы</label>`,
       `      <label><input type="radio" name="term-color-mode" data-action="analysis-term-color-mode" value="custom"${custom ? " checked" : ""}> Свой цвет</label>`,
@@ -202,12 +275,6 @@
       `    <div class="glossary-preview size-${analysis.glossaryTextSize}" style="--term-color:${custom ? analysis.customTermColor : "var(--accent)"}"><strong class="glossary-term">source of truth</strong> <em class="glossary-translation">(«источник истины»)</em><p class="glossary-definition">Единственный авторитетный источник данных или правил.</p></div>`,
       '    <button class="button" type="button" data-action="reset-analysis-appearance">Сбросить вид словаря</button>',
       "  </div>",
-      "</section>",
-      '<section class="settings-group">',
-      "  <h3>OpenRouter</h3>",
-      `  <p class="settings-help">${state.keyConfigured ? "Ключ установлен" : "Ключ не установлен"}</p>`,
-      '  <button class="button" type="button" data-action="open-analysis-options">Управление ключом</button>',
-      "</section>",
     ].join("");
   }
 
@@ -218,6 +285,8 @@
     let openTooltip = null;
     let previouslyFocused = null;
     let toastTimer = null;
+    let dialogCleanup = null;
+    let dialogResizing = false;
 
     function shell() {
       return options.getShell();
@@ -253,6 +322,9 @@
 
     function closeDialog(restoreFocus) {
       openTooltip = null;
+      dialogCleanup?.();
+      dialogCleanup = null;
+      dialogResizing = false;
       backdrop?.remove();
       backdrop = null;
       if (restoreFocus !== false) restorePreviousFocus();
@@ -295,6 +367,99 @@
       toastTimer = setTimeout(removeToast, 2800);
     }
 
+    function installDialogResizers(dialog, handles) {
+      let preferred = workspaceContract.clampPreferredWidth(
+        "analysisDialogWidth",
+        options.getSettings().layout?.analysisDialogWidth,
+      );
+      let drag = null;
+      let previousUserSelect = "";
+
+      function update() {
+        const effective = workspaceContract.effectiveWidth("analysisDialogWidth", preferred, window.innerWidth);
+        dialog.style.setProperty("--analysis-dialog-width", `${effective}px`);
+        handles.forEach((handle) => handle.setAttribute("aria-valuenow", String(effective)));
+      }
+
+      function finish(commit) {
+        if (!drag) return;
+        const currentDrag = drag;
+        drag = null;
+        dialogResizing = false;
+        document.documentElement.style.userSelect = previousUserSelect;
+        currentDrag.handle.classList.remove("is-resizing");
+        try {
+          if (currentDrag.handle.hasPointerCapture?.(currentDrag.pointerId)) {
+            currentDrag.handle.releasePointerCapture(currentDrag.pointerId);
+          }
+        } catch (_) {}
+        if (!commit) preferred = currentDrag.startWidth;
+        update();
+        if (commit) void options.onDialogWidthChange?.(preferred);
+      }
+
+      handles.forEach((handle) => {
+        handle.addEventListener("pointerdown", (event) => {
+          if (event.button !== 0 || drag) return;
+          event.preventDefault();
+          previousUserSelect = document.documentElement.style.userSelect;
+          document.documentElement.style.userSelect = "none";
+          drag = {
+            handle,
+            edge: handle.dataset.edge,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startWidth: preferred,
+          };
+          dialogResizing = true;
+          handle.classList.add("is-resizing");
+          handle.setPointerCapture?.(event.pointerId);
+        });
+        handle.addEventListener("pointermove", (event) => {
+          if (!drag || drag.handle !== handle || event.pointerId !== drag.pointerId) return;
+          preferred = workspaceContract.resizePreferredWidth(
+            "analysisDialogWidth",
+            drag.startWidth,
+            event.clientX - drag.startX,
+            drag.edge,
+          );
+          update();
+        });
+        handle.addEventListener("pointerup", (event) => {
+          if (drag?.handle === handle && event.pointerId === drag.pointerId) finish(true);
+        });
+        handle.addEventListener("pointercancel", () => finish(false));
+        handle.addEventListener("lostpointercapture", () => { if (drag?.handle === handle) finish(true); });
+        handle.addEventListener("dblclick", (event) => {
+          event.preventDefault();
+          preferred = workspaceContract.LAYOUT.analysisDialogWidth.default;
+          update();
+          void options.onDialogWidthChange?.(preferred);
+        });
+        handle.addEventListener("keydown", (event) => {
+          const step = event.shiftKey ? 50 : 10;
+          let next = null;
+          if (event.key === "ArrowLeft") next = preferred - step;
+          else if (event.key === "ArrowRight") next = preferred + step;
+          else if (event.key === "Home") next = workspaceContract.LAYOUT.analysisDialogWidth.min;
+          else if (event.key === "End") next = workspaceContract.LAYOUT.analysisDialogWidth.max;
+          else if (event.key === "Enter") next = preferred;
+          if (next === null) return;
+          event.preventDefault();
+          preferred = workspaceContract.clampPreferredWidth("analysisDialogWidth", next);
+          update();
+          void options.onDialogWidthChange?.(preferred);
+        });
+      });
+      const onViewportResize = () => update();
+      window.addEventListener("resize", onViewportResize);
+      update();
+      return () => {
+        if (drag) finish(false);
+        window.removeEventListener("resize", onViewportResize);
+      };
+    }
+
     function dialogFrame(title) {
       const focusOrigin = backdrop ? previouslyFocused : currentFocusedElement();
       closeDialog(false);
@@ -311,6 +476,18 @@
       dialog.setAttribute("role", "dialog");
       dialog.setAttribute("aria-modal", "true");
       dialog.setAttribute("aria-labelledby", DIALOG_HEADING_ID);
+      const resizeHandles = ["left", "right"].map((edge) => {
+        const handle = document.createElement("div");
+        handle.className = `analysis-dialog-resize ${edge}`;
+        handle.dataset.edge = edge;
+        handle.tabIndex = 0;
+        handle.setAttribute("role", "separator");
+        handle.setAttribute("aria-label", `Изменить ширину окна анализа (${edge === "left" ? "слева" : "справа"})`);
+        handle.setAttribute("aria-orientation", "vertical");
+        handle.setAttribute("aria-valuemin", String(workspaceContract.LAYOUT.analysisDialogWidth.min));
+        handle.setAttribute("aria-valuemax", String(workspaceContract.LAYOUT.analysisDialogWidth.max));
+        return handle;
+      });
       const wallpaper = document.createElement("div");
       wallpaper.className = "analysis-dialog-wallpaper";
       const dataUrl = options.getSettings().wallpaperDataUrl;
@@ -334,9 +511,9 @@
       const body = document.createElement("div");
       header.append(heading, close);
       content.append(header, body);
-      dialog.append(wallpaper, scrim, content);
+      dialog.append(wallpaper, scrim, ...resizeHandles, content);
       backdrop.appendChild(dialog);
-      backdrop.addEventListener("pointerdown", (event) => { if (event.target === backdrop) closeDialog(); });
+      backdrop.addEventListener("pointerdown", (event) => { if (event.target === backdrop && !dialogResizing) closeDialog(); });
       dialog.addEventListener("keydown", (event) => {
         if (event.key !== "Tab") return;
         const focusable = Array.from(dialog.querySelectorAll(FOCUSABLE_SELECTOR)).filter((element) => (
@@ -352,6 +529,7 @@
         focusable[nextIndex].focus();
       });
       shell()?.appendChild(backdrop);
+      dialogCleanup = installDialogResizers(dialog, resizeHandles);
       close.focus();
       return body;
     }
@@ -388,10 +566,12 @@
       const status = document.createElement("span");
       status.className = "analysis-result-status";
       const labels = { new: "Добавлено", alreadySaved: "Уже сохранено", duplicate: "Есть другая версия", unsaved: "Не сохранено", replaced: "Заменено" };
-      status.textContent = labels[term.status] || "";
+      status.textContent = term.replacementCandidate?.status === "multiple"
+        ? "Добавлено отдельно: найдено несколько вариантов"
+        : (labels[term.status] || "");
       card.appendChild(status);
 
-      if (term.status === "duplicate" && term.savedEntry) {
+      if (replacementCommandForTerm(term) && term.savedEntry) {
         const replace = document.createElement("button");
         replace.type = "button";
         replace.className = "analysis-replace";
@@ -426,30 +606,24 @@
         replace.addEventListener("click", async () => {
           if (replace.disabled) return;
           replace.disabled = true;
-          const response = await Promise.resolve(options.onReplace({
-            entryId: term.savedEntry.id,
-            expectedUpdatedAt: term.savedEntry.updatedAt,
-            replacement: {
-              term: term.term,
-              normalizedTerm: term.normalizedTerm,
-              translation: term.translation,
-              definition: term.definition,
-            },
-          })).catch(() => null);
-          if (response?.ok) {
-            term.status = "replaced";
-            term.savedEntry = response.entry;
+          const outcome = await runReplacementAction(term, options.onReplace);
+          const response = outcome.response;
+          if (outcome.status === "replaced") {
             status.textContent = labels.replaced;
             replace.remove();
             tooltip.remove();
             openTooltip = null;
             options.onGlossaryEntries?.(response.glossaryEntries);
-          } else if (response?.error?.code === "GLOSSARY_ENTRY_CHANGED" && response.current) {
-            term.savedEntry = response.current;
+          } else if (outcome.status === "stale") {
             updateTooltip(tooltip, response.current);
             status.textContent = response.error.message;
             replace.disabled = false;
             showTooltip();
+          } else if (outcome.status === "invalid") {
+            status.textContent = "Сохранённая версия изменилась. Быстрая замена больше недоступна.";
+            replace.remove();
+            tooltip.remove();
+            if (openTooltip === tooltip) openTooltip = null;
           } else {
             status.textContent = response?.error?.message || contract.ERROR_MESSAGES.GLOSSARY_STORAGE_FAILED;
             replace.disabled = false;
@@ -509,6 +683,9 @@
     normalizeGlossaryEntries,
     glossaryTextSizeClass,
     nextFocusableIndex,
+    replacementCommandForTerm,
+    refreshReplacementCandidate,
+    runReplacementAction,
     create,
   });
 })(globalThis);

@@ -4,53 +4,19 @@
   if (root.ChatGPTHelperAnalysisController) return;
   const contract = root.ChatGPTHelperAnalysisContract;
   const MESSAGES = contract.MESSAGE_TYPES;
-  const TEXT_ENTRY_SELECTOR = "input, textarea, select, [contenteditable='true'], [contenteditable=''], [role='textbox']";
-
-  function isTextEntryTarget(target) {
-    if (!target || typeof target.closest !== "function") return false;
-    try {
-      return Boolean(target.closest(TEXT_ENTRY_SELECTOR));
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function isTextEntryEvent(event) {
-    if (typeof event?.composedPath === "function") {
-      try {
-        const path = event.composedPath();
-        if (Array.isArray(path) && path.some(isTextEntryTarget)) return true;
-      } catch (_) {
-        // Fall through to the retargeted event target when the path cannot be read.
-      }
-    }
-    return isTextEntryTarget(event?.target);
-  }
-
-  function shortcutFromEvent(event) {
-    return {
-      enabled: true,
-      code: event.code,
-      ctrl: event.ctrlKey,
-      shift: event.shiftKey,
-      alt: event.altKey,
-      meta: event.metaKey,
-    };
-  }
+  const ALLOWED_TRIGGERS = new Set(["browser-command", "context-menu"]);
 
   function create(options) {
     let activeRequestId = null;
-    let shortcutRecording = false;
-
-    function setShortcutRecording(value) {
-      shortcutRecording = value === true;
-    }
 
     async function send(message) {
       return chrome.runtime.sendMessage(message);
     }
 
     async function start(rawText, trigger, pageUrl) {
+      if (!ALLOWED_TRIGGERS.has(trigger)) {
+        return { ok: false, error: contract.makeError("REQUEST_CONTRACT_ERROR") };
+      }
       if (activeRequestId) {
         options.onHint?.(contract.ERROR_MESSAGES.ANALYSIS_ALREADY_RUNNING);
         return { ok: false, error: contract.makeError("ANALYSIS_ALREADY_RUNNING") };
@@ -94,57 +60,9 @@
       }
     }
 
-    function handleKeydown(event) {
-      if (shortcutRecording) {
-        if (event.key === "Escape") {
-          event.preventDefault();
-          event.stopPropagation();
-          shortcutRecording = false;
-          options.onShortcutRecordingCancelled?.();
-          return;
-        }
-        if (contract.MODIFIER_CODES.has(event.code)) return;
-        event.preventDefault();
-        event.stopPropagation();
-        const validation = contract.validateShortcutCandidate(shortcutFromEvent(event));
-        if (!validation.ok) {
-          options.onShortcutCandidate?.(validation);
-          return;
-        }
-        shortcutRecording = false;
-        options.onShortcutCandidate?.(validation);
-        return;
-      }
-
-      if (event.key === "Escape" && options.handleEscapeLayer?.()) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      if (event.repeat || isTextEntryEvent(event)) return;
-      const shortcut = options.getShortcut?.();
-      if (!contract.shortcutMatches(event, shortcut)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (activeRequestId) {
-        options.onHint?.(contract.ERROR_MESSAGES.ANALYSIS_ALREADY_RUNNING);
-        return;
-      }
-      void start(root.getSelection?.().toString() || "", "shortcut", root.location.href);
-    }
-
-    function handleMessage(message, _sender, sendResponse) {
-      if (message?.type === MESSAGES.KEY_STATUS_CHANGED) {
-        if (typeof message.configured === "boolean") options.onKeyStatusChanged?.(message.configured);
-        return false;
-      }
-      if (message?.type !== MESSAGES.CONTEXT_MENU_SELECTION) return false;
-      if (!contract.isSupportedUrl(message.pageUrl || "")) {
-        sendResponse({ ok: false });
-        return false;
-      }
-      void start(message.selectionText, "context-menu", message.pageUrl);
-      sendResponse({ ok: true });
+    function handleMessage(message) {
+      if (message?.type !== MESSAGES.KEY_STATUS_CHANGED) return false;
+      if (typeof message.configured === "boolean") options.onKeyStatusChanged?.(message.configured);
       return false;
     }
 
@@ -153,42 +71,18 @@
       return response?.ok ? response.configured === true : false;
     }
 
-    async function openOptions() {
-      return send({ type: MESSAGES.OPEN_OPTIONS });
+    async function openOptions(section) {
+      return send({ type: MESSAGES.OPEN_OPTIONS, ...(section === "backup" ? { section: "backup" } : {}) });
     }
 
-    async function replaceGlossaryEntry(command) {
-      return send({ type: MESSAGES.REPLACE_GLOSSARY_ENTRY, command });
-    }
-
-    async function moveGlossaryEntry(entryId, beforeEntryId) {
-      return send({ type: MESSAGES.MOVE_GLOSSARY_ENTRY, entryId, beforeEntryId });
-    }
-
-    async function deleteGlossaryEntry(entryId) {
-      return send({ type: MESSAGES.DELETE_GLOSSARY_ENTRY, entryId });
-    }
-
-    document.addEventListener("keydown", handleKeydown, true);
     chrome.runtime.onMessage.addListener(handleMessage);
-
     return Object.freeze({
       start,
       isActive: () => Boolean(activeRequestId),
-      setShortcutRecording,
       getKeyStatus,
       openOptions,
-      replaceGlossaryEntry,
-      moveGlossaryEntry,
-      deleteGlossaryEntry,
     });
   }
 
-  root.ChatGPTHelperAnalysisController = Object.freeze({
-    TEXT_ENTRY_SELECTOR,
-    create,
-    isTextEntryTarget,
-    isTextEntryEvent,
-    shortcutFromEvent,
-  });
+  root.ChatGPTHelperAnalysisController = Object.freeze({ ALLOWED_TRIGGERS, create });
 })(globalThis);
