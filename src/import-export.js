@@ -83,7 +83,10 @@
     const errors = [];
     const payload = plain(payloadValue) ? payloadValue : null;
     if (!payload) return { ok: false, errors: [{ code: "INVALID_SETTINGS_PAYLOAD" }], warnings };
-    const allowed = ["theme", "wallpaperDataUrl", "closePanelAfterRun", "closePanelOnOutsideClick", "recentTemplatesHoverEnabled", "analysis", "layout"];
+    const allowed = [
+      "theme", "wallpaperDataUrl", "closePanelAfterRun", "closePanelOnOutsideClick",
+      "recentTemplatesHoverEnabled", "recentTemplatesHoverCount", "analysis", "layout",
+    ];
     unknownWarnings(payload, allowed, "payload", warnings);
     const imported = {};
     if (Object.prototype.hasOwnProperty.call(payload, "theme")) {
@@ -99,6 +102,16 @@
       if (typeof payload[key] !== "boolean") errors.push({ code: "INVALID_BOOLEAN", path: `payload.${key}` });
       else imported[key] = payload[key];
     });
+    if (Object.prototype.hasOwnProperty.call(payload, "recentTemplatesHoverCount")) {
+      const count = payload.recentTemplatesHoverCount;
+      if (!Number.isInteger(count)
+        || count < contract.RECENT_TEMPLATES_HOVER_COUNT.min
+        || count > contract.RECENT_TEMPLATES_HOVER_COUNT.max) {
+        errors.push({ code: "INVALID_RECENT_TEMPLATES_HOVER_COUNT", path: "payload.recentTemplatesHoverCount" });
+      } else {
+        imported.recentTemplatesHoverCount = count;
+      }
+    }
     if (Object.prototype.hasOwnProperty.call(payload, "analysis")) {
       if (!plain(payload.analysis)) errors.push({ code: "INVALID_ANALYSIS_SETTINGS", path: "payload.analysis" });
       else {

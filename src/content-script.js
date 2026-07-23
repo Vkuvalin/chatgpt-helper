@@ -14,6 +14,10 @@
   const TOGGLE_MESSAGE = contract.MESSAGE_TYPES.TOGGLE_PANEL;
   const RECENT_HOVER_DELAY_MS = 500;
   const RECENT_CLOSE_DELAY_MS = 120;
+  const TEMPLATE_PREVIEW_OPEN_DELAY_MS = 350;
+  const TEMPLATE_PREVIEW_CLOSE_DELAY_MS = 120;
+  const SIDEBAR_MOTION_DURATION_MS = 200;
+  const SIDEBAR_MOTION_FALLBACK_PADDING_MS = 50;
   const VALID_THEMES = new Set(workspaceContract.VALID_THEMES);
   const SECTION_TITLES = {
     templates: "Шаблоны",
@@ -44,6 +48,10 @@
   const state = {
     activeSection: "templates",
     open: false,
+    shellPhase: "closed",
+    shellMotionReady: false,
+    shellRestoreFocus: false,
+    shellTransitionController: null,
     templates: [],
     settings: workspaceContract.normalizeActiveSettings(),
     recentTemplateIds: [],
@@ -76,12 +84,16 @@
     keyChecking: true,
     sidebarResizing: false,
     sidebarResizeCleanup: null,
+    sidebarPreferredWidth: workspaceContract.DEFAULT_ACTIVE_SETTINGS.layout.sidebarWidth,
+    sidebarWidthCommitToken: 0,
+    sidebarWidthCommitPending: false,
     analysisBusy: false,
     analysisController: null,
     analysisUi: null,
     host: null,
     shadow: null,
     shell: null,
+    sidebarFrame: null,
     rail: null,
     panel: null,
     sidebarHandle: null,
@@ -89,6 +101,19 @@
     recentPopup: null,
     recentHoverTimer: null,
     recentCloseTimer: null,
+    preview: {
+      phase: "closed",
+      templateId: null,
+      source: null,
+      anchor: null,
+      openTimer: null,
+      closeTimer: null,
+      pointerInside: false,
+    },
+    previewLayer: null,
+    previewName: null,
+    previewAutoSend: null,
+    previewContent: null,
     quickAction: null,
     wallpaper: null,
     title: null,
@@ -127,16 +152,7 @@
   }
 
   function normalizeRecentTemplateIds(value) {
-    if (!Array.isArray(value)) return [];
-    const result = [];
-    for (const item of value) {
-      if (typeof item !== "string") continue;
-      const id = item.trim();
-      if (!id || result.includes(id)) continue;
-      result.push(id);
-      if (result.length === 3) break;
-    }
-    return result;
+    return workspaceContract.normalizeRecentTemplateIds(value);
   }
 
   function escapeHtml(value) {
@@ -197,6 +213,8 @@
       ":host {",
       "  --sidebar-effective-width: 360px;",
       "  --rail-width: 48px;",
+      "  --sidebar-motion-duration: 200ms;",
+      "  --sidebar-motion-easing: cubic-bezier(.22, .8, .25, 1);",
       "  all: initial;",
       "  position: fixed;",
       "  inset: 0 0 auto auto;",
@@ -205,7 +223,7 @@
       "  pointer-events: none;",
       "}",
       "* { box-sizing: border-box; }",
-      "button, input, textarea { font: inherit; }",
+      "button, input, textarea, select { font: inherit; }",
       "button { color: inherit; }",
       "[hidden] { display: none !important; }",
       ".shell {",
@@ -229,15 +247,27 @@
       "  right: 0;",
       "  bottom: 0;",
       "  z-index: 2;",
-      "  display: flex;",
       "  width: var(--sidebar-effective-width);",
       "  min-width: 0;",
       "  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;",
       "  color: var(--text);",
       "  pointer-events: none;",
       "}",
-      ".shell.is-open { box-shadow: var(--shadow); }",
-      ".shell.is-resizing, .shell.is-resizing .rail, .shell.is-resizing .panel { transition: none !important; }",
+      ".sidebar-frame {",
+      "  position: absolute;",
+      "  inset: 0;",
+      "  z-index: 2;",
+      "  display: flex;",
+      "  width: 100%;",
+      "  min-width: 0;",
+      "  transform: translateX(100%);",
+      "  transition: transform var(--sidebar-motion-duration) var(--sidebar-motion-easing);",
+      "  pointer-events: none;",
+      "  will-change: transform;",
+      "}",
+      ".shell.phase-opening .sidebar-frame, .shell.phase-open .sidebar-frame { transform: translateX(0); }",
+      ".shell.phase-open .sidebar-frame { box-shadow: var(--shadow); pointer-events: auto; }",
+      ".shell.motion-disabled .sidebar-frame, .shell.is-resizing .sidebar-frame { transition: none !important; }",
       ".theme-graphite { --bg: #15171c; --surface: #1d2129; --surface-hover: #272d37; --text: #e8edf3; --muted: #a7b0bd; --border: #3a414d; --accent: #69d6c5; --accent-contrast: #11161c; --danger: #ff8b82; --scrollbar-track: #171a20; --scrollbar-thumb: #596271; --scrollbar-thumb-hover: #778394; --scrollbar-corner: #15171c; --separator-muted: #303641; }",
       ".theme-navy { --bg: #0b1220; --surface: #111c2e; --surface-hover: #182740; --text: #e5eefc; --muted: #9fb0ca; --border: #2a3c55; --accent: #55b7ff; --accent-contrast: #07111e; --danger: #ff8f8f; --scrollbar-track: #0d1727; --scrollbar-thumb: #425d7c; --scrollbar-thumb-hover: #5f7fa3; --scrollbar-corner: #0b1220; --separator-muted: #22344c; }",
       ".theme-violet { --bg: #14101d; --surface: #20162e; --surface-hover: #2d2040; --text: #f4edff; --muted: #b9aacb; --border: #4d3a67; --accent: #b58cff; --accent-contrast: #160e22; --danger: #ff96a8; --scrollbar-track: #181121; --scrollbar-thumb: #66517d; --scrollbar-thumb-hover: #8669a4; --scrollbar-corner: #14101d; --separator-muted: #3b2e4d; }",
@@ -257,7 +287,7 @@
       "  background: color-mix(in srgb, var(--surface) 94%, transparent);",
       "  box-shadow: -4px 0 14px rgb(15 23 42 / 10%);",
       "  backdrop-filter: blur(10px);",
-      "  pointer-events: auto;",
+      "  pointer-events: none;",
       "}",
       ".icon-button, .rail-button, .compact-button, .quick-action, .panel-opener {",
       "  display: inline-grid;",
@@ -272,7 +302,7 @@
       ".rail-button { width: 36px; height: 36px; color: var(--muted); }",
       ".rail-button:hover, .icon-button:hover, .compact-button:hover { background: var(--surface-hover); color: var(--text); }",
       ".rail-button.is-active { border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); background: color-mix(in srgb, var(--accent) 15%, var(--surface)); color: var(--accent); }",
-      "button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }",
+      "button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }",
       "button:disabled { cursor: wait; opacity: .55; }",
       "svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }",
       ".panel {",
@@ -284,19 +314,20 @@
       "  overflow: hidden;",
       "  border-left: 1px solid var(--border);",
       "  background: var(--bg);",
-      "  pointer-events: auto;",
+      "  pointer-events: none;",
       "}",
-      ".panel-resize { position: absolute; top: 0; bottom: 0; left: 0; z-index: 5; width: 10px; cursor: ew-resize; touch-action: none; outline: 0; pointer-events: auto; }",
+      ".phase-open .rail, .phase-open .panel, .phase-open .panel-resize { pointer-events: auto; }",
+      ".panel-resize { position: absolute; top: 0; bottom: 0; left: 0; z-index: 5; width: 10px; cursor: ew-resize; touch-action: none; outline: 0; pointer-events: none; }",
       ".panel-resize::after { content: ''; position: absolute; top: 0; bottom: 0; left: 0; width: 1px; background: transparent; transition: background 120ms ease; }",
       ".panel-resize:hover::after, .panel-resize:focus-visible::after, .panel-resize.is-resizing::after { background: var(--accent); }",
       ".panel-wallpaper, .panel-scrim { position: absolute; inset: 0; pointer-events: none; }",
       ".panel-wallpaper { background-position: center; background-size: cover; opacity: .58; }",
       ".panel-scrim { background: color-mix(in srgb, var(--bg) 90%, transparent); }",
       ".has-wallpaper .panel-scrim { background: color-mix(in srgb, var(--bg) 76%, transparent); backdrop-filter: blur(1px); }",
-      ".panel-content { position: relative; z-index: 1; display: grid; height: 100%; grid-template-rows: auto minmax(0, 1fr); }",
+      ".panel-content { position: relative; z-index: 1; display: grid; min-width: 0; max-width: 100%; height: 100%; grid-template-rows: auto minmax(0, 1fr); }",
       ".panel-header { display: flex; min-height: 58px; padding: 16px 18px 12px; align-items: center; border-bottom: 1px solid var(--border); }",
       ".panel-title { margin: 0; font-size: 17px; font-weight: 680; letter-spacing: -.01em; }",
-      ".panel-body { min-height: 0; overflow: auto; padding: 16px; }",
+      ".panel-body { min-width: 0; max-width: 100%; min-height: 0; overflow: auto; padding: 16px; }",
       ".panel-body, .recent-popup { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track); scrollbar-gutter: stable; }",
       ".panel-body::-webkit-scrollbar, .recent-popup::-webkit-scrollbar { width: 10px; height: 10px; }",
       ".panel-body::-webkit-scrollbar-track, .recent-popup::-webkit-scrollbar-track { background: var(--scrollbar-track); }",
@@ -315,9 +346,14 @@
       "  background: var(--accent);",
       "  color: var(--accent-contrast);",
       "  box-shadow: 0 6px 18px rgb(15 23 42 / 25%);",
-      "  pointer-events: auto;",
-      "  transition: background 120ms ease, opacity 120ms ease;",
+      "  opacity: 0;",
+      "  transform: scale(.8);",
+      "  pointer-events: none;",
+      "  transition: opacity var(--sidebar-motion-duration) var(--sidebar-motion-easing), transform var(--sidebar-motion-duration) var(--sidebar-motion-easing), background 120ms ease;",
       "}",
+      ".phase-revealing-opener .quick-action, .phase-closed .quick-action { opacity: 1; transform: scale(1); }",
+      ".phase-closed .quick-action { pointer-events: auto; }",
+      ".motion-disabled .quick-action { transition: none !important; }",
       ".quick-action:hover { background: color-mix(in srgb, var(--accent) 86%, var(--text)); }",
       ".quick-action svg { width: 17px; height: 17px; fill: currentColor; stroke: none; margin-left: 2px; }",
       ".panel-opener {",
@@ -333,8 +369,13 @@
       "  background: var(--accent);",
       "  color: var(--accent-contrast);",
       "  box-shadow: -5px 5px 16px rgb(15 23 42 / 24%);",
-      "  pointer-events: auto;",
+      "  transform: translateX(100%);",
+      "  transition: transform var(--sidebar-motion-duration) var(--sidebar-motion-easing), background 120ms ease;",
+      "  pointer-events: none;",
       "}",
+      ".phase-revealing-opener .panel-opener, .phase-closed .panel-opener { transform: translateX(0); }",
+      ".phase-closed .panel-opener { pointer-events: auto; }",
+      ".motion-disabled .panel-opener { transition: none !important; }",
       ".panel-opener:hover { background: color-mix(in srgb, var(--accent) 86%, var(--text)); }",
       ".panel-opener svg { width: 18px; height: 18px; stroke-width: 2.2; }",
       ".recent-popup {",
@@ -372,6 +413,27 @@
       "}",
       ".recent-template-button:hover { background: var(--surface-hover); }",
       "@keyframes recent-popup-in { from { opacity: 0; transform: translateX(4px); } }",
+      ".template-preview {",
+      "  position: fixed;",
+      "  z-index: 7;",
+      "  display: grid;",
+      "  width: min(380px, calc(100vw - 24px));",
+      "  max-width: calc(100vw - 24px);",
+      "  max-height: min(420px, 60vh);",
+      "  padding: 12px;",
+      "  gap: 8px;",
+      "  overflow: auto;",
+      "  border: 1px solid var(--border);",
+      "  border-radius: 10px;",
+      "  background: var(--surface);",
+      "  color: var(--text);",
+      "  box-shadow: var(--shadow);",
+      "  pointer-events: auto;",
+      "}",
+      ".template-preview-header { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }",
+      ".template-preview-name { min-width: 0; overflow-wrap: anywhere; }",
+      ".template-preview-auto { flex: 0 0 auto; padding: 2px 6px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 16%, var(--surface)); color: var(--accent); font-size: 11px; font-weight: 700; }",
+      ".template-preview-content { min-width: 0; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }",
       ".section-toolbar { display: flex; margin-bottom: 14px; align-items: center; justify-content: space-between; gap: 10px; }",
       ".button {",
       "  display: inline-flex;",
@@ -392,10 +454,11 @@
       ".button svg { width: 15px; height: 15px; }",
       ".compact-button { width: 34px; height: 34px; border-color: var(--border); background: var(--surface); }",
       ".compact-button.is-active { border-color: var(--danger); color: var(--danger); }",
-      ".templates-list { display: grid; gap: 9px; }",
-      ".template-card { overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--surface) 94%, transparent); }",
+      ".templates-list { display: grid; min-width: 0; max-width: 100%; gap: 9px; }",
+      ".template-card { min-width: 0; max-width: 100%; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--surface) 94%, transparent); }",
       ".template-card.is-dragging { opacity: .5; }",
-      ".template-summary { display: grid; min-height: 48px; padding: 6px 7px; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; }",
+      ".template-summary { display: grid; min-height: 48px; padding: 6px 7px; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 7px; }",
+      ".template-preview-hotspot { display: grid; min-width: 0; min-height: 34px; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; }",
       ".drag-handle { display: grid; width: 25px; height: 34px; place-items: center; color: var(--muted); cursor: grab; border-radius: 6px; }",
       ".drag-handle:active { cursor: grabbing; }",
       ".drag-handle svg { width: 16px; height: 16px; stroke-width: 3; }",
@@ -408,11 +471,11 @@
       ".auto-send { display: inline-flex; min-height: 31px; padding: 0 3px; align-items: center; gap: 4px; color: var(--muted); cursor: pointer; }",
       ".auto-send input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }",
       ".auto-send span { font-size: 11px; }",
-      ".editor { display: grid; padding: 12px; gap: 10px; border-top: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 74%, transparent); }",
+      ".editor { display: grid; min-width: 0; max-width: 100%; padding: 12px; gap: 10px; border-top: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 74%, transparent); }",
       ".new-editor { margin-bottom: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; }",
-      ".field { display: grid; gap: 5px; }",
+      ".field { display: grid; min-width: 0; max-width: 100%; gap: 5px; }",
       ".field > span { color: var(--muted); font-size: 12px; font-weight: 600; }",
-      ".input { width: 100%; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }",
+      ".input { width: 100%; min-width: 0; max-width: 100%; overflow-wrap: anywhere; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }",
       "input.input { min-height: 36px; padding: 7px 9px; }",
       "textarea.input { min-height: 112px; padding: 8px 9px; resize: vertical; line-height: 1.45; }",
       ".editor-actions, .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }",
@@ -433,12 +496,14 @@
       ".settings-help { margin: 0; color: var(--muted); font-size: 12px; }",
       ".setting-option { display: flex; min-height: 38px; padding: 8px 10px; align-items: center; gap: 9px; border: 1px solid var(--border); border-radius: 8px; background: color-mix(in srgb, var(--surface) 92%, transparent); cursor: pointer; }",
       ".setting-option input { margin: 0; accent-color: var(--accent); }",
+      ".recent-count-option { justify-content: space-between; cursor: default; }",
+      ".compact-select { min-width: 58px; min-height: 30px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }",
       ".file-input { width: 100%; color: var(--muted); }",
       ".file-input::file-selector-button { margin-right: 9px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); cursor: pointer; }",
       "@media (prefers-color-scheme: dark) {",
       "  .theme-system { --bg: #17191d; --surface: #22262d; --surface-hover: #2c323b; --text: #edf1f7; --muted: #aab2bf; --border: #3c434e; --accent: #66cfc0; --accent-contrast: #101514; --danger: #ff938c; }",
       "}",
-      "@media (prefers-reduced-motion: reduce) { .quick-action { transition: none; } .recent-popup { animation: none; } }",
+      "@media (prefers-reduced-motion: reduce) { .sidebar-frame, .panel-opener, .quick-action { transition: none; } .recent-popup { animation: none; } }",
       analysisUiModule.styles(),
       workspaceUiModule.styles(),
     ].join("\n");
@@ -447,34 +512,44 @@
   function shellMarkup() {
     return [
       '<style>' + styles() + '</style>',
-      '<div class="shell theme-system">',
+      '<div class="shell theme-system phase-closed motion-disabled">',
       '  <button class="quick-action" type="button" data-action="quick-next" title="Отправить «Далее», если поле пусто" aria-label="Отправить «Далее», если поле пусто">' + ICONS.quick + '</button>',
       '  <button class="panel-opener" type="button" data-action="open-panel" title="Открыть меню шаблонов" aria-label="Открыть меню шаблонов" aria-haspopup="menu" aria-expanded="false">' + ICONS.opener + '</button>',
       '  <div class="recent-popup" role="menu" aria-label="Последние запущенные шаблоны" hidden></div>',
-      '  <div class="panel-resize" role="separator" aria-label="Изменить ширину панели" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="720" aria-valuenow="360" tabindex="0" hidden></div>',
-      '  <nav class="rail" aria-label="Разделы chatgpt-helper" hidden>',
+      '  <aside class="template-preview" aria-label="Предпросмотр шаблона" hidden>',
+      '    <div class="template-preview-header"><strong class="template-preview-name"></strong><span class="template-preview-auto" hidden>Автоотправка</span></div>',
+      '    <p class="template-preview-content"></p>',
+      '  </aside>',
+      '  <div class="sidebar-frame" aria-hidden="true">',
+      '    <div class="panel-resize" role="separator" aria-label="Изменить ширину панели" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="720" aria-valuenow="360" tabindex="-1" hidden></div>',
+      '    <nav class="rail" aria-label="Разделы chatgpt-helper" hidden>',
       '    <button class="rail-button" type="button" data-section="templates" title="Шаблоны" aria-label="Шаблоны">' + ICONS.templates + '</button>',
       '    <button class="rail-button" type="button" data-section="analysis" title="Анализ текста" aria-label="Анализ текста">' + ICONS.analysis + '</button>',
       '    <button class="rail-button" type="button" data-section="saved" title="Сохранённое" aria-label="Сохранённое">' + ICONS.saved + '</button>',
       '    <button class="rail-button" type="button" data-section="settings" title="Настройки" aria-label="Настройки">' + ICONS.settings + '</button>',
-      '  </nav>',
-      '  <section class="panel" aria-label="chatgpt-helper" hidden>',
+      '    </nav>',
+      '    <section class="panel" aria-label="chatgpt-helper" hidden>',
       '    <div class="panel-wallpaper" aria-hidden="true"></div>',
       '    <div class="panel-scrim" aria-hidden="true"></div>',
       '    <div class="panel-content">',
       '      <header class="panel-header"><h2 class="panel-title"></h2></header>',
       '      <main class="panel-body"></main>',
       '    </div>',
-      '  </section>',
+      '    </section>',
+      '  </div>',
       '</div>',
     ].join("");
   }
 
   function applyShellState() {
     if (!state.shell) return;
+    const phase = state.shellPhase;
+    const frameVisible = phase === "opening" || phase === "open" || phase === "closing";
+    const frameInteractive = phase === "open" && !state.sidebarResizing;
+    state.open = phase !== "closed";
     const effectiveSidebarWidth = workspaceContract.effectiveWidth(
       "sidebarWidth",
-      state.settings.layout.sidebarWidth,
+      state.sidebarPreferredWidth,
       window.innerWidth,
     );
     state.host?.style.setProperty("--sidebar-effective-width", `${effectiveSidebarWidth}px`);
@@ -482,26 +557,78 @@
       state.sidebarHandle.setAttribute("aria-valuenow", String(effectiveSidebarWidth));
     }
     state.shell.className = "shell theme-" + state.settings.theme
-      + (state.open ? " is-open" : "")
+      + " phase-" + phase
+      + (state.shellMotionReady ? "" : " motion-disabled")
       + (state.sidebarResizing ? " is-resizing" : "")
       + (state.settings.wallpaperDataUrl ? " has-wallpaper" : "");
-    state.panel.hidden = !state.open;
-    state.rail.hidden = !state.open;
-    state.sidebarHandle.hidden = !state.open;
-    state.opener.hidden = state.open;
-    state.quickAction.hidden = state.open;
+    state.sidebarFrame?.setAttribute("aria-hidden", frameInteractive ? "false" : "true");
+    if (state.sidebarFrame) state.sidebarFrame.inert = !frameInteractive;
+    state.panel.hidden = !frameVisible;
+    state.rail.hidden = !frameVisible;
+    state.sidebarHandle.hidden = !frameVisible;
+    state.panel.setAttribute("aria-hidden", frameInteractive ? "false" : "true");
+    state.rail.setAttribute("aria-hidden", frameInteractive ? "false" : "true");
+    state.sidebarHandle.tabIndex = frameInteractive ? 0 : -1;
+    state.opener.tabIndex = phase === "closed" ? 0 : -1;
+    state.opener.setAttribute("aria-expanded", phase === "opening" || phase === "open" ? "true" : "false");
+    state.opener.setAttribute("aria-hidden", phase === "closed" ? "false" : "true");
+    const quickActionState = workspaceUiModule.quickActionStateForPhase(phase);
+    state.quickAction.hidden = !quickActionState.rendered;
+    state.quickAction.tabIndex = quickActionState.interactive ? 0 : -1;
+    state.quickAction.setAttribute("aria-hidden", quickActionState.interactive ? "false" : "true");
     state.title.textContent = SECTION_TITLES[state.activeSection];
 
     state.shadow.querySelectorAll("[data-section]").forEach(function updateNavigation(button) {
       const active = button.dataset.section === state.activeSection;
       button.classList.toggle("is-active", active);
       button.setAttribute("aria-current", active ? "page" : "false");
-      button.setAttribute("aria-expanded", active && state.open ? "true" : "false");
+      button.setAttribute("aria-expanded", active && (phase === "opening" || phase === "open") ? "true" : "false");
     });
 
     state.wallpaper.style.backgroundImage = state.settings.wallpaperDataUrl
       ? "url(" + JSON.stringify(state.settings.wallpaperDataUrl) + ")"
       : "";
+  }
+
+  function completeShellMotion(expectedPhase) {
+    if (state.shellPhase !== expectedPhase) return;
+    const nextPhase = workspaceUiModule.nextSidebarPhase(expectedPhase, "complete");
+    if (nextPhase === expectedPhase) return;
+    state.shellPhase = nextPhase;
+    applyShellState();
+    if (nextPhase === "revealing-opener") {
+      state.shellTransitionController?.run(state.opener, function openerRevealComplete() {
+        completeShellMotion("revealing-opener");
+      });
+      return;
+    }
+    if (nextPhase === "closed" && state.shellRestoreFocus) {
+      state.shellRestoreFocus = false;
+      state.opener?.focus();
+    }
+  }
+
+  function startShellMotion(nextPhase, restoreFocus) {
+    closeTemplatePreview();
+    closeRecentPopup();
+    state.shellRestoreFocus = Boolean(restoreFocus);
+    state.shellPhase = nextPhase;
+    applyShellState();
+    const movingElement = nextPhase === "revealing-opener" ? state.opener : state.sidebarFrame;
+    state.shellTransitionController?.run(movingElement, function shellMotionComplete() {
+      completeShellMotion(nextPhase);
+    });
+  }
+
+  function enableShellMotionAfterMount() {
+    const mountedHost = state.host;
+    requestAnimationFrame(function establishInitialClosedFrame() {
+      requestAnimationFrame(function enableMotionOnFollowingFrame() {
+        if (state.host !== mountedHost || !mountedHost?.isConnected) return;
+        state.shellMotionReady = true;
+        applyShellState();
+      });
+    });
   }
 
   function setSidebarWidthPreview(preferredWidth) {
@@ -513,14 +640,35 @@
 
   async function persistSidebarWidth(preferredWidth) {
     const width = workspaceContract.clampPreferredWidth("sidebarWidth", preferredWidth);
-    if (width === state.settings.layout.sidebarWidth) {
-      setSidebarWidthPreview(width);
+    const token = ++state.sidebarWidthCommitToken;
+    state.sidebarPreferredWidth = width;
+    setSidebarWidthPreview(width);
+    if (width === state.settings.layout.sidebarWidth && !state.sidebarWidthCommitPending) {
+      state.sidebarWidthCommitPending = false;
       return true;
     }
-    return saveSettings({
-      ...state.settings,
-      layout: { ...state.settings.layout, sidebarWidth: width },
-    }, "Ширина панели сохранена.");
+    state.sidebarWidthCommitPending = true;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: workspaceContract.MESSAGE_TYPES.SETTINGS_UPDATE,
+        patch: { layout: { sidebarWidth: width } },
+      });
+      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось сохранить ширину панели.");
+      if (token !== state.sidebarWidthCommitToken) return true;
+      state.settings = normalizeSettings(response.settings);
+      state.sidebarWidthCommitPending = false;
+      state.sidebarPreferredWidth = state.settings.layout.sidebarWidth;
+      applyShellState();
+      setStatus("success", "Ширина панели сохранена.");
+      return true;
+    } catch (error) {
+      if (token !== state.sidebarWidthCommitToken) return false;
+      state.sidebarWidthCommitPending = false;
+      state.sidebarPreferredWidth = state.settings.layout.sidebarWidth;
+      applyShellState();
+      setStatus("error", error?.message || "Не удалось сохранить ширину панели.");
+      return false;
+    }
   }
 
   function installSidebarResizer(handle) {
@@ -548,15 +696,16 @@
     }
 
     handle.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || drag) return;
+      if (event.button !== 0 || drag || state.shellPhase !== "open") return;
       event.preventDefault();
+      closeTemplatePreview();
       previousUserSelect = document.documentElement.style.userSelect;
       document.documentElement.style.userSelect = "none";
       drag = {
         pointerId: event.pointerId,
         startX: event.clientX,
-        startWidth: state.settings.layout.sidebarWidth,
-        width: state.settings.layout.sidebarWidth,
+        startWidth: state.sidebarPreferredWidth,
+        width: state.sidebarPreferredWidth,
       };
       state.sidebarResizing = true;
       handle.classList.add("is-resizing");
@@ -579,11 +728,13 @@
     handle.addEventListener("pointercancel", () => finishDrag(false));
     handle.addEventListener("lostpointercapture", () => { if (drag) finishDrag(true); });
     handle.addEventListener("dblclick", (event) => {
+      if (state.shellPhase !== "open") return;
       event.preventDefault();
       void persistSidebarWidth(workspaceContract.LAYOUT.sidebarWidth.default);
     });
     handle.addEventListener("keydown", (event) => {
-      const current = state.settings.layout.sidebarWidth;
+      if (state.shellPhase !== "open") return;
+      const current = state.sidebarPreferredWidth;
       const step = event.shiftKey ? 50 : 10;
       let next = null;
       if (event.key === "ArrowLeft") next = current + step;
@@ -617,17 +768,15 @@
       state.recentPopup.hidden = true;
       state.recentPopup.replaceChildren();
     }
-    state.opener?.setAttribute("aria-expanded", "false");
+    if (state.preview.source === "recent") closeTemplatePreview();
   }
 
   function getAvailableRecentTemplates() {
-    const templatesById = new Map(state.templates.map(function mapTemplate(template) {
-      return [template.id, template];
-    }));
-    return state.recentTemplateIds.flatMap(function resolveTemplate(id) {
-      const template = templatesById.get(id);
-      return template ? [template] : [];
-    });
+    return workspaceUiModule.recentTemplatesForDisplay(
+      state.recentTemplateIds,
+      state.templates,
+      state.settings.recentTemplatesHoverCount,
+    );
   }
 
   function showRecentPopup() {
@@ -644,10 +793,9 @@
     }
 
     state.recentPopup.innerHTML = templates.map(function recentTemplateMarkup(template) {
-      return '<button class="recent-template-button" type="button" role="menuitem" data-action="run-recent-template" data-id="' + escapeHtml(template.id) + '" title="' + escapeHtml(template.name) + '" aria-label="Запустить шаблон: ' + escapeHtml(template.name) + '">' + escapeHtml(template.name) + '</button>';
+      return '<button class="recent-template-button" type="button" role="menuitem" data-action="run-recent-template" data-id="' + escapeHtml(template.id) + '" data-preview-anchor data-preview-id="' + escapeHtml(template.id) + '" data-preview-source="recent" title="' + escapeHtml(template.name) + '" aria-label="Запустить шаблон: ' + escapeHtml(template.name) + '">' + escapeHtml(template.name) + '</button>';
     }).join("");
     state.recentPopup.hidden = false;
-    state.opener?.setAttribute("aria-expanded", "true");
   }
 
   function scheduleRecentPopup() {
@@ -665,6 +813,7 @@
     clearRecentCloseTimer();
     state.recentCloseTimer = setTimeout(function closeRecentPopupAfterDelay() {
       state.recentCloseTimer = null;
+      if (state.preview.source === "recent" && state.preview.pointerInside) return;
       closeRecentPopup();
     }, RECENT_CLOSE_DELAY_MS);
   }
@@ -682,8 +831,171 @@
     clearRecentCloseTimer();
   }
 
-  function onRecentPopupPointerLeave() {
+  function onRecentPopupPointerLeave(event) {
+    if (state.previewLayer?.contains(event.relatedTarget)) {
+      clearRecentCloseTimer();
+      return;
+    }
     scheduleRecentPopupClose();
+  }
+
+  function clearPreviewOpenTimer() {
+    if (state.preview.openTimer === null) return;
+    clearTimeout(state.preview.openTimer);
+    state.preview.openTimer = null;
+  }
+
+  function clearPreviewCloseTimer() {
+    if (state.preview.closeTimer === null) return;
+    clearTimeout(state.preview.closeTimer);
+    state.preview.closeTimer = null;
+  }
+
+  function closeTemplatePreview() {
+    const consumed = state.preview.phase !== "closed";
+    clearPreviewOpenTimer();
+    clearPreviewCloseTimer();
+    state.preview.phase = "closed";
+    state.preview.templateId = null;
+    state.preview.source = null;
+    state.preview.anchor = null;
+    state.preview.pointerInside = false;
+    if (state.previewLayer) {
+      state.previewLayer.hidden = true;
+      state.previewLayer.style.removeProperty("left");
+      state.previewLayer.style.removeProperty("top");
+    }
+    if (state.previewName) state.previewName.textContent = "";
+    if (state.previewContent) state.previewContent.textContent = "";
+    if (state.previewAutoSend) state.previewAutoSend.hidden = true;
+    return consumed;
+  }
+
+  function previewSurfaceAvailable(source) {
+    if (source === "main") return state.shellPhase === "open";
+    return source === "recent"
+      && state.shellPhase === "closed"
+      && state.recentPopup
+      && !state.recentPopup.hidden;
+  }
+
+  function previewSuppressed(templateId, source, anchor) {
+    return !previewSurfaceAvailable(source)
+      || state.draggingId !== null
+      || state.busyTemplateId === templateId
+      || state.editing?.id === templateId
+      || state.confirmingDeleteId === templateId
+      || !anchor?.isConnected;
+  }
+
+  function positionTemplatePreview(anchor) {
+    if (!state.previewLayer || !anchor?.isConnected) return false;
+    const position = workspaceUiModule.previewPosition(
+      anchor.getBoundingClientRect(),
+      state.previewLayer.getBoundingClientRect(),
+      { width: window.innerWidth, height: window.innerHeight, gap: 10, padding: 12 },
+    );
+    state.previewLayer.style.left = `${position.left}px`;
+    state.previewLayer.style.top = `${position.top}px`;
+    return true;
+  }
+
+  function openTemplatePreview(anchor, templateId, source) {
+    clearPreviewOpenTimer();
+    clearPreviewCloseTimer();
+    if (previewSuppressed(templateId, source, anchor)) {
+      closeTemplatePreview();
+      return;
+    }
+    const template = state.templates.find((item) => item.id === templateId);
+    if (!template || !state.previewLayer) {
+      closeTemplatePreview();
+      return;
+    }
+    state.preview.phase = "open";
+    state.preview.templateId = templateId;
+    state.preview.source = source;
+    state.preview.anchor = anchor;
+    state.previewName.textContent = template.name;
+    state.previewContent.textContent = template.content;
+    state.previewAutoSend.hidden = template.autoSend !== true;
+    state.previewLayer.hidden = false;
+    if (!positionTemplatePreview(anchor)) closeTemplatePreview();
+  }
+
+  function scheduleTemplatePreview(anchor, templateId, source, immediate) {
+    clearPreviewCloseTimer();
+    if (previewSuppressed(templateId, source, anchor)) {
+      closeTemplatePreview();
+      return;
+    }
+    if (state.preview.phase === "open"
+      && state.preview.templateId === templateId
+      && state.preview.anchor === anchor) return;
+    clearPreviewOpenTimer();
+    state.preview.phase = "waiting";
+    state.preview.templateId = templateId;
+    state.preview.source = source;
+    state.preview.anchor = anchor;
+    if (immediate) {
+      openTemplatePreview(anchor, templateId, source);
+      return;
+    }
+    state.preview.openTimer = setTimeout(function openTemplatePreviewAfterDelay() {
+      state.preview.openTimer = null;
+      openTemplatePreview(anchor, templateId, source);
+    }, TEMPLATE_PREVIEW_OPEN_DELAY_MS);
+  }
+
+  function scheduleTemplatePreviewClose() {
+    clearPreviewOpenTimer();
+    clearPreviewCloseTimer();
+    if (state.preview.phase === "closed") return;
+    state.preview.closeTimer = setTimeout(function closeTemplatePreviewAfterGrace() {
+      state.preview.closeTimer = null;
+      closeTemplatePreview();
+    }, TEMPLATE_PREVIEW_CLOSE_DELAY_MS);
+  }
+
+  function onShadowPointerOver(event) {
+    const anchor = workspaceUiModule.previewAnchorFromTarget(event.target);
+    if (!anchor || anchor.contains(event.relatedTarget)) return;
+    scheduleTemplatePreview(anchor, anchor.dataset.previewId, anchor.dataset.previewSource, false);
+  }
+
+  function onShadowPointerOut(event) {
+    const anchor = workspaceUiModule.previewAnchorFromTarget(event.target);
+    if (!anchor || anchor.contains(event.relatedTarget) || state.previewLayer?.contains(event.relatedTarget)) return;
+    scheduleTemplatePreviewClose();
+  }
+
+  function onShadowFocusIn(event) {
+    const anchor = workspaceUiModule.previewAnchorFromTarget(event.target);
+    if (!anchor) return;
+    scheduleTemplatePreview(anchor, anchor.dataset.previewId, anchor.dataset.previewSource, true);
+  }
+
+  function onShadowFocusOut(event) {
+    const anchor = workspaceUiModule.previewAnchorFromTarget(event.target);
+    if (!anchor || anchor.contains(event.relatedTarget) || state.previewLayer?.contains(event.relatedTarget)) return;
+    closeTemplatePreview();
+  }
+
+  function onPreviewPointerEnter() {
+    state.preview.pointerInside = true;
+    clearPreviewCloseTimer();
+    if (state.preview.source === "recent") clearRecentCloseTimer();
+  }
+
+  function onPreviewPointerLeave(event) {
+    state.preview.pointerInside = false;
+    if (state.preview.anchor?.contains(event.relatedTarget)) return;
+    scheduleTemplatePreviewClose();
+    if (state.preview.source === "recent"
+      && !state.recentPopup?.contains(event.relatedTarget)
+      && !state.opener?.contains(event.relatedTarget)) {
+      scheduleRecentPopupClose();
+    }
   }
 
   function statusMarkup() {
@@ -712,8 +1024,10 @@
     return [
       '<article class="template-card" data-template-id="' + escapeHtml(template.id) + '">',
       '  <div class="template-summary">',
-      '    <span class="drag-handle" draggable="true" data-drag-id="' + escapeHtml(template.id) + '" title="Перетащить шаблон" aria-label="Перетащить шаблон" tabindex="0">' + ICONS.drag + '</span>',
-      '    <span class="template-name" title="' + escapeHtml(template.name) + '">' + escapeHtml(template.name) + '</span>',
+      '    <div class="template-preview-hotspot" data-preview-anchor data-preview-id="' + escapeHtml(template.id) + '" data-preview-source="main">',
+      '      <span class="drag-handle" draggable="true" data-drag-id="' + escapeHtml(template.id) + '" title="Перетащить шаблон" aria-label="Перетащить шаблон" tabindex="0">' + ICONS.drag + '</span>',
+      '      <span class="template-name" title="' + escapeHtml(template.name) + '">' + escapeHtml(template.name) + '</span>',
+      '    </div>',
       '    <div class="template-controls">',
       '      <button class="icon-button run" type="button" data-action="run-template" data-id="' + escapeHtml(template.id) + '" title="Запустить шаблон" aria-label="Запустить шаблон"' + (busy ? " disabled" : "") + '>' + ICONS.play + '</button>',
       '      <button class="icon-button' + (editing ? " expanded" : "") + '" type="button" data-action="edit-template" data-id="' + escapeHtml(template.id) + '" title="Развернуть или свернуть редактор" aria-label="Развернуть или свернуть редактор" aria-expanded="' + (editing ? "true" : "false") + '">' + ICONS.chevron + '</button>',
@@ -767,6 +1081,13 @@
     const themeOptions = themes.map(function themeOption(theme) {
       return '<label class="theme-option"><input type="radio" name="overlay-theme" data-action="theme" value="' + theme[0] + '"' + (state.settings.theme === theme[0] ? " checked" : "") + '><span>' + theme[1] + '</span></label>';
     }).join("");
+    const recentCountOptions = Array.from(
+      { length: workspaceContract.RECENT_TEMPLATES_HOVER_COUNT.max },
+      function recentCountOption(_, index) {
+        const value = index + workspaceContract.RECENT_TEMPLATES_HOVER_COUNT.min;
+        return '<option value="' + value + '"' + (state.settings.recentTemplatesHoverCount === value ? " selected" : "") + '>' + value + '</option>';
+      },
+    ).join("");
     return [
       '<section class="settings-group">',
       '  <h3>Внешний вид</h3>',
@@ -783,6 +1104,9 @@
       '  <label class="setting-option"><input type="checkbox" data-action="close-panel-after-run"' + (state.settings.closePanelAfterRun ? " checked" : "") + '><span>Закрывать панель после запуска шаблона</span></label>',
       '  <label class="setting-option"><input type="checkbox" data-action="close-panel-on-outside-click"' + (state.settings.closePanelOnOutsideClick ? " checked" : "") + '><span>Закрывать панель при клике вне неё</span></label>',
       '  <label class="setting-option"><input type="checkbox" data-action="recent-templates-hover"' + (state.settings.recentTemplatesHoverEnabled ? " checked" : "") + '><span>Показывать последние шаблоны при наведении</span></label>',
+      state.settings.recentTemplatesHoverEnabled
+        ? '  <label class="setting-option recent-count-option"><span>Количество шаблонов</span><select class="compact-select" data-action="recent-templates-count">' + recentCountOptions + '</select></label>'
+        : "",
       '</section>',
       '<section class="settings-group">',
       '  <h3>Горячие клавиши</h3>',
@@ -804,32 +1128,33 @@
     else if (state.activeSection === "analysis") state.body.innerHTML = analysisMarkup();
     else if (state.activeSection === "saved") state.body.innerHTML = savedMarkup();
     else state.body.innerHTML = settingsMarkup();
+    if (state.preview.anchor && !state.preview.anchor.isConnected) closeTemplatePreview();
   }
 
-  function openSection(section) {
+  function openSection(section, options) {
     if (!SECTION_TITLES[section]) return;
+    if (!["closed", "open"].includes(state.shellPhase)) return;
+    closeTemplatePreview();
     closeRecentPopup();
     state.activeSection = section;
-    state.open = true;
-    clearStatus();
+    if (!options?.preserveStatus) clearStatus();
     renderSection();
+    if (state.shellPhase === "closed") {
+      startShellMotion(workspaceUiModule.nextSidebarPhase("closed", "open"), false);
+    }
     if (section === "analysis" || section === "settings") void refreshKeyStatus();
     if (section === "analysis") void refreshGlossary().catch(handleUiError);
     if (section === "saved") void refreshSaved().catch(handleUiError);
   }
 
-  function closePanel() {
-    closeRecentPopup();
-    if (!state.open) return;
-    state.open = false;
-    applyShellState();
+  function closePanel(restoreFocus) {
+    if (state.shellPhase !== "open" || state.sidebarResizing) return;
+    startShellMotion(workspaceUiModule.nextSidebarPhase("open", "close"), restoreFocus);
   }
 
   function togglePanel() {
-    closeRecentPopup();
-    state.open = !state.open;
-    applyShellState();
-    if (state.open) renderSection();
+    if (state.shellPhase === "closed") openSection(state.activeSection);
+    else if (state.shellPhase === "open") closePanel(false);
   }
 
   async function saveTemplateMutation(message) {
@@ -856,6 +1181,9 @@
       });
       if (!response?.ok) throw new Error(response?.error?.message || "Не удалось сохранить настройки.");
       state.settings = normalizeSettings(response.settings);
+      if (!state.sidebarWidthCommitPending && !state.sidebarResizing) {
+        state.sidebarPreferredWidth = state.settings.layout.sidebarWidth;
+      }
       if (!state.settings.recentTemplatesHoverEnabled) closeRecentPopup();
       applyShellState();
       setStatus("success", successText || "Настройки сохранены.");
@@ -1064,9 +1392,9 @@
   function showTemplateRunError(text) {
     closeRecentPopup();
     state.activeSection = "templates";
-    state.open = true;
     state.status = { kind: "error", text: text || "Не удалось выполнить шаблон." };
-    renderSection();
+    if (state.shellPhase === "closed") openSection("templates", { preserveStatus: true });
+    else if (state.shellPhase === "open") renderSection();
   }
 
   async function runTemplate(id) {
@@ -1250,6 +1578,7 @@
     if (!actionButton) return;
     const action = actionButton.dataset.action;
     const id = actionButton.dataset.id;
+    closeTemplatePreview();
 
     if (action === "open-analysis-options") {
       await state.analysisController?.openOptions();
@@ -1402,6 +1731,7 @@
 
   async function onShadowChange(event) {
     const action = event.target.dataset.action;
+    if (action) closeTemplatePreview();
     if (action === "auto-send") {
       const id = event.target.dataset.id;
       const template = state.templates.find((item) => item.id === id);
@@ -1422,6 +1752,11 @@
       await saveSettings({ ...state.settings, closePanelOnOutsideClick: event.target.checked }, "Настройка закрытия панели сохранена.");
     } else if (action === "recent-templates-hover") {
       await saveSettings({ ...state.settings, recentTemplatesHoverEnabled: event.target.checked }, "Настройка последних шаблонов сохранена.");
+    } else if (action === "recent-templates-count") {
+      await saveSettings({
+        ...state.settings,
+        recentTemplatesHoverCount: Number(event.target.value),
+      }, "Количество последних шаблонов сохранено.");
     } else if (action === "analysis-term-color-mode") {
       await saveSettings({
         ...state.settings,
@@ -1483,6 +1818,7 @@
   }
 
   function onDragStart(event) {
+    closeTemplatePreview();
     if (state.sidebarResizing) {
       event.preventDefault();
       return;
@@ -1580,6 +1916,8 @@
   }
 
   function mount() {
+    state.shellTransitionController?.cancel();
+    closeTemplatePreview();
     closeRecentPopup();
     state.sidebarResizeCleanup?.();
     state.analysisUi?.closeDialog(false);
@@ -1594,15 +1932,32 @@
     state.host = host;
     state.shadow = shadow;
     state.shell = shadow.querySelector(".shell");
+    state.sidebarFrame = shadow.querySelector(".sidebar-frame");
     state.rail = shadow.querySelector(".rail");
     state.panel = shadow.querySelector(".panel");
     state.sidebarHandle = shadow.querySelector(".panel-resize");
     state.opener = shadow.querySelector(".panel-opener");
     state.recentPopup = shadow.querySelector(".recent-popup");
+    state.previewLayer = shadow.querySelector(".template-preview");
+    state.previewName = shadow.querySelector(".template-preview-name");
+    state.previewAutoSend = shadow.querySelector(".template-preview-auto");
+    state.previewContent = shadow.querySelector(".template-preview-content");
     state.quickAction = shadow.querySelector(".quick-action");
     state.wallpaper = shadow.querySelector(".panel-wallpaper");
     state.title = shadow.querySelector(".panel-title");
     state.body = shadow.querySelector(".panel-body");
+    state.shellPhase = "closed";
+    state.open = false;
+    state.shellMotionReady = false;
+    state.shellRestoreFocus = false;
+    state.shellTransitionController = workspaceUiModule.createTransformTransitionController({
+      duration: SIDEBAR_MOTION_DURATION_MS,
+      fallbackPadding: SIDEBAR_MOTION_FALLBACK_PADDING_MS,
+      prefersReducedMotion: function prefersReducedMotion() {
+        return !state.shellMotionReady
+          || window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches === true;
+      },
+    });
     if (!state.workspaceClient) {
       state.workspaceClient = workspaceUiModule.createClient({
         getContext: function getWorkspaceContext() { return state.workspaceContext; },
@@ -1628,6 +1983,10 @@
     shadow.addEventListener("click", function handleClick(event) { void onShadowClick(event).catch(handleUiError); });
     shadow.addEventListener("change", function handleChange(event) { void onShadowChange(event).catch(handleUiError); });
     shadow.addEventListener("input", onShadowInput);
+    shadow.addEventListener("pointerover", onShadowPointerOver);
+    shadow.addEventListener("pointerout", onShadowPointerOut);
+    shadow.addEventListener("focusin", onShadowFocusIn);
+    shadow.addEventListener("focusout", onShadowFocusOut);
     shadow.addEventListener("dragstart", onDragStart);
     shadow.addEventListener("dragend", onDragEnd);
     shadow.addEventListener("dragover", onDragOver);
@@ -1636,7 +1995,11 @@
     state.opener.addEventListener("pointerleave", onOpenerPointerLeave);
     state.recentPopup.addEventListener("pointerenter", onRecentPopupPointerEnter);
     state.recentPopup.addEventListener("pointerleave", onRecentPopupPointerLeave);
+    state.previewLayer.addEventListener("pointerenter", onPreviewPointerEnter);
+    state.previewLayer.addEventListener("pointerleave", onPreviewPointerLeave);
+    state.body.addEventListener("scroll", closeTemplatePreview, { passive: true });
     renderSection();
+    enableShellMotionAfterMount();
   }
 
   function ensureMounted() {
@@ -1648,6 +2011,7 @@
       const stored = await chrome.storage.local.get(["templates", "settings", "recentTemplateIds"]);
       state.templates = normalizeTemplates(stored.templates);
       state.settings = normalizeSettings(stored.settings);
+      state.sidebarPreferredWidth = state.settings.layout.sidebarWidth;
       state.recentTemplateIds = normalizeRecentTemplateIds(stored.recentTemplateIds);
       renderSection();
       await refreshKeyStatus();
@@ -1664,7 +2028,30 @@
       event.stopPropagation();
       return;
     }
-    closePanel();
+    if (closeTemplatePreview()) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (state.recentPopup && !state.recentPopup.hidden) {
+      closeRecentPopup();
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (state.shellPhase !== "open") return;
+    if (state.confirmingDeleteId !== null) {
+      state.confirmingDeleteId = null;
+      renderSection();
+    } else if (state.editing) {
+      state.editing = null;
+      state.editorError = "";
+      renderSection();
+    } else {
+      closePanel(true);
+    }
+    event.preventDefault();
+    event.stopPropagation();
   });
 
   document.addEventListener("pointerdown", function handleOutsidePointer(event) {
@@ -1683,13 +2070,16 @@
     refreshKeyStatusWhenVisible();
     retryWorkspaceWhenVisible();
   });
-  window.addEventListener("resize", applyShellState);
+  window.addEventListener("resize", function handleWindowResize() {
+    closeTemplatePreview();
+    applyShellState();
+  });
 
   chrome.runtime.onMessage.addListener(function handleRuntimeMessage(message, _sender, sendResponse) {
     if (message?.type === TOGGLE_MESSAGE) {
       ensureMounted();
       togglePanel();
-      sendResponse({ ok: true, open: state.open });
+      sendResponse({ ok: true, open: state.shellPhase === "opening" || state.shellPhase === "open" });
       return false;
     }
     if (message?.type === commandRegistry.CONTENT_MESSAGE_TYPES.ANALYZE
@@ -1776,8 +2166,14 @@
 
   chrome.storage.onChanged.addListener(function handleStorageChange(changes, areaName) {
     if (areaName !== "local") return;
+    closeTemplatePreview();
     if (changes.templates) state.templates = normalizeTemplates(changes.templates.newValue);
-    if (changes.settings) state.settings = normalizeSettings(changes.settings.newValue);
+    if (changes.settings) {
+      state.settings = normalizeSettings(changes.settings.newValue);
+      if (!state.sidebarWidthCommitPending && !state.sidebarResizing) {
+        state.sidebarPreferredWidth = state.settings.layout.sidebarWidth;
+      }
+    }
     if (changes.recentTemplateIds) state.recentTemplateIds = normalizeRecentTemplateIds(changes.recentTemplateIds.newValue);
     closeRecentPopup();
     renderSection();

@@ -65,6 +65,120 @@
     return requestedMode === "global" ? "global" : "local";
   }
 
+  function nextSidebarPhase(phase, action) {
+    if (action === "open" && phase === "closed") return "opening";
+    if (action === "close" && phase === "open") return "closing";
+    if (action !== "complete") return phase;
+    if (phase === "opening") return "open";
+    if (phase === "closing") return "revealing-opener";
+    if (phase === "revealing-opener") return "closed";
+    return phase;
+  }
+
+  function quickActionStateForPhase(phase) {
+    const visible = phase === "revealing-opener" || phase === "closed";
+    return Object.freeze({
+      rendered: phase === "closing" || visible,
+      visible,
+      interactive: phase === "closed",
+    });
+  }
+
+  function createTransformTransitionController(options) {
+    const duration = Number.isFinite(options?.duration) ? Math.max(0, options.duration) : 200;
+    const fallbackPadding = Number.isFinite(options?.fallbackPadding) ? Math.max(0, options.fallbackPadding) : 50;
+    const schedule = options?.setTimeout || root.setTimeout.bind(root);
+    const cancelScheduled = options?.clearTimeout || root.clearTimeout.bind(root);
+    const prefersReducedMotion = options?.prefersReducedMotion || (() => false);
+    let generation = 0;
+    let cleanup = null;
+
+    function cancel() {
+      generation += 1;
+      cleanup?.();
+      cleanup = null;
+    }
+
+    function run(element, onComplete) {
+      cancel();
+      const token = generation;
+      let settled = false;
+      let fallbackTimer = null;
+
+      function finish() {
+        if (settled || token !== generation) return false;
+        settled = true;
+        element?.removeEventListener?.("transitionend", onTransitionEnd);
+        if (fallbackTimer !== null) cancelScheduled(fallbackTimer);
+        if (cleanup === stop) cleanup = null;
+        onComplete?.();
+        return true;
+      }
+
+      function onTransitionEnd(event) {
+        if (event?.target === element && event?.propertyName === "transform") finish();
+      }
+
+      function stop() {
+        if (settled) return;
+        settled = true;
+        element?.removeEventListener?.("transitionend", onTransitionEnd);
+        if (fallbackTimer !== null) cancelScheduled(fallbackTimer);
+      }
+
+      cleanup = stop;
+      if (prefersReducedMotion()) {
+        finish();
+      } else {
+        element?.addEventListener?.("transitionend", onTransitionEnd);
+        fallbackTimer = schedule(finish, duration + fallbackPadding);
+      }
+      return token;
+    }
+
+    return Object.freeze({
+      run,
+      cancel,
+      generation: () => generation,
+    });
+  }
+
+  function recentTemplatesForDisplay(recentTemplateIds, templatesValue, countValue) {
+    const templates = Array.isArray(templatesValue) ? templatesValue : [];
+    const byId = new Map(templates.map((template) => [template?.id, template]));
+    const count = contract.normalizeRecentTemplatesHoverCount(countValue);
+    return contract.normalizeRecentTemplateIds(recentTemplateIds).flatMap((id) => {
+      const template = byId.get(id);
+      return template ? [template] : [];
+    }).slice(0, count);
+  }
+
+  function previewPosition(anchorRectValue, previewRectValue, viewportValue) {
+    const anchor = anchorRectValue || {};
+    const preview = previewRectValue || {};
+    const viewport = viewportValue || {};
+    const gap = Number.isFinite(viewport.gap) ? viewport.gap : 10;
+    const padding = Number.isFinite(viewport.padding) ? viewport.padding : 12;
+    const viewportWidth = Math.max(0, Number(viewport.width) || 0);
+    const viewportHeight = Math.max(0, Number(viewport.height) || 0);
+    const previewWidth = Math.max(0, Number(preview.width) || 0);
+    const previewHeight = Math.max(0, Number(preview.height) || 0);
+    const maxLeft = Math.max(padding, viewportWidth - previewWidth - padding);
+    const maxTop = Math.max(padding, viewportHeight - previewHeight - padding);
+    const preferredLeft = (Number(anchor.left) || 0) - previewWidth - gap;
+    const preferredTop = (Number(anchor.top) || 0) + previewHeight > viewportHeight - padding
+      ? (Number(anchor.bottom) || 0) - previewHeight
+      : (Number(anchor.top) || 0);
+    return {
+      left: Math.min(maxLeft, Math.max(padding, preferredLeft)),
+      top: Math.min(maxTop, Math.max(padding, preferredTop)),
+    };
+  }
+
+  function previewAnchorFromTarget(target) {
+    return target?.closest?.("[data-preview-anchor]") || null;
+  }
+
   function glossaryMarkup(state) {
     const query = String(state.glossarySearch || "");
     const requestedMode = state.glossaryRequestedMode === "global" ? "global" : "local";
@@ -282,6 +396,12 @@
     unavailableMarkup,
     activeSearchMode,
     requestedModeAfterQueryInput,
+    nextSidebarPhase,
+    quickActionStateForPhase,
+    createTransformTransitionController,
+    recentTemplatesForDisplay,
+    previewPosition,
+    previewAnchorFromTarget,
     glossaryMarkup,
     savedMarkup,
     styles,

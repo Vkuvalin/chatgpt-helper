@@ -114,6 +114,7 @@ assert.deepEqual(workspace.normalizeActiveSettings({
   theme: "gold",
   closePanelAfterRun: false,
   recentTemplatesHoverEnabled: false,
+  recentTemplatesHoverCount: 7.6,
   analysis: { termColorMode: "custom", customTermColor: "#ABCDEF", glossaryTextSize: "large", shortcut: { code: "KeyX" } },
   layout: { sidebarWidth: 999, analysisDialogWidth: 100 },
   commands: { injected: true },
@@ -124,6 +125,7 @@ assert.deepEqual(workspace.normalizeActiveSettings({
   closePanelAfterRun: false,
   closePanelOnOutsideClick: true,
   recentTemplatesHoverEnabled: false,
+  recentTemplatesHoverCount: 8,
   analysis: { termColorMode: "custom", customTermColor: "#abcdef", glossaryTextSize: "large" },
   layout: { sidebarWidth: 720, analysisDialogWidth: 360 },
 });
@@ -132,10 +134,26 @@ assert.deepEqual(workspace.validateActiveSettingsPatch({
   closePanelOnOutsideClick: false,
   analysis: { customTermColor: "#ABCDEF" },
   layout: { sidebarWidth: 999 },
+  recentTemplatesHoverCount: 8,
 }), {
   ok: true,
-  patch: { wallpaperDataUrl: null, closePanelOnOutsideClick: false, analysis: { customTermColor: "#abcdef" }, layout: { sidebarWidth: 720 } },
+  patch: {
+    wallpaperDataUrl: null,
+    closePanelOnOutsideClick: false,
+    recentTemplatesHoverCount: 8,
+    analysis: { customTermColor: "#abcdef" },
+    layout: { sidebarWidth: 720 },
+  },
 });
+assert.deepEqual(workspace.RECENT_TEMPLATES_HOVER_COUNT, { default: 3, min: 1, max: 8 });
+assert.deepEqual(
+  [undefined, "6", null, NaN, Infinity, -4, 1.49, 7.6, 99]
+    .map((value) => workspace.normalizeRecentTemplatesHoverCount(value)),
+  [3, 3, 3, 3, 3, 1, 1, 8, 8],
+);
+assert.deepEqual(workspace.normalizeRecentTemplateIds([
+  "one", " two ", "one", "", null, "three", "four", "five", "six", "seven", "eight",
+]), ["one", "two", "three", "four", "five", "six", "seven", "eight"]);
 for (const invalidPatch of [
   {},
   { unknown: true },
@@ -143,7 +161,18 @@ for (const invalidPatch of [
   { analysis: {} },
   { analysis: { shortcut: "KeyX" } },
   { layout: { sidebarWidth: "420" } },
+  { recentTemplatesHoverCount: "3" },
+  { recentTemplatesHoverCount: null },
+  { recentTemplatesHoverCount: 1.5 },
+  { recentTemplatesHoverCount: 0 },
+  { recentTemplatesHoverCount: 9 },
 ]) assert.equal(workspace.validateActiveSettingsPatch(invalidPatch).ok, false);
+for (const recentTemplatesHoverCount of [1, 3, 8]) {
+  assert.deepEqual(workspace.validateActiveSettingsPatch({ recentTemplatesHoverCount }), {
+    ok: true,
+    patch: { recentTemplatesHoverCount },
+  });
+}
 const patchedSettings = workspace.applyActiveSettingsPatch({
   ...workspace.DEFAULT_ACTIVE_SETTINGS,
   theme: "navy",
@@ -154,8 +183,14 @@ assert.equal(patchedSettings.settings.theme, "gold");
 assert.deepEqual(patchedSettings.settings.layout, { sidebarWidth: 420, analysisDialogWidth: 610 });
 assert.deepEqual(workspace.createActiveSettingsPatch(
   { ...workspace.DEFAULT_ACTIVE_SETTINGS, theme: "navy" },
-  { ...workspace.DEFAULT_ACTIVE_SETTINGS, theme: "navy", wallpaperDataUrl: null, layout: { sidebarWidth: 420, analysisDialogWidth: 560 } },
-), { layout: { sidebarWidth: 420 } });
+  {
+    ...workspace.DEFAULT_ACTIVE_SETTINGS,
+    theme: "navy",
+    wallpaperDataUrl: null,
+    recentTemplatesHoverCount: 6,
+    layout: { sidebarWidth: 420, analysisDialogWidth: 560 },
+  },
+), { recentTemplatesHoverCount: 6, layout: { sidebarWidth: 420 } });
 assert.deepEqual(workspace.validateTemplatePatch({ name: "New", content: "A\n\n\nB" }), {
   ok: true,
   patch: { name: "New", content: "A\n\n\nB" },
@@ -264,6 +299,202 @@ for (const invalidTemplatePatch of [
 assert.equal(workspace.effectiveWidth("sidebarWidth", 720, 500), 400);
 assert.equal(workspace.clampPreferredWidth("sidebarWidth", 720), 720);
 assert.equal(workspace.resizePreferredWidth("sidebarWidth", 360, -40, "left"), 400);
+assert.equal(workspaceUi.nextSidebarPhase("closed", "open"), "opening");
+assert.equal(workspaceUi.nextSidebarPhase("opening", "open"), "opening");
+assert.equal(workspaceUi.nextSidebarPhase("opening", "close"), "opening");
+assert.equal(workspaceUi.nextSidebarPhase("opening", "complete"), "open");
+assert.equal(workspaceUi.nextSidebarPhase("open", "close"), "closing");
+assert.equal(workspaceUi.nextSidebarPhase("closing", "open"), "closing");
+assert.equal(workspaceUi.nextSidebarPhase("closing", "complete"), "revealing-opener");
+assert.equal(workspaceUi.nextSidebarPhase("revealing-opener", "close"), "revealing-opener");
+assert.equal(workspaceUi.nextSidebarPhase("revealing-opener", "complete"), "closed");
+assert.deepEqual(workspaceUi.quickActionStateForPhase("closing"), {
+  rendered: true,
+  visible: false,
+  interactive: false,
+});
+assert.deepEqual(workspaceUi.quickActionStateForPhase("revealing-opener"), {
+  rendered: true,
+  visible: true,
+  interactive: false,
+});
+assert.deepEqual(workspaceUi.quickActionStateForPhase("closed"), {
+  rendered: true,
+  visible: true,
+  interactive: true,
+});
+for (const phase of ["opening", "open"]) {
+  assert.deepEqual(workspaceUi.quickActionStateForPhase(phase), {
+    rendered: false,
+    visible: false,
+    interactive: false,
+  });
+}
+
+function createFakeTransitionElement() {
+  const listeners = new Set();
+  return {
+    listeners,
+    addEventListener(type, listener) { if (type === "transitionend") listeners.add(listener); },
+    removeEventListener(type, listener) { if (type === "transitionend") listeners.delete(listener); },
+    dispatch(propertyName, target) {
+      [...listeners].forEach((listener) => listener({ propertyName, target: target || this }));
+    },
+  };
+}
+
+let transitionTimerId = 0;
+const transitionTimers = new Map();
+const transitionElement = createFakeTransitionElement();
+const transitionCompletions = [];
+const transitionController = workspaceUi.createTransformTransitionController({
+  duration: 200,
+  fallbackPadding: 50,
+  setTimeout(callback, delay) {
+    transitionTimerId += 1;
+    transitionTimers.set(transitionTimerId, { callback, delay });
+    return transitionTimerId;
+  },
+  clearTimeout(id) { transitionTimers.delete(id); },
+  prefersReducedMotion: () => false,
+});
+transitionController.run(transitionElement, () => transitionCompletions.push("transition"));
+assert.equal([...transitionTimers.values()][0].delay, 250);
+transitionElement.dispatch("opacity");
+transitionElement.dispatch("transform", {});
+assert.deepEqual(transitionCompletions, []);
+transitionElement.dispatch("transform");
+assert.deepEqual(transitionCompletions, ["transition"]);
+assert.equal(transitionTimers.size, 0);
+
+transitionController.run(transitionElement, () => transitionCompletions.push("fallback"));
+const fallbackTimer = [...transitionTimers.values()][0];
+fallbackTimer.callback();
+assert.deepEqual(transitionCompletions, ["transition", "fallback"]);
+assert.equal(transitionElement.listeners.size, 0);
+
+transitionController.run(transitionElement, () => transitionCompletions.push("stale"));
+const staleListener = [...transitionElement.listeners][0];
+transitionController.run(transitionElement, () => transitionCompletions.push("current"));
+staleListener({ propertyName: "transform", target: transitionElement });
+assert.equal(transitionCompletions.includes("stale"), false);
+transitionElement.dispatch("transform");
+assert.equal(transitionCompletions.at(-1), "current");
+
+let reducedMotionTimerCalls = 0;
+const reducedMotionController = workspaceUi.createTransformTransitionController({
+  setTimeout() { reducedMotionTimerCalls += 1; return 1; },
+  clearTimeout() {},
+  prefersReducedMotion: () => true,
+});
+let reducedMotionCompleted = false;
+reducedMotionController.run(createFakeTransitionElement(), () => { reducedMotionCompleted = true; });
+assert.equal(reducedMotionCompleted, true);
+assert.equal(reducedMotionTimerCalls, 0);
+let reducedClosePhase = "closing";
+reducedMotionController.run(createFakeTransitionElement(), () => {
+  reducedClosePhase = workspaceUi.nextSidebarPhase(reducedClosePhase, "complete");
+  reducedMotionController.run(createFakeTransitionElement(), () => {
+    reducedClosePhase = workspaceUi.nextSidebarPhase(reducedClosePhase, "complete");
+  });
+});
+assert.equal(reducedClosePhase, "closed");
+
+const recentHistoryFixture = ["missing", ...Array.from({ length: 8 }, (_, index) => `recent-${index + 1}`)];
+const recentTemplatesFixture = Array.from({ length: 8 }, (_, index) => ({
+  id: `recent-${index + 1}`,
+  name: `Recent ${index + 1}`,
+  content: `Content ${index + 1}`,
+  autoSend: false,
+}));
+assert.deepEqual(
+  workspaceUi.recentTemplatesForDisplay(recentHistoryFixture, recentTemplatesFixture, 3).map((item) => item.id),
+  ["recent-1", "recent-2", "recent-3"],
+);
+assert.deepEqual(
+  workspaceUi.recentTemplatesForDisplay(recentHistoryFixture, recentTemplatesFixture, 6).map((item) => item.id),
+  ["recent-1", "recent-2", "recent-3", "recent-4", "recent-5", "recent-6"],
+);
+assert.equal(recentHistoryFixture.length, 9);
+assert.deepEqual(
+  workspaceUi.previewPosition(
+    { left: 700, top: 500, bottom: 540 },
+    { width: 380, height: 300 },
+    { width: 1000, height: 700, gap: 10, padding: 12 },
+  ),
+  { left: 310, top: 240 },
+);
+assert.deepEqual(
+  workspaceUi.previewPosition(
+    { left: 20, top: 5, bottom: 35 },
+    { width: 380, height: 420 },
+    { width: 360, height: 500, gap: 10, padding: 12 },
+  ),
+  { left: 12, top: 12 },
+);
+
+function createPreviewTarget(parent, previewAnchor) {
+  return {
+    parent,
+    previewAnchor: previewAnchor === true,
+    closest(selector) {
+      assert.equal(selector, "[data-preview-anchor]");
+      let current = this;
+      while (current) {
+        if (current.previewAnchor) return current;
+        current = current.parent;
+      }
+      return null;
+    },
+  };
+}
+
+const templateSummarySafeZone = createPreviewTarget(null, false);
+const templatePreviewHotspot = createPreviewTarget(templateSummarySafeZone, true);
+const templateDragHandle = createPreviewTarget(templatePreviewHotspot, false);
+const templateName = createPreviewTarget(templatePreviewHotspot, false);
+const templateControlsSafeZone = createPreviewTarget(templateSummarySafeZone, false);
+const templateRun = createPreviewTarget(templateControlsSafeZone, false);
+const templateEdit = createPreviewTarget(templateControlsSafeZone, false);
+const templateAutoSend = createPreviewTarget(templateControlsSafeZone, false);
+const templateDelete = createPreviewTarget(templateControlsSafeZone, false);
+const recentTemplateButton = createPreviewTarget(null, true);
+
+assert.equal(workspaceUi.previewAnchorFromTarget(templatePreviewHotspot), templatePreviewHotspot);
+assert.equal(workspaceUi.previewAnchorFromTarget(templateName), templatePreviewHotspot);
+assert.equal(workspaceUi.previewAnchorFromTarget(templateDragHandle), templatePreviewHotspot,
+  "keyboard focus on the hotspot's drag handle keeps immediate preview available");
+assert.equal(workspaceUi.previewAnchorFromTarget(recentTemplateButton), recentTemplateButton,
+  "recent-template buttons remain preview anchors");
+for (const [name, target] of [
+  ["Run", templateRun],
+  ["Edit", templateEdit],
+  ["autoSend", templateAutoSend],
+  ["Delete", templateDelete],
+  ["controls-side whitespace", templateControlsSafeZone],
+  ["summary padding", templateSummarySafeZone],
+]) {
+  assert.equal(workspaceUi.previewAnchorFromTarget(target), null, `${name} stays outside the preview hotspot`);
+}
+let previewOpenTimersArmed = 0;
+function simulatePreviewPointerOver(target) {
+  if (workspaceUi.previewAnchorFromTarget(target)) previewOpenTimersArmed += 1;
+}
+[
+  templateRun,
+  templateControlsSafeZone,
+  templateEdit,
+  templateControlsSafeZone,
+  templateAutoSend,
+  templateControlsSafeZone,
+  templateDelete,
+  templateSummarySafeZone,
+].forEach(simulatePreviewPointerOver);
+assert.equal(previewOpenTimersArmed, 0,
+  "moving between controls and adjacent safe-zone space cannot arm preview");
+simulatePreviewPointerOver(templateName);
+assert.equal(previewOpenTimersArmed, 1, "the content hotspot can arm preview");
+
 assert.equal(workspaceUi.activeSearchMode("global", ""), "local");
 assert.equal(workspaceUi.activeSearchMode("global", "   "), "local");
 assert.equal(workspaceUi.activeSearchMode("global", "query"), "global");
@@ -315,6 +546,73 @@ assert.equal(workspaceQueryMessages[4].text, structuredSavedText);
 const contentScriptSource = fs.readFileSync(path.join(__dirname, "../src/content-script.js"), "utf8");
 assert.match(contentScriptSource, /await navigator\.clipboard\.writeText\(entry\.text\);/);
 assert.doesNotMatch(contentScriptSource, /navigator\.clipboard\.writeText\([^)]*(?:innerText|textContent)/);
+assert.match(contentScriptSource, /TEMPLATE_PREVIEW_OPEN_DELAY_MS = 350/);
+assert.match(contentScriptSource, /TEMPLATE_PREVIEW_CLOSE_DELAY_MS = 120/);
+assert.equal((contentScriptSource.match(/<aside class="template-preview"/g) || []).length, 1);
+assert.match(contentScriptSource, /data-preview-source="main"/);
+assert.match(contentScriptSource, /data-preview-source="recent"/);
+assert.match(contentScriptSource, /class="template-preview-hotspot" data-preview-anchor data-preview-id=/);
+assert.doesNotMatch(contentScriptSource, /class="template-summary" data-preview-/);
+assert.match(contentScriptSource, /state\.previewContent\.textContent = template\.content/);
+assert.doesNotMatch(contentScriptSource, /state\.previewContent\.innerHTML/);
+assert.match(contentScriptSource, /white-space: pre-wrap/);
+assert.match(contentScriptSource, /overflow-wrap: anywhere/);
+assert.match(contentScriptSource, /patch: \{ layout: \{ sidebarWidth: width \} \}/);
+assert.match(contentScriptSource, /state\.sidebarPreferredWidth = width/);
+assert.match(contentScriptSource, /phase-revealing-opener \.panel-opener/);
+assert.match(contentScriptSource, /\.phase-revealing-opener \.quick-action, \.phase-closed \.quick-action \{ opacity: 1; transform: scale\(1\); \}/);
+assert.match(contentScriptSource, /\.phase-closed \.quick-action \{ pointer-events: auto; \}/);
+assert.match(contentScriptSource, /\.motion-disabled \.quick-action \{ transition: none !important; \}/);
+assert.match(contentScriptSource, /state\.quickAction\.tabIndex = quickActionState\.interactive \? 0 : -1/);
+assert.match(contentScriptSource, /state\.quickAction\.setAttribute\("aria-hidden", quickActionState\.interactive \? "false" : "true"\)/);
+assert.match(contentScriptSource, /state\.body\.addEventListener\("scroll", closeTemplatePreview/);
+assert.match(contentScriptSource, /recent-templates-count/);
+assert.match(contentScriptSource, /state\.settings\.recentTemplatesHoverEnabled\s*\?\s*'  <label class="setting-option recent-count-option"/);
+assert.match(contentScriptSource, /--sidebar-motion-duration: 200ms/);
+assert.match(contentScriptSource, /--sidebar-motion-easing: cubic-bezier\(\.22, \.8, \.25, 1\)/);
+assert.match(contentScriptSource, /\.panel-opener \{[\s\S]*transition: transform var\(--sidebar-motion-duration\) var\(--sidebar-motion-easing\), background 120ms ease;/);
+assert.match(contentScriptSource, /\.quick-action \{[\s\S]*transition: opacity var\(--sidebar-motion-duration\) var\(--sidebar-motion-easing\), transform var\(--sidebar-motion-duration\) var\(--sidebar-motion-easing\), background 120ms ease;/);
+assert.match(contentScriptSource, /\.sidebar-frame \{[\s\S]*transform: translateX\(100%\);[\s\S]*transition: transform/);
+assert.match(contentScriptSource, /\.shell\.phase-opening \.sidebar-frame, \.shell\.phase-open \.sidebar-frame \{ transform: translateX\(0\); \}/);
+assert.match(contentScriptSource, /if \(!\["closed", "open"\]\.includes\(state\.shellPhase\)\) return;/);
+assert.match(contentScriptSource, /state\.shellPhase !== "open" \|\| state\.sidebarResizing/);
+const shellMarkupSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function shellMarkup"),
+  contentScriptSource.indexOf("function applyShellState"),
+);
+assert.match(shellMarkupSource, /class="shell theme-system phase-closed motion-disabled"/);
+assert.equal((shellMarkupSource.match(/class="sidebar-frame"/g) || []).length, 1);
+assert.equal(shellMarkupSource.indexOf("panel-resize") < shellMarkupSource.indexOf("<nav class=\"rail\""), true);
+assert.equal(shellMarkupSource.indexOf("<nav class=\"rail\"") < shellMarkupSource.indexOf("<section class=\"panel\""), true);
+const widthCommitSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("async function persistSidebarWidth"),
+  contentScriptSource.indexOf("function installSidebarResizer"),
+);
+assert.equal((widthCommitSource.match(/SETTINGS_UPDATE/g) || []).length, 1);
+assert.match(widthCommitSource, /patch: \{ layout: \{ sidebarWidth: width \} \}/);
+const editorActionSource = contentScriptSource.slice(
+  contentScriptSource.indexOf('else if (action === "add-template")'),
+  contentScriptSource.indexOf('else if (action === "remove-wallpaper")'),
+);
+assert.doesNotMatch(editorActionSource, /SETTINGS_UPDATE|layout:/);
+const previewLifecycleSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function clearPreviewOpenTimer"),
+  contentScriptSource.indexOf("function statusMarkup"),
+);
+assert.match(previewLifecycleSource, /setTimeout\(function openTemplatePreviewAfterDelay/);
+assert.match(previewLifecycleSource, /setTimeout\(function closeTemplatePreviewAfterGrace/);
+assert.match(previewLifecycleSource, /state\.draggingId !== null/);
+assert.match(previewLifecycleSource, /state\.editing\?\.id === templateId/);
+assert.match(previewLifecycleSource, /state\.confirmingDeleteId === templateId/);
+assert.match(previewLifecycleSource, /workspaceUiModule\.previewAnchorFromTarget\(event\.target\)/);
+assert.match(previewLifecycleSource, /state\.previewLayer\?\.contains\(event\.relatedTarget\)/);
+assert.match(previewLifecycleSource, /scheduleTemplatePreview\(anchor, anchor\.dataset\.previewId, anchor\.dataset\.previewSource, true\)/);
+const escapeLifecycleSource = contentScriptSource.slice(
+  contentScriptSource.indexOf('document.addEventListener("keydown", function handleEscape'),
+  contentScriptSource.indexOf('document.addEventListener("pointerdown", function handleOutsidePointer'),
+);
+assert.equal(escapeLifecycleSource.indexOf("closeTemplatePreview()") < escapeLifecycleSource.indexOf("state.editing"), true);
+assert.equal(escapeLifecycleSource.indexOf("state.editing") < escapeLifecycleSource.indexOf("closePanel(true)"), true);
 
 const unsafeSavedMarkup = workspaceUi.savedMarkup({
   savedRequestedMode: "local",
@@ -1273,6 +1571,7 @@ async function runStoreTests() {
     closePanelAfterRun: true,
     closePanelOnOutsideClick: false,
     recentTemplatesHoverEnabled: false,
+    recentTemplatesHoverCount: 7,
     analysis: { termColorMode: "custom", customTermColor: "#abcdef", glossaryTextSize: "large" },
     layout: { sidebarWidth: 515, analysisDialogWidth: 745 },
     commands: { mustNotExport: true },
@@ -1283,9 +1582,11 @@ async function runStoreTests() {
   assert.equal(settingsExport.text.includes("must-not-export"), false);
   const validSettings = importExport.validateSettingsText(settingsExport.text);
   assert.equal(validSettings.ok, true);
+  assert.equal(validSettings.imported.recentTemplatesHoverCount, 7);
   const settingsMerge = importExport.buildSettingsPlan(workspace.DEFAULT_ACTIVE_SETTINGS, validSettings, "merge");
   assert.equal(settingsMerge.settings.theme, "navy");
   assert.equal(settingsMerge.settings.closePanelOnOutsideClick, false);
+  assert.equal(settingsMerge.settings.recentTemplatesHoverCount, 7);
   assert.equal(settingsMerge.preview.values.current.wallpaperDataUrl, null);
   assert.match(settingsMerge.preview.values.result.wallpaperDataUrl, /^\[data:image,/);
   const partialSettings = JSON.parse(settingsExport.text);
@@ -1295,13 +1596,25 @@ async function runStoreTests() {
   assert.equal(partialValidation.ok, true);
   assert.equal(partialValidation.warnings.filter((item) => item.code === "UNKNOWN_FIELD").length, 2);
   assert.equal(partialValidation.warnings.some((item) => item.code === "CLAMPED_WIDTH"), true);
+  const mergePartialSettings = importExport.buildSettingsPlan(settingsMerge.settings, partialValidation, "merge");
+  assert.equal(mergePartialSettings.settings.recentTemplatesHoverCount, 7);
   const replaceSettings = importExport.buildSettingsPlan(settingsMerge.settings, partialValidation, "replace");
   assert.equal(replaceSettings.settings.layout.sidebarWidth, workspace.LAYOUT.sidebarWidth.max);
   assert.equal(replaceSettings.settings.analysis.glossaryTextSize, workspace.DEFAULT_ACTIVE_SETTINGS.analysis.glossaryTextSize);
+  assert.equal(replaceSettings.settings.recentTemplatesHoverCount, 3);
   assert.equal(replaceSettings.preview.reset.includes("analysis.glossaryTextSize"), true);
+  assert.equal(replaceSettings.preview.reset.includes("recentTemplatesHoverCount"), true);
   const invalidSettings = JSON.parse(settingsExport.text);
   invalidSettings.payload.theme = 17;
   assert.equal(importExport.validateSettingsText(JSON.stringify(invalidSettings)).errors[0].code, "INVALID_THEME");
+  for (const invalidRecentTemplatesHoverCount of ["3", null, 1.5, 0, 9]) {
+    const invalidCountSettings = JSON.parse(settingsExport.text);
+    invalidCountSettings.payload.recentTemplatesHoverCount = invalidRecentTemplatesHoverCount;
+    assert.equal(
+      importExport.validateSettingsText(JSON.stringify(invalidCountSettings)).errors[0].code,
+      "INVALID_RECENT_TEMPLATES_HOVER_COUNT",
+    );
+  }
   const futureSettings = JSON.parse(settingsExport.text);
   futureSettings.schemaVersion += 1;
   assert.equal(importExport.validateSettingsText(JSON.stringify(futureSettings)).errors[0].code, "FUTURE_SCHEMA");
@@ -1320,6 +1633,7 @@ async function runStoreTests() {
   const dataExport = importExport.createDataExport(portableState, dataMetadata);
   assert.equal(dataExport.text, importExport.canonicalStringify(dataExport.envelope));
   assert.equal(dataExport.text.includes("closePanelOnOutsideClick"), false);
+  assert.equal(dataExport.text.includes("recentTemplatesHoverCount"), false);
   const sortedExport = importExport.createDataExport({
     ...portableState,
     templates: [

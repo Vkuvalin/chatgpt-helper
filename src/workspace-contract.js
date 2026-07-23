@@ -14,6 +14,7 @@
   const OUTER_FORMATTING_RE = /^[\s`*_~"'“”„‘’«»]+|[\s`*_~"'“”„‘’«»]+$/gu;
   const SUPPORTED_HOSTS = Object.freeze(["chatgpt.com", "chat.openai.com"]);
   const VALID_THEMES = Object.freeze(["system", "graphite", "navy", "violet", "gold"]);
+  const RECENT_TEMPLATES_HOVER_COUNT = Object.freeze({ default: 3, min: 1, max: 8 });
   const LAYOUT = Object.freeze({
     sidebarWidth: Object.freeze({ default: 360, min: 320, max: 720, viewportRatio: 0.8 }),
     analysisDialogWidth: Object.freeze({ default: 560, min: 360, max: 960, viewportRatio: 0.92 }),
@@ -24,6 +25,7 @@
     closePanelAfterRun: true,
     closePanelOnOutsideClick: true,
     recentTemplatesHoverEnabled: true,
+    recentTemplatesHoverCount: RECENT_TEMPLATES_HOVER_COUNT.default,
     analysis: Object.freeze({
       termColorMode: "theme",
       customTermColor: "#69d6c5",
@@ -311,6 +313,30 @@
     return clampPreferredWidth(name, Number(startWidth) + (Number.isFinite(signedDelta) ? signedDelta : 0));
   }
 
+  function normalizeRecentTemplatesHoverCount(value) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return RECENT_TEMPLATES_HOVER_COUNT.default;
+    }
+    return Math.round(Math.min(
+      RECENT_TEMPLATES_HOVER_COUNT.max,
+      Math.max(RECENT_TEMPLATES_HOVER_COUNT.min, value),
+    ));
+  }
+
+  function normalizeRecentTemplateIds(value) {
+    if (!Array.isArray(value)) return [];
+    const result = [];
+    const seen = new Set();
+    for (const item of value) {
+      if (typeof item !== "string") continue;
+      const id = item.trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      result.push(id);
+    }
+    return result;
+  }
+
   function normalizeActiveSettings(value) {
     const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
     const analysis = input.analysis && typeof input.analysis === "object" && !Array.isArray(input.analysis)
@@ -331,6 +357,7 @@
       recentTemplatesHoverEnabled: typeof input.recentTemplatesHoverEnabled === "boolean"
         ? input.recentTemplatesHoverEnabled
         : DEFAULT_ACTIVE_SETTINGS.recentTemplatesHoverEnabled,
+      recentTemplatesHoverCount: normalizeRecentTemplatesHoverCount(input.recentTemplatesHoverCount),
       analysis: {
         termColorMode: analysis.termColorMode === "custom" ? "custom" : "theme",
         customTermColor: /^#[0-9a-f]{6}$/i.test(analysis.customTermColor || "")
@@ -351,7 +378,10 @@
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       return { ok: false, error: "INVALID_SETTINGS_PATCH" };
     }
-    const topLevel = ["theme", "wallpaperDataUrl", "closePanelAfterRun", "closePanelOnOutsideClick", "recentTemplatesHoverEnabled", "analysis", "layout"];
+    const topLevel = [
+      "theme", "wallpaperDataUrl", "closePanelAfterRun", "closePanelOnOutsideClick",
+      "recentTemplatesHoverEnabled", "recentTemplatesHoverCount", "analysis", "layout",
+    ];
     const keys = Object.keys(value);
     if (!keys.length || keys.some((key) => !topLevel.includes(key))) {
       return { ok: false, error: "INVALID_SETTINGS_PATCH" };
@@ -370,6 +400,14 @@
       if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
       if (typeof value[key] !== "boolean") return { ok: false, error: "INVALID_SETTINGS_PATCH" };
       patch[key] = value[key];
+    }
+    if (Object.prototype.hasOwnProperty.call(value, "recentTemplatesHoverCount")) {
+      if (!Number.isInteger(value.recentTemplatesHoverCount)
+        || value.recentTemplatesHoverCount < RECENT_TEMPLATES_HOVER_COUNT.min
+        || value.recentTemplatesHoverCount > RECENT_TEMPLATES_HOVER_COUNT.max) {
+        return { ok: false, error: "INVALID_SETTINGS_PATCH" };
+      }
+      patch.recentTemplatesHoverCount = value.recentTemplatesHoverCount;
     }
 
     if (Object.prototype.hasOwnProperty.call(value, "analysis")) {
@@ -434,7 +472,10 @@
     const previous = normalizeActiveSettings(previousValue);
     const next = normalizeActiveSettings(nextValue);
     const patch = {};
-    for (const key of ["theme", "wallpaperDataUrl", "closePanelAfterRun", "closePanelOnOutsideClick", "recentTemplatesHoverEnabled"]) {
+    for (const key of [
+      "theme", "wallpaperDataUrl", "closePanelAfterRun", "closePanelOnOutsideClick",
+      "recentTemplatesHoverEnabled", "recentTemplatesHoverCount",
+    ]) {
       if (!Object.is(previous[key], next[key])) patch[key] = next[key];
     }
     for (const group of ["analysis", "layout"]) {
@@ -581,6 +622,7 @@
     MAX_WALLPAPER_SOURCE_BYTES,
     SUPPORTED_HOSTS,
     VALID_THEMES,
+    RECENT_TEMPLATES_HOVER_COUNT,
     LAYOUT,
     DEFAULT_ACTIVE_SETTINGS,
     STORE_NAMES,
@@ -608,6 +650,8 @@
     clampPreferredWidth,
     effectiveWidth,
     resizePreferredWidth,
+    normalizeRecentTemplatesHoverCount,
+    normalizeRecentTemplateIds,
     normalizeActiveSettings,
     validateActiveSettingsPatch,
     applyActiveSettingsPatch,

@@ -121,16 +121,7 @@ function normalizeSettings(value) {
 }
 
 function normalizeRecentTemplateIds(value) {
-  if (!Array.isArray(value)) return [];
-  const result = [];
-  for (const item of value) {
-    if (typeof item !== "string") continue;
-    const id = item.trim();
-    if (!id || result.includes(id)) continue;
-    result.push(id);
-    if (result.length === 3) break;
-  }
-  return result;
+  return workspaceContract.normalizeRecentTemplateIds(value);
 }
 
 async function migrateStorage() {

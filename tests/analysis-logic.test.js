@@ -397,7 +397,7 @@ assert.equal(analysisUi.replacementCommandForTerm({
 }), null);
 assert.equal(analysisUi.replacementCommandForTerm({ status: "new" }), null);
 assert.doesNotMatch(contentScriptSource, /chrome\.storage\.local\.set\s*\(/);
-assert.match(contentScriptSource, /\.shell \{[\s\S]*display: flex;[\s\S]*width: var\(--sidebar-effective-width\);/);
+assert.match(contentScriptSource, /\.shell \{[\s\S]*width: var\(--sidebar-effective-width\);[\s\S]*\.sidebar-frame \{[\s\S]*display: flex;/);
 assert.match(contentScriptSource, /\.rail \{[\s\S]*position: relative;[\s\S]*flex: 0 0 var\(--rail-width\);/);
 assert.match(contentScriptSource, /\.panel \{[\s\S]*position: relative;[\s\S]*flex: 1 1 auto;/);
 assert.match(contentScriptSource, /\.panel-resize \{[^}]*left: 0;[^}]*width: 10px;/);
@@ -405,6 +405,15 @@ assert.match(contentScriptSource, /\.panel-resize::after \{[^}]*left: 0;[^}]*wid
 assert.doesNotMatch(contentScriptSource, /\.panel-resize::after \{[^}]*left: 4px;/);
 assert.doesNotMatch(contentScriptSource, /\.is-open \.rail/);
 assert.match(contentScriptSource, /state\.settings\.closePanelOnOutsideClick/);
+assert.match(contentScriptSource, /\.quick-action \{[\s\S]*opacity: 0;[\s\S]*transform: scale\(\.8\);[\s\S]*pointer-events: none;[\s\S]*opacity var\(--sidebar-motion-duration\) var\(--sidebar-motion-easing\), transform var\(--sidebar-motion-duration\) var\(--sidebar-motion-easing\)/);
+assert.match(contentScriptSource, /\.phase-revealing-opener \.quick-action, \.phase-closed \.quick-action \{ opacity: 1; transform: scale\(1\); \}/);
+assert.match(contentScriptSource, /const quickActionState = workspaceUiModule\.quickActionStateForPhase\(phase\)/);
+assert.match(contentScriptSource, /state\.quickAction\.hidden = !quickActionState\.rendered/);
+assert.match(contentScriptSource, /class="template-preview-hotspot" data-preview-anchor data-preview-id=/);
+assert.doesNotMatch(contentScriptSource, /class="template-summary" data-preview-/);
+assert.match(contentScriptSource, /\.template-summary \{[^}]*grid-template-columns: minmax\(0, 1fr\) auto;/);
+assert.match(contentScriptSource, /\.template-preview-hotspot \{[^}]*grid-template-columns: auto minmax\(0, 1fr\);/);
+assert.match(contentScriptSource, /workspaceUiModule\.previewAnchorFromTarget\(event\.target\)/);
 assert.match(contentScriptSource, /createTemplatePatch\(state\.editing\.original, \{ name, content \}\)/);
 assert.match(contentScriptSource, /original: \{ name: template\.name, content: template\.content \}/);
 assert.match(contentScriptSource, /if \(!Object\.keys\(patch\)\.length\)/);
@@ -814,6 +823,7 @@ async function runAsyncTests() {
   assert.equal(patchMigration.storage.settings.analysis.termColorMode, "custom");
   assert.equal(patchMigration.storage.settings.analysis.customTermColor, "#abcdef");
   assert.equal(patchMigration.storage.settings.analysis.glossaryTextSize, "normal");
+  assert.equal(patchMigration.storage.settings.recentTemplatesHoverCount, 3);
   assert.deepEqual(patchMigration.storage.templates, validStorage().templates);
   assert.deepEqual(patchMigration.storage.recentTemplateIds, validStorage().recentTemplateIds);
 
@@ -833,6 +843,20 @@ async function runAsyncTests() {
     glossaryTextSize: contract.DEFAULT_ANALYSIS_SETTINGS.glossaryTextSize,
   });
   assert.equal(Object.prototype.hasOwnProperty.call(missingAnalysisMigration.storage.settings, "futureSettingsField"), false);
+
+  const completeRecentTemplates = Array.from({ length: 8 }, (_, index) => ({
+    id: `history-${index + 1}`,
+    name: `History ${index + 1}`,
+    content: `Content ${index + 1}`,
+    autoSend: false,
+  }));
+  const completeRecentHistory = completeRecentTemplates.map((template) => template.id);
+  const completeHistoryMigration = createServiceWorkerHarness(validStorage({
+    templates: completeRecentTemplates,
+    recentTemplateIds: completeRecentHistory,
+  }));
+  await completeHistoryMigration.waitForMigration();
+  assert.deepEqual(completeHistoryMigration.storage.recentTemplateIds, completeRecentHistory);
 
   const futureGlossary = { future: true, entries: [{ opaque: "value" }] };
   const futureSchemaMigration = createServiceWorkerHarness(validStorage({
@@ -999,11 +1023,35 @@ async function runAsyncTests() {
     patch: { theme: "gold" },
   }, { tab: { id: 305, url: "https://chatgpt.com/c/local-mutations" }, url: "https://chatgpt.com/c/local-mutations" })).settings.theme, "gold");
   assert.equal((await localMutationHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.SETTINGS_UPDATE,
+    patch: { recentTemplatesHoverCount: 8 },
+  }, { tab: { id: 305, url: "https://chatgpt.com/c/local-mutations" }, url: "https://chatgpt.com/c/local-mutations" })).settings.recentTemplatesHoverCount, 8);
+  for (const invalidRecentTemplatesHoverCount of ["8", null, 2.5, 0, 9]) {
+    assert.equal((await localMutationHarness.handleMessage({
+      type: workspaceContract.MESSAGE_TYPES.SETTINGS_UPDATE,
+      patch: { recentTemplatesHoverCount: invalidRecentTemplatesHoverCount },
+    }, { tab: { id: 305, url: "https://chatgpt.com/c/local-mutations" }, url: "https://chatgpt.com/c/local-mutations" })).error.code, "INVALID_SETTINGS_PATCH");
+  }
+  assert.equal((await localMutationHarness.handleMessage({
     type: workspaceContract.MESSAGE_TYPES.TEMPLATE_DELETE,
     templateId: "template-created",
   }, { tab: { id: 305, url: "https://chatgpt.com/c/local-mutations" }, url: "https://chatgpt.com/c/local-mutations" })).ok, true);
   assert.deepEqual(localMutationHarness.storage.templates.map((item) => item.id), ["template-1"]);
   assert.equal(localMutationHarness.storage.recentTemplateIds.includes("template-created"), false);
+
+  const completeHistoryMutation = createServiceWorkerHarness(validStorage({
+    templates: completeRecentTemplates,
+    recentTemplateIds: completeRecentHistory,
+  }));
+  await completeHistoryMutation.waitForMigration();
+  const completeHistoryTouched = await completeHistoryMutation.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.RECENT_TEMPLATE_TOUCH,
+    templateId: "history-8",
+  }, { tab: { id: 306, url: "https://chatgpt.com/c/complete-history" }, url: "https://chatgpt.com/c/complete-history" });
+  assert.deepEqual(completeHistoryTouched.recentTemplateIds, [
+    "history-8", "history-1", "history-2", "history-3",
+    "history-4", "history-5", "history-6", "history-7",
+  ]);
 
   const queueSender = { tab: { id: 308, url: "https://chatgpt.com/c/local-queue" }, url: "https://chatgpt.com/c/local-queue" };
   const createQueueHarness = createServiceWorkerHarness(validStorage());
