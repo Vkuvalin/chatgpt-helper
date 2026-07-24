@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" class="theme-system theme-pending">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -49,14 +49,18 @@
     <div class="section-separator" aria-hidden="true"></div>
 
     <section id="backup" class="card backup-card" aria-labelledby="backup-title">
-      <h2 id="backup-title">Резервное копирование</h2>
-      <p class="intro">Файлы создаются локально. API key никогда не включается в экспорт.</p>
+      <h2 id="backup-title">Импорт и экспорт</h2>
+      <p class="intro">Файлы создаются и обрабатываются локально.<br>API key никогда не включается в экспорт.</p>
 
       <section class="backup-section" data-backup-kind="settings" aria-labelledby="settings-backup-title">
         <h3 id="settings-backup-title">Настройки</h3>
         <div class="actions">
-          <button type="button" data-backup-action="export" data-kind="settings">Экспортировать настройки</button>
-          <label class="file-button">Выбрать файл<input type="file" accept="application/json,.json" data-backup-action="file" data-kind="settings"></label>
+          <button type="button" data-backup-action="export" data-kind="settings">Экспорт</button>
+          <label class="file-button">Импорт<input type="file" accept="application/json,.json" data-backup-action="file" data-kind="settings"></label>
+        </div>
+        <div class="selected-file-row" data-backup-selected-file="settings" hidden>
+          <span class="selected-file-name" data-backup-filename="settings"></span>
+          <button type="button" data-backup-action="cancel" data-kind="settings" aria-label="Отменить выбор файла настроек">Отменить выбор</button>
         </div>
         <div class="mode-row" role="radiogroup" aria-label="Режим импорта настроек">
           <label><input type="radio" name="settings-mode" value="merge" data-backup-action="mode" data-kind="settings" checked> Merge</label>
@@ -70,8 +74,12 @@
       <section class="backup-section" data-backup-kind="data" aria-labelledby="data-backup-title">
         <h3 id="data-backup-title">Данные</h3>
         <div class="actions">
-          <button type="button" data-backup-action="export" data-kind="data">Экспортировать данные</button>
-          <label class="file-button">Выбрать файл<input type="file" accept="application/json,.json" data-backup-action="file" data-kind="data"></label>
+          <button type="button" data-backup-action="export" data-kind="data">Экспорт</button>
+          <label class="file-button">Импорт<input type="file" accept="application/json,.json" data-backup-action="file" data-kind="data"></label>
+        </div>
+        <div class="selected-file-row" data-backup-selected-file="data" hidden>
+          <span class="selected-file-name" data-backup-filename="data"></span>
+          <button type="button" data-backup-action="cancel" data-kind="data" aria-label="Отменить выбор файла данных">Отменить выбор</button>
         </div>
         <div class="mode-row" role="radiogroup" aria-label="Режим импорта данных">
           <label><input type="radio" name="data-mode" value="merge" data-backup-action="mode" data-kind="data" checked> Merge</label>

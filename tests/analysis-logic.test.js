@@ -21,6 +21,11 @@ const analysisController = globalThis.ChatGPTHelperAnalysisController;
 const analysisUi = globalThis.ChatGPTHelperAnalysisUi;
 const serviceWorkerSource = fs.readFileSync(path.join(__dirname, "../src/service-worker.js"), "utf8");
 const contentScriptSource = fs.readFileSync(path.join(__dirname, "../src/content-script.js"), "utf8");
+const analysisControllerSource = fs.readFileSync(path.join(__dirname, "../src/analysis-controller.js"), "utf8");
+const optionsHtmlSource = fs.readFileSync(path.join(__dirname, "../src/options.html"), "utf8");
+const optionsScriptSource = fs.readFileSync(path.join(__dirname, "../src/options.js"), "utf8");
+const optionsStylesSource = fs.readFileSync(path.join(__dirname, "../src/options.css"), "utf8");
+const manifestSource = fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8");
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -334,6 +339,191 @@ function createServiceWorkerHarness(initialStorage, harnessOptions) {
   };
 }
 
+function createDeferredPromise() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function createOptionsElement(options) {
+  const value = options || {};
+  const listeners = {};
+  return {
+    tagName: value.tagName || "DIV",
+    dataset: { ...(value.dataset || {}) },
+    hidden: value.hidden === true,
+    disabled: false,
+    textContent: value.textContent || "",
+    title: "",
+    value: value.value || "",
+    files: [],
+    className: value.className || "",
+    addEventListener(type, listener) { listeners[type] = listener; },
+    focus() {},
+    closest(selector) {
+      if (selector === "[data-backup-action]" && this.dataset.backupAction) return this;
+      if (selector === "[data-action]" && this.dataset.action) return this;
+      return null;
+    },
+    listeners,
+  };
+}
+
+function createOptionsPageHarness(harnessOptions) {
+  const options = harnessOptions || {};
+  const documentListeners = {};
+  const storageListeners = {};
+  const sendCalls = [];
+  let sendHandler = options.sendMessage || (async (message) => {
+    if (message.type === contract.MESSAGE_TYPES.GET_KEY_STATUS) return { ok: true, configured: false };
+    if ([workspaceContract.MESSAGE_TYPES.IMPORT_SETTINGS_PREVIEW, workspaceContract.MESSAGE_TYPES.IMPORT_DATA_PREVIEW].includes(message.type)) {
+      return { ok: true, preview: { metadata: { format: "test" }, warnings: [] } };
+    }
+    return { ok: true };
+  });
+  const rootClasses = new Set(options.rootClasses || ["theme-system", "theme-pending", "service-ready"]);
+  const documentElement = {
+    classList: {
+      add(...names) { names.forEach((name) => rootClasses.add(name)); },
+      remove(...names) { names.forEach((name) => rootClasses.delete(name)); },
+      contains(name) { return rootClasses.has(name); },
+    },
+  };
+  const form = createOptionsElement({ tagName: "FORM" });
+  const input = createOptionsElement({ tagName: "INPUT" });
+  const statusView = createOptionsElement();
+  const message = createOptionsElement();
+  const deleteConfirm = createOptionsElement();
+  const cancelReplace = createOptionsElement({ tagName: "BUTTON", dataset: { action: "cancel-replace" } });
+  const backupSection = createOptionsElement();
+  backupSection.scrollIntoView = () => {};
+  const byId = new Map([
+    ["key-form", form],
+    ["api-key", input],
+    ["status-view", statusView],
+    ["message", message],
+    ["delete-confirm", deleteConfirm],
+    ["backup", backupSection],
+  ]);
+  const bySelector = new Map([
+    ['[data-action="cancel-replace"]', cancelReplace],
+  ]);
+  const groups = {};
+  for (const kind of ["settings", "data"]) {
+    const preview = createOptionsElement({ tagName: "PRE", textContent: "Файл не выбран." });
+    const result = createOptionsElement({ tagName: "P" });
+    const apply = createOptionsElement({ tagName: "BUTTON", dataset: { backupAction: "apply", kind } });
+    const selectedFile = createOptionsElement({ hidden: true });
+    const selectedFilename = createOptionsElement({ tagName: "SPAN" });
+    const exportButton = createOptionsElement({ tagName: "BUTTON", dataset: { backupAction: "export", kind } });
+    const fileInput = createOptionsElement({ tagName: "INPUT", dataset: { backupAction: "file", kind } });
+    const mergeMode = createOptionsElement({ tagName: "INPUT", dataset: { backupAction: "mode", kind }, value: "merge" });
+    const replaceMode = createOptionsElement({ tagName: "INPUT", dataset: { backupAction: "mode", kind }, value: "replace" });
+    const cancel = createOptionsElement({ tagName: "BUTTON", dataset: { backupAction: "cancel", kind } });
+    const actions = [exportButton, fileInput, mergeMode, replaceMode, cancel, apply];
+    groups[kind] = {
+      preview,
+      result,
+      apply,
+      selectedFile,
+      selectedFilename,
+      exportButton,
+      fileInput,
+      mergeMode,
+      replaceMode,
+      cancel,
+      actions,
+    };
+    bySelector.set(`[data-backup-preview="${kind}"]`, preview);
+    bySelector.set(`[data-backup-result="${kind}"]`, result);
+    bySelector.set(`[data-backup-action="apply"][data-kind="${kind}"]`, apply);
+    bySelector.set(`[data-backup-selected-file="${kind}"]`, selectedFile);
+    bySelector.set(`[data-backup-filename="${kind}"]`, selectedFilename);
+    bySelector.set(`[data-backup-action="file"][data-kind="${kind}"]`, fileInput);
+  }
+  const document = {
+    documentElement,
+    body: { appendChild() {} },
+    getElementById(id) { return byId.get(id) || null; },
+    querySelector(selector) { return bySelector.get(selector) || null; },
+    querySelectorAll(selector) {
+      if (selector === "[data-action], #api-key") return [input, cancelReplace];
+      const match = selector.match(/^\[data-backup-kind="(settings|data)"\] \[data-backup-action\]$/);
+      return match ? groups[match[1]].actions : [];
+    },
+    addEventListener(type, listener) { documentListeners[type] = listener; },
+    createElement() { return createOptionsElement(); },
+  };
+  const chrome = {
+    storage: {
+      local: {
+        async get() {
+          if (options.storageError) throw options.storageError;
+          return { settings: options.settings };
+        },
+      },
+      onChanged: {
+        addListener(listener) { storageListeners.changed = listener; },
+      },
+    },
+    runtime: {
+      async sendMessage(messageValue) {
+        sendCalls.push(messageValue);
+        return sendHandler(messageValue);
+      },
+    },
+  };
+  const instrumentedSource = optionsScriptSource.replace(
+    /\}\)\(\);\s*$/,
+    `globalThis.__optionsPageTest = Object.freeze({
+      backup, clearBackupSelection, readBackupFile, renderBackup, renderBackups, applyBackup, applyTheme, loadTheme
+    });
+  })();`,
+  );
+  const context = vm.createContext({
+    console,
+    Blob,
+    URL,
+    setTimeout,
+    clearTimeout,
+    chrome,
+    document,
+    location: { hash: "" },
+    window: { confirm: () => true },
+    ChatGPTHelperAnalysisContract: contract,
+    ChatGPTHelperWorkspaceContract: workspaceContract,
+    ChatGPTHelperImportExport: importExport,
+  });
+  vm.runInContext(instrumentedSource, context, { filename: "options.js" });
+  return {
+    state: context.__optionsPageTest.backup,
+    api: context.__optionsPageTest,
+    groups,
+    input,
+    rootClasses,
+    sendCalls,
+    setSendHandler(handler) { sendHandler = handler; },
+    emitStorageChange(changes, areaName) { storageListeners.changed(changes, areaName || "local"); },
+    async clickBackup(kind, action) {
+      const target = groups[kind].actions.find((element) => element.dataset.backupAction === action);
+      return documentListeners.click({ target });
+    },
+    changeFile(kind, file) {
+      groups[kind].fileInput.files = file ? [file] : [];
+      documentListeners.change({ target: groups[kind].fileInput });
+    },
+    async settle() {
+      await Promise.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      await Promise.resolve();
+    },
+  };
+}
+
 function fakeElement(selectorFragment) {
   return {
     closest(selector) {
@@ -399,6 +589,31 @@ assert.equal(analysisUi.replacementCommandForTerm({ status: "new" }), null);
 assert.doesNotMatch(contentScriptSource, /chrome\.storage\.local\.set\s*\(/);
 assert.doesNotMatch(contentScriptSource, /\bindexedDB\b/);
 assert.doesNotMatch(contentScriptSource, /chrome\.storage\.local\.(?:remove|clear)\s*\(/);
+assert.match(optionsHtmlSource, /<html lang="ru" class="theme-system theme-pending">/);
+assert.match(optionsHtmlSource, /<h1>Настройки расширения<\/h1>/);
+assert.match(optionsHtmlSource, /<section id="backup"[\s\S]*<h2 id="backup-title">Импорт и экспорт<\/h2>/);
+assert.match(optionsHtmlSource, /Файлы создаются и обрабатываются локально\.<br>API key никогда не включается в экспорт\./);
+assert.equal([...optionsHtmlSource.matchAll(/data-backup-action="export"[^>]*>Экспорт<\/button>/g)].length, 2);
+assert.equal([...optionsHtmlSource.matchAll(/<label class="file-button">Импорт<input type="file"/g)].length, 2);
+assert.doesNotMatch(optionsHtmlSource, /Экспортировать настройки|Экспортировать данные|Выбрать файл/);
+assert.match(optionsHtmlSource, /data-backup-selected-file="settings"[\s\S]*data-backup-filename="settings"[\s\S]*aria-label="Отменить выбор файла настроек"/);
+assert.match(optionsHtmlSource, /data-backup-selected-file="data"[\s\S]*data-backup-filename="data"[\s\S]*aria-label="Отменить выбор файла данных"/);
+assert.match(optionsHtmlSource, />Применить настройки<\/button>/);
+assert.match(optionsHtmlSource, />Применить данные<\/button>/);
+assert.match(optionsStylesSource, /html\.theme-pending body \{ visibility: hidden; \}/);
+assert.match(optionsStylesSource, /@media \(prefers-color-scheme: dark\) \{\s*:root\.theme-system \{/);
+assert.doesNotMatch(optionsStylesSource, /@media \(prefers-color-scheme: dark\) \{\s*:root\s*\{/);
+assert.match(optionsStylesSource, /\.selected-file-name \{[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/);
+assert.doesNotMatch(optionsScriptSource, /document\.documentElement\.className\s*=/);
+assert.match(optionsScriptSource, /function clearBackupSelection\(kind\)/);
+assert.match(contentScriptSource, /<h3>Настройки расширения<\/h3>/);
+assert.match(contentScriptSource, /Ключ OpenRouter, импорт и экспорт настроек и данных\./);
+assert.match(contentScriptSource, /data-action="open-extension-options">Открыть настройки расширения<\/button>/);
+assert.match(contentScriptSource, /action === "open-extension-options"\) \{\s*await state\.analysisController\?\.openOptions\(\);/);
+assert.doesNotMatch(contentScriptSource, /open-backup-options/);
+assert.match(analysisControllerSource, /async function openOptions\(section\)[\s\S]*section === "backup"[\s\S]*section: "backup"/);
+assert.match(serviceWorkerSource, /message\.section === "backup"[\s\S]*src\/options\.html#backup/);
+assert.equal(JSON.parse(manifestSource).options_ui.page, "src/options.html");
 assert.match(contentScriptSource, /\.shell \{[\s\S]*width: var\(--sidebar-effective-width\);[\s\S]*\.sidebar-frame \{[\s\S]*display: flex;/);
 assert.match(contentScriptSource, /\.rail \{[\s\S]*position: relative;[\s\S]*flex: 0 0 var\(--rail-width\);/);
 assert.match(contentScriptSource, /\.panel \{[\s\S]*position: relative;[\s\S]*flex: 1 1 auto;/);
@@ -686,7 +901,303 @@ assert.equal(openRouter.extractStructuredContent({
   choices: [{ finish_reason: "content_filter", message: { content: "" } }],
 }).code, "CONTENT_BLOCKED");
 
+async function runOptionsPageBehaviorTests() {
+  const knownThemeClasses = ["theme-system", "theme-graphite", "theme-navy", "theme-violet", "theme-gold"];
+  const themeHarness = createOptionsPageHarness({ settings: { theme: "navy" } });
+  await themeHarness.settle();
+  assert.equal(themeHarness.rootClasses.has("theme-navy"), true);
+  assert.equal(themeHarness.rootClasses.has("theme-pending"), false);
+  assert.equal(themeHarness.rootClasses.has("service-ready"), true);
+  assert.equal(knownThemeClasses.filter((name) => themeHarness.rootClasses.has(name)).length, 1);
+  themeHarness.api.applyTheme({ theme: "violet" });
+  assert.equal(themeHarness.rootClasses.has("theme-violet"), true);
+  assert.equal(themeHarness.rootClasses.has("service-ready"), true);
+  assert.equal(knownThemeClasses.filter((name) => themeHarness.rootClasses.has(name)).length, 1);
+  themeHarness.api.applyTheme({ theme: "not-a-theme" });
+  assert.equal(themeHarness.rootClasses.has("theme-system"), true);
+  assert.equal(knownThemeClasses.filter((name) => themeHarness.rootClasses.has(name)).length, 1);
+  themeHarness.emitStorageChange({ settings: { newValue: { theme: "gold" } } });
+  assert.equal(themeHarness.rootClasses.has("theme-gold"), true);
+  assert.equal(themeHarness.rootClasses.has("service-ready"), true);
+
+  const failedThemeHarness = createOptionsPageHarness({ storageError: new Error("settings unavailable") });
+  await failedThemeHarness.settle();
+  assert.equal(failedThemeHarness.rootClasses.has("theme-system"), true);
+  assert.equal(failedThemeHarness.rootClasses.has("theme-pending"), false);
+  assert.equal(failedThemeHarness.rootClasses.has("service-ready"), true);
+
+  const keyStatusDeferred = createDeferredPromise();
+  const keyBusyHarness = createOptionsPageHarness({
+    settings: { theme: "system" },
+    sendMessage(messageValue) {
+      if (messageValue.type === contract.MESSAGE_TYPES.GET_KEY_STATUS) return keyStatusDeferred.promise;
+      return Promise.resolve({ ok: true });
+    },
+  });
+  assert.equal(keyBusyHarness.input.disabled, true);
+  assert.equal(keyBusyHarness.groups.settings.exportButton.disabled, false);
+  assert.equal(keyBusyHarness.groups.data.exportButton.disabled, false);
+  keyStatusDeferred.resolve({ ok: true, configured: false });
+  await keyBusyHarness.settle();
+  assert.equal(keyBusyHarness.input.disabled, false);
+
+  for (const kind of ["settings", "data"]) {
+    const otherKind = kind === "settings" ? "data" : "settings";
+    const harness = createOptionsPageHarness({ settings: { theme: "system" } });
+    await harness.settle();
+    const file = {
+      name: `<selected-${kind}>.json`,
+      size: 128,
+      lastModified: 10,
+      async text() { return "{}"; },
+    };
+    const otherFile = {
+      name: `${otherKind}.json`,
+      size: 64,
+      lastModified: 20,
+      async text() { return "{}"; },
+    };
+    Object.assign(harness.state[kind], {
+      state: "ready",
+      file,
+      fingerprint: `${file.name}:${file.size}:${file.lastModified}`,
+      text: "{}",
+      preview: { metadata: { format: "test" } },
+      mode: "replace",
+      result: "old result",
+      error: true,
+    });
+    Object.assign(harness.state[otherKind], {
+      state: "failed",
+      file: otherFile,
+      fingerprint: `${otherFile.name}:${otherFile.size}:${otherFile.lastModified}`,
+      text: "other text",
+      preview: { marker: "other preview" },
+      mode: "replace",
+      result: "other result",
+      error: true,
+    });
+    harness.groups[kind].fileInput.value = "C:\\fakepath\\selected.json";
+    harness.api.renderBackups();
+    assert.equal(harness.groups[kind].selectedFile.hidden, false);
+    assert.equal(harness.groups[kind].selectedFilename.textContent, file.name);
+    assert.equal(harness.groups[kind].selectedFilename.title, file.name);
+    assert.equal(harness.groups[kind].cancel.disabled, false);
+    const sendCountBeforeCancel = harness.sendCalls.length;
+    await harness.clickBackup(kind, "cancel");
+    assert.equal(harness.sendCalls.length, sendCountBeforeCancel);
+    assert.equal(harness.state[kind].state, "idle");
+    assert.equal(harness.state[kind].file, null);
+    assert.equal(harness.state[kind].fingerprint, null);
+    assert.equal(harness.state[kind].text, null);
+    assert.equal(harness.state[kind].preview, null);
+    assert.equal(harness.state[kind].result, "");
+    assert.equal(harness.state[kind].error, false);
+    assert.equal(harness.state[kind].mode, "replace");
+    assert.equal(harness.groups[kind].fileInput.value, "");
+    assert.equal(harness.groups[kind].selectedFile.hidden, true);
+    assert.equal(harness.groups[kind].preview.textContent, "Файл не выбран.");
+    assert.equal(harness.state[otherKind].state, "failed");
+    assert.equal(harness.state[otherKind].file, otherFile);
+    assert.equal(harness.state[otherKind].text, "other text");
+    assert.equal(harness.state[otherKind].preview.marker, "other preview");
+    assert.equal(harness.state[otherKind].mode, "replace");
+    assert.equal(harness.state[otherKind].result, "other result");
+    assert.equal(harness.state[otherKind].error, true);
+  }
+
+  const delayedRead = createDeferredPromise();
+  const readingHarness = createOptionsPageHarness({ settings: { theme: "system" } });
+  await readingHarness.settle();
+  const readingFile = {
+    name: "delayed-settings.json",
+    size: 100,
+    lastModified: 30,
+    text() { return delayedRead.promise; },
+  };
+  readingHarness.groups.settings.fileInput.value = "C:\\fakepath\\delayed-settings.json";
+  const readingOperation = readingHarness.api.readBackupFile("settings", readingFile);
+  assert.equal(readingHarness.state.settings.state, "reading");
+  for (const action of ["exportButton", "fileInput", "mergeMode", "replaceMode", "apply"]) {
+    assert.equal(readingHarness.groups.settings[action].disabled, true);
+  }
+  assert.equal(readingHarness.groups.settings.cancel.disabled, false);
+  await readingHarness.clickBackup("settings", "cancel");
+  delayedRead.resolve("{}");
+  await readingOperation;
+  assert.equal(readingHarness.state.settings.state, "idle");
+  assert.equal(readingHarness.state.settings.file, null);
+  assert.equal(readingHarness.groups.settings.preview.textContent, "Файл не выбран.");
+
+  const rejectedRead = createDeferredPromise();
+  const rejectedReadHarness = createOptionsPageHarness({ settings: { theme: "system" } });
+  await rejectedReadHarness.settle();
+  const rejectedReadFile = {
+    name: "rejected-read.json",
+    size: 100,
+    lastModified: 31,
+    text() { return rejectedRead.promise; },
+  };
+  const rejectedReadOperation = rejectedReadHarness.api.readBackupFile("settings", rejectedReadFile);
+  await rejectedReadHarness.clickBackup("settings", "cancel");
+  rejectedRead.reject(new Error("late read failure"));
+  await rejectedReadOperation;
+  assert.equal(rejectedReadHarness.state.settings.state, "idle");
+  assert.equal(rejectedReadHarness.state.settings.result, "");
+  assert.equal(rejectedReadHarness.state.settings.error, false);
+
+  for (const validationOutcome of ["resolve", "reject"]) {
+    const delayedValidation = createDeferredPromise();
+    const validationHarness = createOptionsPageHarness({ settings: { theme: "system" } });
+    await validationHarness.settle();
+    validationHarness.setSendHandler((messageValue) => {
+      if (messageValue.type === workspaceContract.MESSAGE_TYPES.IMPORT_DATA_PREVIEW) return delayedValidation.promise;
+      return Promise.resolve({ ok: true, configured: false });
+    });
+    const validationFile = {
+      name: `delayed-validation-${validationOutcome}.json`,
+      size: 100,
+      lastModified: validationOutcome === "resolve" ? 40 : 41,
+      async text() { return "{}"; },
+    };
+    const validationOperation = validationHarness.api.readBackupFile("data", validationFile);
+    await validationHarness.settle();
+    assert.equal(validationHarness.state.data.state, "validating");
+    for (const action of ["exportButton", "fileInput", "mergeMode", "replaceMode", "apply"]) {
+      assert.equal(validationHarness.groups.data[action].disabled, true);
+    }
+    assert.equal(validationHarness.groups.data.cancel.disabled, false);
+    await validationHarness.clickBackup("data", "cancel");
+    if (validationOutcome === "resolve") {
+      delayedValidation.resolve({ ok: true, preview: { metadata: { format: "test" } } });
+    } else {
+      delayedValidation.reject(new Error("late validation failure"));
+    }
+    await validationOperation;
+    assert.equal(validationHarness.state.data.state, "idle");
+    assert.equal(validationHarness.state.data.preview, null);
+    assert.equal(validationHarness.state.data.result, "");
+    assert.equal(validationHarness.state.data.error, false);
+  }
+
+  const retainedFileHarness = createOptionsPageHarness({ settings: { theme: "system" } });
+  await retainedFileHarness.settle();
+  for (const [kind, stateValue] of [["settings", "failed"], ["data", "recovery-required"]]) {
+    const file = {
+      name: `${stateValue}.json`,
+      size: 80,
+      lastModified: 50,
+      async text() { return "{}"; },
+    };
+    Object.assign(retainedFileHarness.state[kind], {
+      state: stateValue,
+      file,
+      fingerprint: `${file.name}:${file.size}:${file.lastModified}`,
+      result: "retained error",
+      error: true,
+    });
+  }
+  retainedFileHarness.api.renderBackups();
+  assert.equal(retainedFileHarness.groups.settings.cancel.disabled, false);
+  assert.equal(retainedFileHarness.groups.data.cancel.disabled, false);
+
+  const applyDeferred = createDeferredPromise();
+  const applyingHarness = createOptionsPageHarness({ settings: { theme: "system" } });
+  await applyingHarness.settle();
+  for (const kind of ["settings", "data"]) {
+    const file = {
+      name: `${kind}-apply.json`,
+      size: 120,
+      lastModified: kind === "settings" ? 60 : 61,
+      async text() { return "{}"; },
+    };
+    Object.assign(applyingHarness.state[kind], {
+      state: "ready",
+      file,
+      fingerprint: `${file.name}:${file.size}:${file.lastModified}`,
+      text: "{}",
+      preview: { metadata: { format: "test" } },
+      result: "",
+      error: false,
+    });
+    applyingHarness.groups[kind].fileInput.value = `C:\\fakepath\\${file.name}`;
+  }
+  applyingHarness.api.renderBackups();
+  applyingHarness.setSendHandler((messageValue) => {
+    if (messageValue.type === workspaceContract.MESSAGE_TYPES.IMPORT_SETTINGS_APPLY) return applyDeferred.promise;
+    return Promise.resolve({ ok: true });
+  });
+  const applyOperation = applyingHarness.api.applyBackup("settings");
+  assert.equal(applyingHarness.state.settings.state, "applying");
+  for (const kind of ["settings", "data"]) {
+    for (const element of applyingHarness.groups[kind].actions) assert.equal(element.disabled, true);
+  }
+  applyingHarness.api.clearBackupSelection("settings");
+  applyingHarness.api.clearBackupSelection("data");
+  assert.equal(applyingHarness.state.settings.state, "applying");
+  assert.notEqual(applyingHarness.state.settings.file, null);
+  assert.notEqual(applyingHarness.state.data.file, null);
+  applyDeferred.resolve({ ok: true });
+  await applyOperation;
+  assert.equal(applyingHarness.state.settings.state, "success");
+  assert.equal(applyingHarness.state.settings.file, null);
+  assert.equal(applyingHarness.state.settings.fingerprint, null);
+  assert.equal(applyingHarness.state.settings.text, null);
+  assert.equal(applyingHarness.state.settings.preview, null);
+  assert.equal(applyingHarness.state.settings.result, "Импорт успешно применён.");
+  assert.equal(applyingHarness.state.settings.error, false);
+  assert.equal(applyingHarness.groups.settings.fileInput.value, "");
+  assert.equal(applyingHarness.groups.settings.selectedFile.hidden, true);
+  assert.equal(applyingHarness.groups.data.exportButton.disabled, false);
+  assert.equal(applyingHarness.groups.data.cancel.disabled, false);
+
+  const sameFileHarness = createOptionsPageHarness({ settings: { theme: "system" } });
+  await sameFileHarness.settle();
+  const sameFile = {
+    name: "same-file.json",
+    size: 100,
+    lastModified: 70,
+    async text() { return "{}"; },
+  };
+  sameFileHarness.groups.settings.fileInput.value = "C:\\fakepath\\same-file.json";
+  sameFileHarness.changeFile("settings", sameFile);
+  await sameFileHarness.settle();
+  assert.equal(sameFileHarness.state.settings.state, "ready");
+  await sameFileHarness.clickBackup("settings", "cancel");
+  assert.equal(sameFileHarness.groups.settings.fileInput.value, "");
+  sameFileHarness.groups.settings.fileInput.value = "C:\\fakepath\\same-file.json";
+  sameFileHarness.changeFile("settings", sameFile);
+  await sameFileHarness.settle();
+  assert.equal(sameFileHarness.state.settings.state, "ready");
+  assert.equal(sameFileHarness.state.settings.file, sameFile);
+  assert.equal(sameFileHarness.groups.settings.selectedFile.hidden, false);
+
+  const originalChrome = globalThis.chrome;
+  const controllerMessages = [];
+  globalThis.chrome = {
+    runtime: {
+      onMessage: { addListener() {} },
+      async sendMessage(messageValue) {
+        controllerMessages.push(messageValue);
+        return { ok: true };
+      },
+    },
+  };
+  try {
+    const controller = analysisController.create({});
+    await controller.openOptions();
+    await controller.openOptions("backup");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+  assert.deepEqual(controllerMessages, [
+    { type: contract.MESSAGE_TYPES.OPEN_OPTIONS },
+    { type: contract.MESSAGE_TYPES.OPEN_OPTIONS, section: "backup" },
+  ]);
+}
+
 async function runAsyncTests() {
+  await runOptionsPageBehaviorTests();
   const retryTerm = {
     status: "duplicate",
     conceptId: "concept-retry",

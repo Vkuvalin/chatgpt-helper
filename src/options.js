@@ -6,6 +6,8 @@
   const importExport = globalThis.ChatGPTHelperImportExport;
   const MESSAGES = analysisContract.MESSAGE_TYPES;
   const BACKUP_MESSAGES = workspaceContract.MESSAGE_TYPES;
+  const THEME_CLASSES = Object.freeze(["theme-system", "theme-graphite", "theme-navy", "theme-violet", "theme-gold"]);
+  const CANCELLABLE_BACKUP_STATES = new Set(["reading", "validating", "ready", "success", "failed", "recovery-required"]);
   const form = document.getElementById("key-form");
   const input = document.getElementById("api-key");
   const statusView = document.getElementById("status-view");
@@ -84,6 +86,12 @@
     const preview = document.querySelector(`[data-backup-preview="${kind}"]`);
     const result = document.querySelector(`[data-backup-result="${kind}"]`);
     const apply = document.querySelector(`[data-backup-action="apply"][data-kind="${kind}"]`);
+    const selectedFile = document.querySelector(`[data-backup-selected-file="${kind}"]`);
+    const selectedFilename = document.querySelector(`[data-backup-filename="${kind}"]`);
+    const applying = Object.values(backup).some((item) => item.state === "applying");
+    selectedFile.hidden = !state.file;
+    selectedFilename.textContent = state.file?.name || "";
+    selectedFilename.title = state.file?.name || "";
     preview.textContent = state.state === "reading" ? "Чтение файла…"
       : state.state === "validating" ? "Проверка файла…"
         : state.preview ? previewText(kind, state.preview) : "Файл не выбран.";
@@ -93,10 +101,14 @@
       || !state.preview
       || !state.text
       || state.fingerprint !== fileFingerprint(state.file)
-      || Object.values(backup).some((item) => item.state === "applying");
+      || applying;
     document.querySelectorAll(`[data-backup-kind="${kind}"] [data-backup-action]`).forEach((element) => {
       if (element === apply) return;
-      element.disabled = state.state === "reading" || state.state === "validating" || state.state === "applying";
+      if (element.dataset.backupAction === "cancel") {
+        element.disabled = applying || !state.file || !CANCELLABLE_BACKUP_STATES.has(state.state);
+        return;
+      }
+      element.disabled = applying || state.state === "reading" || state.state === "validating";
     });
   }
 
@@ -107,12 +119,34 @@
 
   function applyTheme(settingsValue) {
     const settings = workspaceContract.normalizeActiveSettings(settingsValue);
-    document.documentElement.className = `theme-${settings.theme}`;
+    document.documentElement.classList.remove(...THEME_CLASSES);
+    document.documentElement.classList.add(`theme-${settings.theme}`);
   }
 
   async function loadTheme() {
-    const stored = await chrome.storage.local.get("settings").catch(() => ({}));
-    applyTheme(stored.settings);
+    try {
+      const stored = await chrome.storage.local.get("settings");
+      applyTheme(stored.settings);
+    } catch (_) {
+      applyTheme(undefined);
+    } finally {
+      document.documentElement.classList.remove("theme-pending");
+    }
+  }
+
+  function clearBackupSelection(kind) {
+    const state = backup[kind];
+    if (!state || Object.values(backup).some((item) => item.state === "applying")) return;
+    state.state = "idle";
+    state.file = null;
+    state.fingerprint = null;
+    state.text = null;
+    state.preview = null;
+    state.result = "";
+    state.error = false;
+    const fileInput = document.querySelector(`[data-backup-action="file"][data-kind="${kind}"]`);
+    if (fileInput) fileInput.value = "";
+    renderBackup(kind);
   }
 
   async function loadStatus() {
@@ -169,6 +203,7 @@
         state.state = "ready";
       }
     } catch (_) {
+      if (file !== state.file || fingerprint !== state.fingerprint) return;
       state.state = "failed";
       state.result = "Не удалось прочитать или проверить файл UTF-8.";
       state.error = true;
@@ -288,6 +323,7 @@
       const kind = backupButton.dataset.kind;
       if (backupButton.dataset.backupAction === "export") await exportBackup(kind);
       else if (backupButton.dataset.backupAction === "apply") await applyBackup(kind);
+      else if (backupButton.dataset.backupAction === "cancel") clearBackupSelection(kind);
       return;
     }
     const button = event.target.closest("[data-action]");

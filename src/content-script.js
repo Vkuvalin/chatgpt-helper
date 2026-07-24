@@ -1165,8 +1165,9 @@
       '  <ul class="command-list"><li>Активировать расширение</li><li>Анализировать выделенный текст</li><li>Сохранить выделенный текст</li><li>Нормализовать пустые строки</li></ul>',
       '</section>',
       '<section class="settings-group">',
-      '  <h3>Резервное копирование</h3>',
-      '  <button class="button" type="button" data-action="open-backup-options">Открыть резервное копирование</button>',
+      '  <h3>Настройки расширения</h3>',
+      '  <p class="settings-help">Ключ OpenRouter, импорт и экспорт настроек и данных.</p>',
+      '  <button class="button" type="button" data-action="open-extension-options">Открыть настройки расширения</button>',
       '</section>',
       statusMarkup(),
     ].join("");
@@ -1669,8 +1670,8 @@
 
     if (action === "open-analysis-options") {
       await state.analysisController?.openOptions();
-    } else if (action === "open-backup-options") {
-      await state.analysisController?.openOptions("backup");
+    } else if (action === "open-extension-options") {
+      await state.analysisController?.openOptions();
     } else if (action === "reset-interface-sizes") {
       await saveSettings({
         ...state.settings,
