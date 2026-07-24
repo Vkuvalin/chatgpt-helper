@@ -7,6 +7,7 @@
   const DRAG_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/></svg>';
   const COPY_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8.75h8.25A1.75 1.75 0 0 1 19 10.5v7.25a1.75 1.75 0 0 1-1.75 1.75H10a1.75 1.75 0 0 1-1.75-1.75V10.5A1.75 1.75 0 0 1 10 8.75Zm6.75 0V6.5A1.75 1.75 0 0 0 14 4.75H6.75A1.75 1.75 0 0 0 5 6.5v7.25a1.75 1.75 0 0 0 1.75 1.75h1.5"/></svg>';
   const CHECK_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.25 4.25L19 7"/></svg>';
+  const TRASH_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14m-9-3h4l1 3H9l1-3Zm-3 3 1 13h8l1-13M10 10v6m4-6v6"/></svg>';
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -56,13 +57,117 @@
     ].join("");
   }
 
-  function activeSearchMode(requestedMode, queryValue) {
-    return requestedMode === "global" && String(queryValue || "").trim() ? "global" : "local";
+  function activeSearchMode(requestedMode) {
+    return requestedMode === "global" ? "global" : "local";
   }
 
-  function requestedModeAfterQueryInput(requestedMode, queryValue) {
-    if (String(queryValue ?? "") === "") return "local";
+  function requestedModeAfterQueryInput(requestedMode) {
     return requestedMode === "global" ? "global" : "local";
+  }
+
+  function closedWorkspaceDeleteState() {
+    return {
+      phase: "closed",
+      kind: null,
+      entryId: null,
+      scope: null,
+      menuOpen: false,
+    };
+  }
+
+  function workspaceDeleteOwns(value, kind, entryId) {
+    return value?.phase !== "closed" && value?.kind === kind && value?.entryId === entryId;
+  }
+
+  function workspaceDeleteMenuOpen(value) {
+    return value?.phase !== "closed" && value?.menuOpen !== false;
+  }
+
+  function transitionWorkspaceDelete(value, event) {
+    const current = value?.phase ? value : closedWorkspaceDeleteState();
+    if (event?.type === "settle") return closedWorkspaceDeleteState();
+    if (event?.type === "close") {
+      if (current.phase === "deleting") return { ...current, menuOpen: false };
+      return closedWorkspaceDeleteState();
+    }
+    if (event?.type === "trigger") {
+      if (current.phase === "deleting") return current;
+      if (!["glossary", "saved"].includes(event.kind) || typeof event.entryId !== "string" || !event.entryId) {
+        return current;
+      }
+      if (workspaceDeleteOwns(current, event.kind, event.entryId)) return closedWorkspaceDeleteState();
+      return {
+        phase: "choosing",
+        kind: event.kind,
+        entryId: event.entryId,
+        scope: null,
+        menuOpen: true,
+      };
+    }
+    if (event?.type === "begin"
+      && current.phase === "choosing"
+      && ["local", "global"].includes(event.scope)) {
+      return {
+        ...current,
+        phase: "deleting",
+        scope: event.scope,
+        menuOpen: true,
+      };
+    }
+    return current;
+  }
+
+  function workspaceDeleteOperation(kind, scope) {
+    if (kind === "glossary" && scope === "local") return "unlinkGlossary";
+    if (kind === "glossary" && scope === "global") return "deleteGlossary";
+    if (kind === "saved" && scope === "local") return "unlinkSaved";
+    if (kind === "saved" && scope === "global") return "deleteSaved";
+    return null;
+  }
+
+  function workspaceDeleteLocalAvailable(mode, entry) {
+    return mode === "local" || entry?.attached === true;
+  }
+
+  function workspaceDeletePointerInside(value, pathValue) {
+    if (value?.phase === "closed" || !Array.isArray(pathValue)) return false;
+    return pathValue.some((item) => (
+      item?.dataset?.workspaceDeleteKind === value.kind
+      && item?.dataset?.workspaceDeleteId === value.entryId
+    ));
+  }
+
+  function workspaceDeleteEntryPresent(value, entriesValue) {
+    if (value?.phase === "closed") return true;
+    return Array.isArray(entriesValue) && entriesValue.some((entry) => entry?.id === value?.entryId);
+  }
+
+  function isCurrentWorkspaceRequest(token, currentToken) {
+    return token === currentToken;
+  }
+
+  function workspaceDeleteMarkup(state, kind, entry, mode) {
+    const deletion = state.workspaceDelete || closedWorkspaceDeleteState();
+    const owns = workspaceDeleteOwns(deletion, kind, entry.id);
+    const menuOpen = owns && workspaceDeleteMenuOpen(deletion);
+    const busy = deletion.phase === "deleting";
+    const localAvailable = workspaceDeleteLocalAvailable(mode, entry);
+    const localLabel = localAvailable ? "Удалить только из этого чата" : "Запись не добавлена в этот чат";
+    const trash = [
+      `<button class="icon-button workspace-trash-button${menuOpen ? " is-open" : ""}" type="button" data-action="workspace-delete-toggle" data-kind="${kind}" data-id="${escapeHtml(entry.id)}" title="Удалить запись" aria-label="Удалить запись" aria-expanded="${menuOpen}"${busy ? " disabled" : ""}>`,
+      `  ${TRASH_ICON}`,
+      "</button>",
+    ].join("");
+    const menu = menuOpen ? [
+      `<div class="workspace-delete-menu" data-workspace-delete-menu="${kind}" role="group" aria-label="Удалить запись">`,
+      '  <strong class="workspace-delete-title">Удалить запись</strong>',
+      '  <div class="workspace-delete-actions">',
+      `    <button class="button" type="button" data-action="workspace-delete-local" data-kind="${kind}" data-id="${escapeHtml(entry.id)}" title="${localLabel}" aria-label="${localLabel}"${!localAvailable || busy ? " disabled" : ""}>Из чата</button>`,
+      `    <button class="button danger" type="button" data-action="workspace-delete-global" data-kind="${kind}" data-id="${escapeHtml(entry.id)}" title="Удалить запись везде" aria-label="Удалить запись везде"${busy ? " disabled" : ""}>Везде</button>`,
+      "  </div>",
+      "</div>",
+    ].join("") : "";
+    return { trash, menu };
   }
 
   function nextSidebarPhase(phase, action) {
@@ -183,22 +288,22 @@
     const query = String(state.glossarySearch || "");
     const requestedMode = state.glossaryRequestedMode === "global" ? "global" : "local";
     const mode = activeSearchMode(requestedMode, query);
-    const entries = normalizeGlossaryEntries(state.glossaryEntries);
+    const globalEmpty = mode === "global" && !query.trim();
+    const entries = globalEmpty ? [] : normalizeGlossaryEntries(state.glossaryEntries);
     const analysis = state.settings?.analysis || {};
     const termColor = analysis.termColorMode === "custom" ? analysis.customTermColor : "var(--accent)";
     const unavailable = unavailableMarkup(state);
     const cards = entries.map((entry) => {
-      const confirming = state.glossaryConfirmDeleteId === entry.id;
       const local = mode === "local";
       const draggable = local && !query.trim();
       const action = local
-        ? `<button class="button workspace-card-action" type="button" data-action="unlink-glossary" data-id="${escapeHtml(entry.id)}">Убрать из чата</button>`
+        ? ""
         : entry.attached
           ? '<span class="workspace-attached">Уже в этом чате</span>'
           : `<button class="button workspace-card-action" type="button" data-action="attach-glossary" data-id="${escapeHtml(entry.id)}">Добавить в чат</button>`;
-      const globalDelete = local ? "" : `<button class="button danger workspace-card-action" type="button" data-action="ask-global-glossary-delete" data-id="${escapeHtml(entry.id)}">Удалить глобально во всех чатах</button>`;
+      const deletion = workspaceDeleteMarkup(state, "glossary", entry, mode);
       return [
-        `<article class="workspace-card glossary-card" data-glossary-id="${escapeHtml(entry.id)}">`,
+        `<article class="workspace-card glossary-card" data-glossary-id="${escapeHtml(entry.id)}" data-workspace-delete-kind="glossary" data-workspace-delete-id="${escapeHtml(entry.id)}">`,
         '  <div class="workspace-card-main">',
         local ? `    <span class="drag-handle" ${draggable ? 'draggable="true"' : ""} data-glossary-drag-id="${escapeHtml(entry.id)}" title="${draggable ? "Перетащить термин" : "Порядок доступен без поиска"}">${DRAG_ICON}</span>` : "",
         '    <div class="workspace-card-copy">',
@@ -206,22 +311,15 @@
         `      <p class="glossary-definition">${escapeHtml(entry.definition)}</p>`,
         "    </div>",
         "  </div>",
-        `  <div class="workspace-card-footer">${action}${globalDelete}</div>`,
-        confirming && !local ? [
-          '  <div class="workspace-delete-confirm">',
-          "    <span>Удалить глобальное значение и все его связи со всеми чатами?</span>",
-          '    <div class="confirm-actions">',
-          '      <button class="button" type="button" data-action="cancel-global-glossary-delete">Нет</button>',
-          `      <button class="button danger" type="button" data-action="confirm-global-glossary-delete" data-id="${escapeHtml(entry.id)}">Удалить</button>`,
-          "    </div>",
-          "  </div>",
-        ].join("") : "",
+        `  <div class="workspace-card-footer">${action}${deletion.trash}</div>`,
+        deletion.menu,
         "</article>",
       ].join("");
     }).join("");
 
     let empty = "";
-    if (!entries.length && mode === "local") empty = '<p class="empty-state">В этом чате пока нет терминов. Запустите анализ выделенного текста или добавьте результат глобального поиска.</p>';
+    if (globalEmpty) empty = '<p class="empty-state">Введите запрос для глобального поиска.</p>';
+    else if (!entries.length && mode === "local") empty = '<p class="empty-state">В этом чате пока нет терминов. Запустите анализ выделенного текста или добавьте результат глобального поиска.</p>';
     else if (!entries.length) empty = '<p class="empty-state">По глобальному запросу ничего не найдено.</p>';
     const keyOnboarding = !state.keyChecking && !state.keyConfigured
       ? [
@@ -249,18 +347,18 @@
     const query = String(state.savedSearch || "");
     const requestedMode = state.savedRequestedMode === "global" ? "global" : "local";
     const mode = activeSearchMode(requestedMode, query);
-    const entries = normalizeSavedEntries(state.savedEntries);
+    const globalEmpty = mode === "global" && !query.trim();
+    const entries = globalEmpty ? [] : normalizeSavedEntries(state.savedEntries);
     const unavailable = unavailableMarkup(state);
     const cards = entries.map((entry) => {
-      const confirming = state.savedConfirmDeleteId === entry.id;
       const local = mode === "local";
       const draggable = local && !query.trim();
       const action = local
-        ? `<button class="button workspace-card-action" type="button" data-action="unlink-saved" data-id="${escapeHtml(entry.id)}">Убрать из чата</button>`
+        ? ""
         : entry.attached
           ? '<span class="workspace-attached">Уже в этом чате</span>'
           : `<button class="button workspace-card-action" type="button" data-action="attach-saved" data-id="${escapeHtml(entry.id)}">Добавить в чат</button>`;
-      const globalDelete = local ? "" : `<button class="button danger workspace-card-action" type="button" data-action="ask-global-saved-delete" data-id="${escapeHtml(entry.id)}">Удалить глобально во всех чатах</button>`;
+      const deletion = workspaceDeleteMarkup(state, "saved", entry, mode);
       const copy = [
         `<button class="icon-button workspace-copy-button" type="button" data-action="copy-saved" data-id="${escapeHtml(entry.id)}" title="Скопировать сохранённый текст" aria-label="Скопировать сохранённый текст">`,
         `  <span class="workspace-copy-default">${COPY_ICON}</span>`,
@@ -268,27 +366,20 @@
         "</button>",
       ].join("");
       return [
-        `<article class="workspace-card saved-card" data-saved-id="${escapeHtml(entry.id)}">`,
+        `<article class="workspace-card saved-card" data-saved-id="${escapeHtml(entry.id)}" data-workspace-delete-kind="saved" data-workspace-delete-id="${escapeHtml(entry.id)}">`,
         '  <div class="workspace-card-main">',
         local ? `    <span class="drag-handle" ${draggable ? 'draggable="true"' : ""} data-saved-drag-id="${escapeHtml(entry.id)}" title="${draggable ? "Перетащить" : "Порядок доступен без поиска"}">${DRAG_ICON}</span>` : "",
         `    <p class="saved-text">${escapeHtml(entry.text)}</p>`,
         "  </div>",
-        `  <div class="workspace-card-footer saved-card-footer">${copy}<div class="workspace-card-actions">${action}${globalDelete}</div></div>`,
-        confirming && !local ? [
-          '  <div class="workspace-delete-confirm">',
-          "    <span>Удалить глобальный текст и все его связи со всеми чатами?</span>",
-          '    <div class="confirm-actions">',
-          '      <button class="button" type="button" data-action="cancel-global-saved-delete">Нет</button>',
-          `      <button class="button danger" type="button" data-action="confirm-global-saved-delete" data-id="${escapeHtml(entry.id)}">Удалить</button>`,
-          "    </div>",
-          "  </div>",
-        ].join("") : "",
+        `  <div class="workspace-card-footer saved-card-footer">${copy}<div class="workspace-card-actions">${action}${deletion.trash}</div></div>`,
+        deletion.menu,
         "</article>",
       ].join("");
     }).join("");
 
     let empty = "";
-    if (!entries.length && mode === "local") empty = '<p class="empty-state">В этом чате пока нет сохранённого текста. Выделите текст и запустите назначенную в браузере команду «Сохранить выделенный текст» или используйте контекстное меню.</p>';
+    if (globalEmpty) empty = '<p class="empty-state">Введите запрос для глобального поиска.</p>';
+    else if (!entries.length && mode === "local") empty = '<p class="empty-state">В этом чате пока нет сохранённого текста. Выделите текст и запустите назначенную в браузере команду «Сохранить выделенный текст» или используйте контекстное меню.</p>';
     else if (!entries.length) empty = '<p class="empty-state">По глобальному запросу ничего не найдено.</p>';
 
     return [
@@ -330,7 +421,13 @@
       ".workspace-copy-button.is-copied { border-color: color-mix(in srgb, var(--accent) 62%, var(--border)); background: color-mix(in srgb, var(--accent) 14%, var(--surface)); color: var(--accent); }",
       ".workspace-copy-button.is-copied .workspace-copy-default { display: none; }",
       ".workspace-copy-button.is-copied .workspace-copy-success { display: inline-grid; }",
-      ".workspace-delete-confirm { display: grid; padding: 10px; gap: 9px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }",
+      ".workspace-trash-button { width: 28px; height: 28px; flex: 0 0 28px; border-color: var(--border); background: var(--surface); color: var(--muted); }",
+      ".workspace-trash-button svg { width: 15px; height: 15px; }",
+      ".workspace-trash-button:hover, .workspace-trash-button:focus-visible, .workspace-trash-button.is-open { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--surface)); color: var(--danger); }",
+      ".workspace-delete-menu { display: grid; padding: 9px 10px 10px; gap: 7px; border-top: 1px solid var(--border); }",
+      ".workspace-delete-title { color: var(--text); font-size: 12px; }",
+      ".workspace-delete-actions { display: flex; justify-content: flex-end; gap: 6px; }",
+      ".workspace-delete-actions .button { min-height: 28px; padding: 4px 9px; font-size: 11px; }",
       ".workspace-unavailable { display: grid; margin-bottom: 12px; padding: 10px; gap: 8px; border: 1px solid var(--danger); border-radius: 9px; background: color-mix(in srgb, var(--danger) 10%, var(--surface)); }",
       ".workspace-unavailable p { margin: 0; color: var(--text); font-size: 12px; }",
       ".saved-text { min-width: 0; margin: 0; flex: 1; overflow-wrap: anywhere; white-space: pre-wrap; }",
@@ -396,6 +493,15 @@
     unavailableMarkup,
     activeSearchMode,
     requestedModeAfterQueryInput,
+    closedWorkspaceDeleteState,
+    workspaceDeleteOwns,
+    workspaceDeleteMenuOpen,
+    transitionWorkspaceDelete,
+    workspaceDeleteOperation,
+    workspaceDeleteLocalAvailable,
+    workspaceDeletePointerInside,
+    workspaceDeleteEntryPresent,
+    isCurrentWorkspaceRequest,
     nextSidebarPhase,
     quickActionStateForPhase,
     createTransformTransitionController,

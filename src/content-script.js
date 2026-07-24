@@ -66,14 +66,12 @@
     glossaryEntries: [],
     glossaryRequestedMode: "local",
     glossarySearch: "",
-    glossaryDeleteMode: false,
-    glossaryConfirmDeleteId: null,
     glossaryDraggingId: null,
     savedEntries: [],
     savedRequestedMode: "local",
     savedSearch: "",
-    savedConfirmDeleteId: null,
     savedDraggingId: null,
+    workspaceDelete: workspaceUiModule.closedWorkspaceDeleteState(),
     workspaceContext: null,
     workspaceStatus: { status: "loading", context: null, errorCode: null, message: null },
     workspaceClient: null,
@@ -201,6 +199,58 @@
 
   function clearStatus() {
     state.status = { kind: "", text: "" };
+  }
+
+  function workspaceEntries(kind) {
+    return kind === "glossary" ? state.glossaryEntries : state.savedEntries;
+  }
+
+  function workspaceMode(kind) {
+    return workspaceUiModule.activeSearchMode(
+      kind === "glossary" ? state.glossaryRequestedMode : state.savedRequestedMode,
+    );
+  }
+
+  function findWorkspaceDeleteTrigger(kind, entryId) {
+    return [...(state.body?.querySelectorAll('[data-action="workspace-delete-toggle"]') || [])]
+      .find((button) => button.dataset.kind === kind && button.dataset.id === entryId) || null;
+  }
+
+  function closeWorkspaceDelete() {
+    if (!workspaceUiModule.workspaceDeleteMenuOpen(state.workspaceDelete)
+      && state.workspaceDelete.phase === "closed") return false;
+    const wasOpen = workspaceUiModule.workspaceDeleteMenuOpen(state.workspaceDelete);
+    state.workspaceDelete = workspaceUiModule.transitionWorkspaceDelete(
+      state.workspaceDelete,
+      { type: "close" },
+    );
+    return wasOpen;
+  }
+
+  function settleWorkspaceDelete() {
+    state.workspaceDelete = workspaceUiModule.transitionWorkspaceDelete(
+      state.workspaceDelete,
+      { type: "settle" },
+    );
+  }
+
+  function closeWorkspaceDeleteAndRender(restoreFocus) {
+    const { kind, entryId } = state.workspaceDelete;
+    if (!closeWorkspaceDelete()) return false;
+    renderSection();
+    if (restoreFocus) {
+      const trigger = findWorkspaceDeleteTrigger(kind, entryId);
+      if (trigger?.isConnected && !trigger.disabled) trigger.focus();
+    }
+    return true;
+  }
+
+  function reconcileWorkspaceDeleteEntry() {
+    const deletion = state.workspaceDelete;
+    if (deletion.phase === "closed" || !deletion.kind || !deletion.entryId) return;
+    if (!workspaceUiModule.workspaceDeleteEntryPresent(deletion, workspaceEntries(deletion.kind))) {
+      closeWorkspaceDelete();
+    }
   }
 
   function handleUiError(error) {
@@ -611,6 +661,7 @@
   function startShellMotion(nextPhase, restoreFocus) {
     closeTemplatePreview();
     closeRecentPopup();
+    if (nextPhase === "closing") closeWorkspaceDelete();
     state.shellRestoreFocus = Boolean(restoreFocus);
     state.shellPhase = nextPhase;
     applyShellState();
@@ -1123,6 +1174,7 @@
 
   function renderSection() {
     if (!state.body) return;
+    reconcileWorkspaceDeleteEntry();
     applyShellState();
     if (state.activeSection === "templates") state.body.innerHTML = templatesMarkup();
     else if (state.activeSection === "analysis") state.body.innerHTML = analysisMarkup();
@@ -1136,6 +1188,7 @@
     if (!["closed", "open"].includes(state.shellPhase)) return;
     closeTemplatePreview();
     closeRecentPopup();
+    if (state.activeSection !== section) closeWorkspaceDelete();
     state.activeSection = section;
     if (!options?.preserveStatus) clearStatus();
     renderSection();
@@ -1230,20 +1283,23 @@
 
   function updateGlossaryEntries(value) {
     state.glossaryEntries = workspaceUiModule.normalizeGlossaryEntries(value);
+    if (state.workspaceDelete.kind === "glossary") closeWorkspaceDelete();
     if (state.open && state.activeSection === "analysis") renderSection();
   }
 
   function updateSavedEntries(value) {
     state.savedEntries = workspaceUiModule.normalizeSavedEntries(value);
+    if (state.workspaceDelete.kind === "saved") closeWorkspaceDelete();
     if (state.open && state.activeSection === "saved") renderSection();
   }
 
   async function refreshGlossary() {
     if (!state.workspaceClient || !state.workspaceContext) return;
     const token = ++state.glossaryRequestToken;
-    const effectiveMode = workspaceUiModule.activeSearchMode(state.glossaryRequestedMode, state.glossarySearch);
-    const response = await state.workspaceClient.queryGlossary(effectiveMode, state.glossarySearch);
-    if (token !== state.glossaryRequestToken) return;
+    const requestedMode = workspaceUiModule.activeSearchMode(state.glossaryRequestedMode);
+    const query = state.glossarySearch;
+    const response = await state.workspaceClient.queryGlossary(requestedMode, query);
+    if (!workspaceUiModule.isCurrentWorkspaceRequest(token, state.glossaryRequestToken)) return;
     if (!response?.ok) throw new Error(response?.error?.message || "Не удалось загрузить словарь.");
     updateGlossaryEntries(response.entries);
   }
@@ -1251,21 +1307,24 @@
   async function refreshSaved() {
     if (!state.workspaceClient || !state.workspaceContext) return;
     const token = ++state.savedRequestToken;
-    const effectiveMode = workspaceUiModule.activeSearchMode(state.savedRequestedMode, state.savedSearch);
-    const response = await state.workspaceClient.querySaved(effectiveMode, state.savedSearch);
-    if (token !== state.savedRequestToken) return;
+    const requestedMode = workspaceUiModule.activeSearchMode(state.savedRequestedMode);
+    const query = state.savedSearch;
+    const response = await state.workspaceClient.querySaved(requestedMode, query);
+    if (!workspaceUiModule.isCurrentWorkspaceRequest(token, state.savedRequestToken)) return;
     if (!response?.ok) throw new Error(response?.error?.message || "Не удалось загрузить сохранённое.");
     updateSavedEntries(response.entries);
   }
 
   function handleWorkspaceContextChange(context) {
+    closeWorkspaceDelete();
     state.workspaceContext = context;
     state.glossaryRequestedMode = "local";
     state.glossarySearch = "";
     state.savedRequestedMode = "local";
     state.savedSearch = "";
-    state.glossaryConfirmDeleteId = null;
-    state.savedConfirmDeleteId = null;
+    state.glossaryEntries = [];
+    state.savedEntries = [];
+    if (state.open && ["analysis", "saved"].includes(state.activeSection)) renderSection();
     void Promise.all([refreshGlossary(), refreshSaved()]).catch(handleUiError);
   }
 
@@ -1273,11 +1332,10 @@
     const previous = state.workspaceStatus;
     state.workspaceStatus = status;
     if (status.status === "unavailable") {
+      closeWorkspaceDelete();
       state.workspaceContext = null;
       state.glossaryEntries = [];
       state.savedEntries = [];
-      state.glossaryConfirmDeleteId = null;
-      state.savedConfirmDeleteId = null;
     }
     if (state.open && ["analysis", "saved"].includes(state.activeSection)
       && (previous.status !== status.status || previous.message !== status.message)) {
@@ -1285,15 +1343,43 @@
     }
   }
 
-  async function deleteGlossaryEntry(id) {
-    const response = await state.workspaceClient?.deleteGlossary(id);
-    if (!response?.ok) {
-      setStatus("error", response?.error?.message || contract.ERROR_MESSAGES.GLOSSARY_STORAGE_FAILED);
+  async function deleteWorkspaceEntry(kind, id, scope) {
+    if (!workspaceUiModule.workspaceDeleteOwns(state.workspaceDelete, kind, id)
+      || state.workspaceDelete.phase !== "choosing") return;
+    const entry = workspaceEntries(kind).find((item) => item.id === id);
+    if (!entry) {
+      settleWorkspaceDelete();
+      renderSection();
       return;
     }
-    state.glossaryConfirmDeleteId = null;
-    await refreshGlossary();
-    setStatus("success", "Значение удалено глобально.");
+    if (scope === "local" && !workspaceUiModule.workspaceDeleteLocalAvailable(workspaceMode(kind), entry)) return;
+    const operation = workspaceUiModule.workspaceDeleteOperation(kind, scope);
+    if (!operation || typeof state.workspaceClient?.[operation] !== "function") return;
+
+    state.workspaceDelete = workspaceUiModule.transitionWorkspaceDelete(
+      state.workspaceDelete,
+      { type: "begin", scope },
+    );
+    renderSection();
+    try {
+      const response = await state.workspaceClient[operation](id);
+      if (!response?.ok) {
+        const fallback = kind === "glossary"
+          ? contract.ERROR_MESSAGES.GLOSSARY_STORAGE_FAILED
+          : "Не удалось удалить сохранённый текст.";
+        throw new Error(response?.error?.message || fallback);
+      }
+      if (kind === "glossary") await refreshGlossary();
+      else await refreshSaved();
+      settleWorkspaceDelete();
+      const success = kind === "glossary"
+        ? (scope === "local" ? "Термин удалён из этого чата." : "Термин удалён везде.")
+        : (scope === "local" ? "Текст удалён из этого чата." : "Текст удалён везде.");
+      setStatus("success", success);
+    } catch (error) {
+      settleWorkspaceDelete();
+      setStatus("error", error?.message || "Не удалось удалить запись.");
+    }
   }
 
   async function reorderGlossaryEntries(sourceId, beforeEntryId) {
@@ -1578,6 +1664,7 @@
     if (!actionButton) return;
     const action = actionButton.dataset.action;
     const id = actionButton.dataset.id;
+    const kind = actionButton.dataset.kind;
     closeTemplatePreview();
 
     if (action === "open-analysis-options") {
@@ -1603,44 +1690,35 @@
         },
       }, "Вид словаря сброшен.");
     } else if (action === "glossary-mode-local") {
+      closeWorkspaceDelete();
       state.glossaryRequestedMode = "local";
+      state.glossaryEntries = [];
+      renderSection();
       await refreshGlossary();
-      renderSection();
     } else if (action === "glossary-mode-global") {
+      closeWorkspaceDelete();
       state.glossaryRequestedMode = "global";
-      if (state.glossarySearch.trim()) {
-        await refreshGlossary();
-      }
+      state.glossaryEntries = [];
       renderSection();
+      await refreshGlossary();
       state.body.querySelector('[data-action="glossary-search"]')?.focus();
     } else if (action === "attach-glossary") {
       const response = await state.workspaceClient?.attachGlossary(id);
       if (!response?.ok) throw new Error(response?.error?.message || "Не удалось добавить термин в чат.");
       await refreshGlossary();
       setStatus("success", "Термин добавлен в текущий чат.");
-    } else if (action === "unlink-glossary") {
-      const response = await state.workspaceClient?.unlinkGlossary(id);
-      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось убрать термин из чата.");
-      await refreshGlossary();
-      setStatus("success", "Термин убран только из текущего чата.");
-    } else if (action === "ask-global-glossary-delete") {
-      state.glossaryConfirmDeleteId = id;
-      renderSection();
-    } else if (action === "cancel-global-glossary-delete") {
-      state.glossaryConfirmDeleteId = null;
-      renderSection();
-    } else if (action === "confirm-global-glossary-delete") {
-      await deleteGlossaryEntry(id);
     } else if (action === "saved-mode-local") {
+      closeWorkspaceDelete();
       state.savedRequestedMode = "local";
+      state.savedEntries = [];
+      renderSection();
       await refreshSaved();
-      renderSection();
     } else if (action === "saved-mode-global") {
+      closeWorkspaceDelete();
       state.savedRequestedMode = "global";
-      if (state.savedSearch.trim()) {
-        await refreshSaved();
-      }
+      state.savedEntries = [];
       renderSection();
+      await refreshSaved();
       state.body.querySelector('[data-action="saved-search"]')?.focus();
     } else if (action === "retry-workspace") {
       await state.contextClient?.retry();
@@ -1662,23 +1740,16 @@
       const entry = state.savedEntries.find((item) => item.id === id);
       if (!entry) throw new Error("Сохранённый текст не найден.");
       await saveSelectionSnapshot(entry.text, "Текст добавлен в текущий чат.");
-    } else if (action === "unlink-saved") {
-      const response = await state.workspaceClient?.unlinkSaved(id);
-      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось убрать текст из чата.");
-      await refreshSaved();
-      setStatus("success", "Текст убран только из текущего чата.");
-    } else if (action === "ask-global-saved-delete") {
-      state.savedConfirmDeleteId = id;
+    } else if (action === "workspace-delete-toggle") {
+      state.workspaceDelete = workspaceUiModule.transitionWorkspaceDelete(
+        state.workspaceDelete,
+        { type: "trigger", kind, entryId: id },
+      );
       renderSection();
-    } else if (action === "cancel-global-saved-delete") {
-      state.savedConfirmDeleteId = null;
-      renderSection();
-    } else if (action === "confirm-global-saved-delete") {
-      const response = await state.workspaceClient?.deleteSaved(id);
-      if (!response?.ok) throw new Error(response?.error?.message || "Не удалось удалить сохранённый текст.");
-      state.savedConfirmDeleteId = null;
-      await refreshSaved();
-      setStatus("success", "Сохранённый текст удалён глобально.");
+    } else if (action === "workspace-delete-local") {
+      await deleteWorkspaceEntry(kind, id, "local");
+    } else if (action === "workspace-delete-global") {
+      await deleteWorkspaceEntry(kind, id, "global");
     } else if (action === "open-panel") {
       closeRecentPopup();
       openSection(state.activeSection);
@@ -1783,12 +1854,15 @@
       return;
     }
     if (event.target.dataset.action === "glossary-search") {
+      const menuClosed = closeWorkspaceDelete();
       state.glossarySearch = event.target.value;
-      state.glossaryRequestedMode = workspaceUiModule.requestedModeAfterQueryInput(
-        state.glossaryRequestedMode,
-        state.glossarySearch,
-      );
       const cursor = event.target.selectionStart;
+      if (menuClosed || (workspaceMode("glossary") === "global" && !state.glossarySearch.trim())) {
+        renderSection();
+        const search = state.body.querySelector('[data-action="glossary-search"]');
+        search?.focus();
+        if (Number.isInteger(cursor)) search?.setSelectionRange(cursor, cursor);
+      }
       void refreshGlossary().then(() => {
         const search = state.body.querySelector('[data-action="glossary-search"]');
         search?.focus();
@@ -1797,12 +1871,15 @@
       return;
     }
     if (event.target.dataset.action === "saved-search") {
+      const menuClosed = closeWorkspaceDelete();
       state.savedSearch = event.target.value;
-      state.savedRequestedMode = workspaceUiModule.requestedModeAfterQueryInput(
-        state.savedRequestedMode,
-        state.savedSearch,
-      );
       const cursor = event.target.selectionStart;
+      if (menuClosed || (workspaceMode("saved") === "global" && !state.savedSearch.trim())) {
+        renderSection();
+        const search = state.body.querySelector('[data-action="saved-search"]');
+        search?.focus();
+        if (Number.isInteger(cursor)) search?.setSelectionRange(cursor, cursor);
+      }
       void refreshSaved().then(() => {
         const search = state.body.querySelector('[data-action="saved-search"]');
         search?.focus();
@@ -1919,6 +1996,7 @@
     state.shellTransitionController?.cancel();
     closeTemplatePreview();
     closeRecentPopup();
+    closeWorkspaceDelete();
     state.sidebarResizeCleanup?.();
     state.analysisUi?.closeDialog(false);
     document.getElementById(HOST_ID)?.remove();
@@ -2028,6 +2106,11 @@
       event.stopPropagation();
       return;
     }
+    if (closeWorkspaceDeleteAndRender(true)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (closeTemplatePreview()) {
       event.preventDefault();
       event.stopPropagation();
@@ -2056,7 +2139,16 @@
 
   document.addEventListener("pointerdown", function handleOutsidePointer(event) {
     if (state.sidebarResizing) return;
-    if (state.host && !event.composedPath().includes(state.host)) {
+    const path = event.composedPath();
+    if (workspaceUiModule.workspaceDeleteMenuOpen(state.workspaceDelete)) {
+      const insideActiveCard = workspaceUiModule.workspaceDeletePointerInside(state.workspaceDelete, path);
+      if (!insideActiveCard && closeWorkspaceDelete()) {
+        setTimeout(function renderAfterOutsidePointer() {
+          if (state.body) renderSection();
+        }, 0);
+      }
+    }
+    if (state.host && !path.includes(state.host)) {
       if (state.open && state.settings.closePanelOnOutsideClick) closePanel();
       else closeRecentPopup();
     }
@@ -2133,9 +2225,11 @@
         conversationScope: message.conversationScope,
         revision: message.revision,
       })) return false;
+      const deletionClosed = closeWorkspaceDelete();
       if (message.entityFamily === workspaceContract.ENTITY_FAMILIES.ALL) {
         state.glossaryEntries = [];
         state.savedEntries = [];
+        if (state.open && ["analysis", "saved"].includes(state.activeSection)) renderSection();
         void state.contextClient?.sync(location.href).then(() => {
           if (!state.open) return;
           if (state.activeSection === "analysis") return refreshGlossary();
@@ -2144,6 +2238,7 @@
         }).catch(handleUiError);
         return false;
       }
+      if (deletionClosed && state.open && ["analysis", "saved"].includes(state.activeSection)) renderSection();
       const currentScope = state.workspaceContext?.scopeKey;
       const relevantScope = message.conversationScope === null || message.conversationScope === currentScope;
       if (message.entityFamily === workspaceContract.ENTITY_FAMILIES.GLOSSARY

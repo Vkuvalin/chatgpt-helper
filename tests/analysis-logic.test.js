@@ -397,6 +397,8 @@ assert.equal(analysisUi.replacementCommandForTerm({
 }), null);
 assert.equal(analysisUi.replacementCommandForTerm({ status: "new" }), null);
 assert.doesNotMatch(contentScriptSource, /chrome\.storage\.local\.set\s*\(/);
+assert.doesNotMatch(contentScriptSource, /\bindexedDB\b/);
+assert.doesNotMatch(contentScriptSource, /chrome\.storage\.local\.(?:remove|clear)\s*\(/);
 assert.match(contentScriptSource, /\.shell \{[\s\S]*width: var\(--sidebar-effective-width\);[\s\S]*\.sidebar-frame \{[\s\S]*display: flex;/);
 assert.match(contentScriptSource, /\.rail \{[\s\S]*position: relative;[\s\S]*flex: 0 0 var\(--rail-width\);/);
 assert.match(contentScriptSource, /\.panel \{[\s\S]*position: relative;[\s\S]*flex: 1 1 auto;/);
@@ -438,6 +440,43 @@ assert.doesNotMatch(contentScriptSource, /TEMPLATE_UPDATE,[\s\S]{0,180}template:
 assert.match(contentScriptSource, /validateWallpaperSourceFile\(file\)/);
 assert.match(contentScriptSource, /Максимум 6 МБ/);
 assert.doesNotMatch(contentScriptSource, /clear-glossary-search|clear-saved-search/);
+assert.doesNotMatch(contentScriptSource, /unlink-glossary|unlink-saved|ask-global-(?:glossary|saved)-delete|confirm-global-(?:glossary|saved)-delete/);
+const workspaceRefreshSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("async function refreshGlossary"),
+  contentScriptSource.indexOf("function handleWorkspaceContextChange"),
+);
+assert.match(workspaceRefreshSource, /const requestedMode = workspaceUiModule\.activeSearchMode\(state\.glossaryRequestedMode\)/);
+assert.match(workspaceRefreshSource, /const requestedMode = workspaceUiModule\.activeSearchMode\(state\.savedRequestedMode\)/);
+assert.match(workspaceRefreshSource, /isCurrentWorkspaceRequest\(token, state\.glossaryRequestToken\)/);
+assert.match(workspaceRefreshSource, /isCurrentWorkspaceRequest\(token, state\.savedRequestToken\)/);
+const workspaceInputSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function onShadowInput"),
+  contentScriptSource.indexOf("function onDragStart"),
+);
+assert.match(workspaceInputSource, /state\.glossarySearch = event\.target\.value/);
+assert.match(workspaceInputSource, /state\.savedSearch = event\.target\.value/);
+assert.doesNotMatch(workspaceInputSource, /glossaryRequestedMode\s*=/);
+assert.doesNotMatch(workspaceInputSource, /savedRequestedMode\s*=/);
+const workspaceDeleteSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("async function deleteWorkspaceEntry"),
+  contentScriptSource.indexOf("async function reorderGlossaryEntries"),
+);
+assert.match(workspaceDeleteSource, /workspaceDeleteOperation\(kind, scope\)/);
+assert.match(workspaceDeleteSource, /await state\.workspaceClient\[operation\]\(id\)/);
+assert.match(workspaceDeleteSource, /if \(kind === "glossary"\) await refreshGlossary\(\)/);
+assert.match(workspaceDeleteSource, /else await refreshSaved\(\)/);
+assert.match(workspaceDeleteSource, /settleWorkspaceDelete\(\)/);
+assert.doesNotMatch(workspaceDeleteSource, /glossaryRequestedMode\s*=|glossarySearch\s*=|savedRequestedMode\s*=|savedSearch\s*=/);
+const workspaceEscapeSource = contentScriptSource.slice(
+  contentScriptSource.indexOf('document.addEventListener("keydown", function handleEscape'),
+  contentScriptSource.indexOf('document.addEventListener("pointerdown", function handleOutsidePointer'),
+);
+assert.equal(workspaceEscapeSource.indexOf("state.analysisUi?.handleEscape()")
+  < workspaceEscapeSource.indexOf("closeWorkspaceDeleteAndRender(true)"), true);
+assert.equal(workspaceEscapeSource.indexOf("closeWorkspaceDeleteAndRender(true)")
+  < workspaceEscapeSource.indexOf("closeTemplatePreview()"), true);
+assert.equal(workspaceEscapeSource.indexOf("closeTemplatePreview()")
+  < workspaceEscapeSource.indexOf("closePanel(true)"), true);
 const selectedTextReaderSource = contentScriptSource.slice(
   contentScriptSource.indexOf("function readSelectedTextSnapshot"),
   contentScriptSource.indexOf("async function saveSelectionSnapshot"),

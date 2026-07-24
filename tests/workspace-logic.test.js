@@ -495,13 +495,14 @@ assert.equal(previewOpenTimersArmed, 0,
 simulatePreviewPointerOver(templateName);
 assert.equal(previewOpenTimersArmed, 1, "the content hotspot can arm preview");
 
-assert.equal(workspaceUi.activeSearchMode("global", ""), "local");
-assert.equal(workspaceUi.activeSearchMode("global", "   "), "local");
+assert.equal(workspaceUi.activeSearchMode("global", ""), "global");
+assert.equal(workspaceUi.activeSearchMode("global", "   "), "global");
 assert.equal(workspaceUi.activeSearchMode("global", "query"), "global");
 assert.equal(workspaceUi.activeSearchMode("local", "query"), "local");
 assert.equal(workspaceUi.requestedModeAfterQueryInput("global", "   "), "global");
 assert.equal(workspaceUi.requestedModeAfterQueryInput("global", "q"), "global");
-assert.equal(workspaceUi.requestedModeAfterQueryInput("global", ""), "local");
+assert.equal(workspaceUi.requestedModeAfterQueryInput("global", ""), "global");
+assert.equal(workspaceUi.requestedModeAfterQueryInput("local", "query"), "local");
 
 const nativeSearchMarkup = workspaceUi.savedMarkup({
   savedEntries: [],
@@ -516,11 +517,139 @@ assert.doesNotMatch(workspaceUi.styles(), /workspace-search-clear/);
 for (const kind of ["glossary", "saved"]) {
   let requestedMode = "local";
   requestedMode = "global";
-  assert.equal(workspaceUi.activeSearchMode(requestedMode, ""), "local", `${kind} keeps local data while armed`);
+  assert.equal(workspaceUi.activeSearchMode(requestedMode, ""), "global", `${kind} keeps the explicit global mode`);
   requestedMode = workspaceUi.requestedModeAfterQueryInput(requestedMode, "q");
-  assert.equal(workspaceUi.activeSearchMode(requestedMode, "q"), "global", `${kind} activates on the first character`);
+  assert.equal(workspaceUi.activeSearchMode(requestedMode, "q"), "global", `${kind} keeps global with a query`);
   requestedMode = workspaceUi.requestedModeAfterQueryInput(requestedMode, "");
-  assert.equal(requestedMode, "local", `${kind} clearing search resets the requested mode`);
+  assert.equal(requestedMode, "global", `${kind} clearing search preserves the requested mode`);
+  requestedMode = "local";
+  requestedMode = workspaceUi.requestedModeAfterQueryInput(requestedMode, "");
+  assert.equal(requestedMode, "local", `${kind} clearing a local query preserves local mode`);
+}
+
+const closedWorkspaceDelete = workspaceUi.closedWorkspaceDeleteState();
+assert.deepEqual(closedWorkspaceDelete, {
+  phase: "closed",
+  kind: null,
+  entryId: null,
+  scope: null,
+  menuOpen: false,
+});
+let workspaceDeleteState = workspaceUi.transitionWorkspaceDelete(closedWorkspaceDelete, {
+  type: "trigger",
+  kind: "glossary",
+  entryId: "sense-a",
+});
+assert.deepEqual(workspaceDeleteState, {
+  phase: "choosing",
+  kind: "glossary",
+  entryId: "sense-a",
+  scope: null,
+  menuOpen: true,
+});
+assert.equal(workspaceUi.workspaceDeleteOwns(workspaceDeleteState, "glossary", "sense-a"), true);
+assert.equal(workspaceUi.workspaceDeleteMenuOpen(workspaceDeleteState), true);
+assert.deepEqual(
+  workspaceUi.transitionWorkspaceDelete(workspaceDeleteState, {
+    type: "trigger",
+    kind: "glossary",
+    entryId: "sense-a",
+  }),
+  closedWorkspaceDelete,
+  "the same trash trigger toggles the shared menu closed",
+);
+workspaceDeleteState = workspaceUi.transitionWorkspaceDelete(workspaceDeleteState, {
+  type: "trigger",
+  kind: "saved",
+  entryId: "saved-b",
+});
+assert.equal(workspaceDeleteState.kind, "saved");
+assert.equal(workspaceDeleteState.entryId, "saved-b");
+assert.equal(workspaceDeleteState.phase, "choosing", "another record receives the one shared menu");
+workspaceDeleteState = workspaceUi.transitionWorkspaceDelete(workspaceDeleteState, { type: "begin", scope: "local" });
+assert.equal(workspaceDeleteState.phase, "deleting");
+assert.equal(workspaceDeleteState.scope, "local");
+assert.strictEqual(
+  workspaceUi.transitionWorkspaceDelete(workspaceDeleteState, {
+    type: "trigger",
+    kind: "glossary",
+    entryId: "sense-c",
+  }),
+  workspaceDeleteState,
+  "a deleting state blocks another deletion trigger",
+);
+const hiddenBusyDelete = workspaceUi.transitionWorkspaceDelete(workspaceDeleteState, { type: "close" });
+assert.equal(hiddenBusyDelete.phase, "deleting", "lifecycle cleanup keeps the mutation busy");
+assert.equal(hiddenBusyDelete.menuOpen, false, "lifecycle cleanup hides the active menu");
+assert.deepEqual(
+  workspaceUi.transitionWorkspaceDelete(hiddenBusyDelete, { type: "settle" }),
+  closedWorkspaceDelete,
+  "success or failure settles the shared state",
+);
+
+assert.deepEqual([
+  ["glossary", "local"],
+  ["glossary", "global"],
+  ["saved", "local"],
+  ["saved", "global"],
+].map(([kind, scope]) => workspaceUi.workspaceDeleteOperation(kind, scope)), [
+  "unlinkGlossary",
+  "deleteGlossary",
+  "unlinkSaved",
+  "deleteSaved",
+]);
+assert.equal(workspaceUi.workspaceDeleteOperation("saved", "unknown"), null);
+assert.equal(workspaceUi.workspaceDeleteLocalAvailable("local", { attached: false }), true);
+assert.equal(workspaceUi.workspaceDeleteLocalAvailable("global", { attached: true }), true);
+assert.equal(workspaceUi.workspaceDeleteLocalAvailable("global", { attached: false }), false);
+const activeDeleteCard = { dataset: { workspaceDeleteKind: "saved", workspaceDeleteId: "saved-b" } };
+const otherDeleteCard = { dataset: { workspaceDeleteKind: "glossary", workspaceDeleteId: "sense-a" } };
+assert.equal(workspaceUi.workspaceDeletePointerInside(workspaceDeleteState, [activeDeleteCard]), true);
+assert.equal(workspaceUi.workspaceDeletePointerInside(workspaceDeleteState, [otherDeleteCard]), false);
+assert.equal(workspaceUi.workspaceDeletePointerInside(closedWorkspaceDelete, [activeDeleteCard]), false);
+assert.equal(workspaceUi.workspaceDeleteEntryPresent(workspaceDeleteState, [{ id: "saved-b" }]), true);
+assert.equal(workspaceUi.workspaceDeleteEntryPresent(workspaceDeleteState, [{ id: "saved-other" }]), false);
+assert.equal(workspaceUi.workspaceDeleteEntryPresent(closedWorkspaceDelete, []), true);
+
+const deletionCalls = [];
+const deletionClient = {
+  unlinkGlossary(id) { deletionCalls.push(["unlinkGlossary", id]); },
+  deleteGlossary(id) { deletionCalls.push(["deleteGlossary", id]); },
+  unlinkSaved(id) { deletionCalls.push(["unlinkSaved", id]); },
+  deleteSaved(id) { deletionCalls.push(["deleteSaved", id]); },
+};
+[
+  ["glossary", "local", "sense-local"],
+  ["glossary", "global", "sense-global"],
+  ["saved", "local", "saved-local"],
+  ["saved", "global", "saved-global"],
+].forEach(([kind, scope, id]) => {
+  const operation = workspaceUi.workspaceDeleteOperation(kind, scope);
+  deletionClient[operation](id);
+});
+assert.deepEqual(deletionCalls, [
+  ["unlinkGlossary", "sense-local"],
+  ["deleteGlossary", "sense-global"],
+  ["unlinkSaved", "saved-local"],
+  ["deleteSaved", "saved-global"],
+]);
+
+for (const kind of ["glossary", "saved"]) {
+  asyncBoundaryTests.push((async () => {
+    let currentToken = 0;
+    let resolveStale;
+    const rendered = [];
+    async function applyResult(token, promise) {
+      const value = await promise;
+      if (workspaceUi.isCurrentWorkspaceRequest(token, currentToken)) rendered.push(value);
+    }
+    const stale = applyResult(++currentToken, new Promise((resolve) => { resolveStale = resolve; }));
+    const current = applyResult(++currentToken, Promise.resolve(`${kind}-current`));
+    await current;
+    resolveStale(`${kind}-stale`);
+    await stale;
+    assert.deepEqual(rendered, [`${kind}-current`], `${kind} ignores a stale query completion`);
+  })());
 }
 
 const workspaceQueryMessages = [];
@@ -540,8 +669,8 @@ const structuredSavedText = "Paragraph\n\n1. Numbered\n• Bullet\n  indented";
 void workspaceClient.saveSelection(structuredSavedText);
 assert.equal(workspaceQueryMessages[0].mode, "global");
 assert.equal(workspaceQueryMessages[1].mode, "global");
-assert.equal(workspaceQueryMessages[2].mode, "local");
-assert.equal(workspaceQueryMessages[3].mode, "local");
+assert.equal(workspaceQueryMessages[2].mode, "global");
+assert.equal(workspaceQueryMessages[3].mode, "global");
 assert.equal(workspaceQueryMessages[4].text, structuredSavedText);
 const contentScriptSource = fs.readFileSync(path.join(__dirname, "../src/content-script.js"), "utf8");
 assert.match(contentScriptSource, /await navigator\.clipboard\.writeText\(entry\.text\);/);
@@ -611,13 +740,60 @@ const escapeLifecycleSource = contentScriptSource.slice(
   contentScriptSource.indexOf('document.addEventListener("keydown", function handleEscape'),
   contentScriptSource.indexOf('document.addEventListener("pointerdown", function handleOutsidePointer'),
 );
+assert.equal(escapeLifecycleSource.indexOf("state.analysisUi?.handleEscape()") < escapeLifecycleSource.indexOf("closeWorkspaceDeleteAndRender(true)"), true);
+assert.equal(escapeLifecycleSource.indexOf("closeWorkspaceDeleteAndRender(true)") < escapeLifecycleSource.indexOf("closeTemplatePreview()"), true);
 assert.equal(escapeLifecycleSource.indexOf("closeTemplatePreview()") < escapeLifecycleSource.indexOf("state.editing"), true);
 assert.equal(escapeLifecycleSource.indexOf("state.editing") < escapeLifecycleSource.indexOf("closePanel(true)"), true);
+const outsideWorkspaceDeleteSource = contentScriptSource.slice(
+  contentScriptSource.indexOf('document.addEventListener("pointerdown", function handleOutsidePointer'),
+  contentScriptSource.indexOf('window.addEventListener("focus", function handleWindowFocus'),
+);
+assert.match(outsideWorkspaceDeleteSource, /workspaceDeleteMenuOpen\(state\.workspaceDelete\)/);
+assert.match(outsideWorkspaceDeleteSource, /workspaceDeletePointerInside\(state\.workspaceDelete, path\)/);
+assert.match(outsideWorkspaceDeleteSource, /setTimeout\(function renderAfterOutsidePointer/);
+const workspaceDeleteMutationSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("async function deleteWorkspaceEntry"),
+  contentScriptSource.indexOf("async function reorderGlossaryEntries"),
+);
+assert.match(workspaceDeleteMutationSource, /workspaceDeleteOperation\(kind, scope\)/);
+assert.match(workspaceDeleteMutationSource, /state\.workspaceDelete\.phase !== "choosing"/);
+assert.match(workspaceDeleteMutationSource, /\{ type: "begin", scope \}/);
+assert.match(workspaceDeleteMutationSource, /await state\.workspaceClient\[operation\]\(id\)/);
+assert.equal(
+  workspaceDeleteMutationSource.indexOf('{ type: "begin", scope }')
+    < workspaceDeleteMutationSource.indexOf("await state.workspaceClient[operation](id)"),
+  true,
+  "busy state is entered before the mutation can yield",
+);
+assert.doesNotMatch(workspaceDeleteMutationSource, /splice|filter|workspaceEntries\(kind\)\s*=/,
+  "deletion does not optimistically remove a record");
+const workspaceSearchInputSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function onShadowInput"),
+  contentScriptSource.indexOf("function onDragStart"),
+);
+assert.doesNotMatch(workspaceSearchInputSource, /glossaryRequestedMode\s*=/);
+assert.doesNotMatch(workspaceSearchInputSource, /savedRequestedMode\s*=/);
+assert.match(workspaceSearchInputSource, /closeWorkspaceDelete\(\)/);
+for (const lifecycleSource of [
+  "function startShellMotion",
+  "function openSection",
+  "function updateGlossaryEntries",
+  "function updateSavedEntries",
+  "function handleWorkspaceContextChange",
+  "function handleWorkspaceStatusChange",
+  "function mount",
+]) {
+  const start = contentScriptSource.indexOf(lifecycleSource);
+  const nextFunction = contentScriptSource.indexOf("\n  function ", start + lifecycleSource.length);
+  const nextAsyncFunction = contentScriptSource.indexOf("\n  async function ", start + lifecycleSource.length);
+  const candidates = [nextFunction, nextAsyncFunction].filter((index) => index > start);
+  const end = candidates.length ? Math.min(...candidates) : contentScriptSource.length;
+  assert.match(contentScriptSource.slice(start, end), /closeWorkspaceDelete\(\)/, `${lifecycleSource} closes the shared menu`);
+}
 
 const unsafeSavedMarkup = workspaceUi.savedMarkup({
   savedRequestedMode: "local",
   savedSearch: "",
-  savedConfirmDeleteId: null,
   savedEntries: [{ id: "unsafe", text: '<img src=x onerror="alert(1)">\nNext line', attached: true }],
 });
 assert.match(unsafeSavedMarkup, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;\nNext line/);
@@ -628,11 +804,36 @@ const emptyGlobalSavedMarkup = workspaceUi.savedMarkup({
   savedSearch: "",
   savedEntries: [{ id: "hidden", text: "must not render" }],
 });
-assert.equal(emptyGlobalSavedMarkup.includes("must not render"), true);
-assert.match(emptyGlobalSavedMarkup, /data-action="unlink-saved"/);
+assert.equal(emptyGlobalSavedMarkup.includes("must not render"), false);
 assert.match(emptyGlobalSavedMarkup, /data-action="saved-mode-global" aria-pressed="true"/);
-assert.equal(emptyGlobalSavedMarkup.includes("ask-global-saved-delete"), false);
-assert.equal(emptyGlobalSavedMarkup.includes("Глобальный поиск ожидает запрос"), false);
+assert.match(emptyGlobalSavedMarkup, /Введите запрос для глобального поиска\./);
+assert.equal(emptyGlobalSavedMarkup.includes("По глобальному запросу ничего не найдено."), false);
+const emptyGlobalGlossaryMarkup = workspaceUi.glossaryMarkup({
+  glossaryRequestedMode: "global",
+  glossarySearch: "   ",
+  glossaryEntries: [{ id: "hidden", term: "hidden", translation: "скрыто", definition: "Не показывать.", attached: true }],
+  settings: { analysis: { glossaryTextSize: "normal" } },
+  keyConfigured: true,
+});
+assert.equal(emptyGlobalGlossaryMarkup.includes("Не показывать."), false);
+assert.match(emptyGlobalGlossaryMarkup, /Введите запрос для глобального поиска\./);
+for (const zeroGlobalMarkup of [
+  workspaceUi.glossaryMarkup({
+    glossaryRequestedMode: "global",
+    glossarySearch: "missing",
+    glossaryEntries: [],
+    settings: { analysis: { glossaryTextSize: "normal" } },
+    keyConfigured: true,
+  }),
+  workspaceUi.savedMarkup({
+    savedRequestedMode: "global",
+    savedSearch: "missing",
+    savedEntries: [],
+  }),
+]) {
+  assert.match(zeroGlobalMarkup, /По глобальному запросу ничего не найдено\./);
+  assert.equal(zeroGlobalMarkup.includes("Введите запрос для глобального поиска."), false);
+}
 const localGlossaryMarkup = workspaceUi.glossaryMarkup({
   glossaryRequestedMode: "local",
   glossarySearch: "",
@@ -641,9 +842,22 @@ const localGlossaryMarkup = workspaceUi.glossaryMarkup({
   keyConfigured: true,
 });
 assert.match(localGlossaryMarkup, /draggable="true"/);
-assert.match(localGlossaryMarkup, /data-action="unlink-glossary"/);
+assert.equal((localGlossaryMarkup.match(/data-action="workspace-delete-toggle"/g) || []).length, 1);
+assert.match(localGlossaryMarkup, /title="Удалить запись" aria-label="Удалить запись" aria-expanded="false"/);
+assert.doesNotMatch(localGlossaryMarkup, /Убрать из чата|Удалить глобально во всех чатах/);
 assert.equal(localGlossaryMarkup.includes("OpenRouter"), false);
-assert.equal(localGlossaryMarkup.includes("ask-global-glossary-delete"), false);
+const localGlossaryDeleteMenu = workspaceUi.glossaryMarkup({
+  glossaryRequestedMode: "local",
+  glossarySearch: "",
+  workspaceDelete: workspaceUi.transitionWorkspaceDelete(
+    workspaceUi.closedWorkspaceDeleteState(),
+    { type: "trigger", kind: "glossary", entryId: "sense" },
+  ),
+  glossaryEntries: [{ id: "sense", term: "state", translation: "состояние", definition: "Описание.", attached: true }],
+  settings: { analysis: { glossaryTextSize: "normal" } },
+  keyConfigured: true,
+});
+assert.match(localGlossaryDeleteMenu, /data-action="workspace-delete-local"[^>]*aria-label="Удалить только из этого чата">Из чата/);
 const armedGlobalGlossaryMarkup = workspaceUi.glossaryMarkup({
   glossaryRequestedMode: "global",
   glossarySearch: "",
@@ -652,9 +866,9 @@ const armedGlobalGlossaryMarkup = workspaceUi.glossaryMarkup({
   keyConfigured: true,
 });
 assert.match(armedGlobalGlossaryMarkup, /data-action="glossary-mode-global" aria-pressed="true"/);
-assert.match(armedGlobalGlossaryMarkup, /draggable="true"/);
-assert.match(armedGlobalGlossaryMarkup, /data-action="unlink-glossary"/);
-assert.equal(armedGlobalGlossaryMarkup.includes("ask-global-glossary-delete"), false);
+assert.equal(armedGlobalGlossaryMarkup.includes('draggable="true"'), false);
+assert.equal(armedGlobalGlossaryMarkup.includes("Описание."), false);
+assert.match(armedGlobalGlossaryMarkup, /Введите запрос для глобального поиска\./);
 const globalGlossaryMarkup = workspaceUi.glossaryMarkup({
   glossaryRequestedMode: "global",
   glossarySearch: "state",
@@ -664,17 +878,33 @@ const globalGlossaryMarkup = workspaceUi.glossaryMarkup({
 });
 assert.equal(globalGlossaryMarkup.includes('draggable="true"'), false);
 assert.match(globalGlossaryMarkup, /data-action="attach-glossary"/);
-assert.match(globalGlossaryMarkup, /data-action="ask-global-glossary-delete"/);
-const confirmedGlobalGlossaryMarkup = workspaceUi.glossaryMarkup({
+assert.match(globalGlossaryMarkup, /data-action="workspace-delete-toggle"/);
+const choosingGlobalGlossaryDelete = workspaceUi.transitionWorkspaceDelete(
+  workspaceUi.closedWorkspaceDeleteState(),
+  { type: "trigger", kind: "glossary", entryId: "sense" },
+);
+const unattachedGlobalGlossaryMenu = workspaceUi.glossaryMarkup({
   glossaryRequestedMode: "global",
   glossarySearch: "state",
-  glossaryConfirmDeleteId: "sense",
+  workspaceDelete: choosingGlobalGlossaryDelete,
   glossaryEntries: [{ id: "sense", term: "state", translation: "состояние", definition: "Описание.", attached: false }],
   settings: { analysis: { glossaryTextSize: "normal" } },
   keyConfigured: true,
 });
-assert.match(confirmedGlobalGlossaryMarkup, /confirm-global-glossary-delete/);
-assert.match(confirmedGlobalGlossaryMarkup, /все его связи со всеми чатами/);
+assert.equal((unattachedGlobalGlossaryMenu.match(/class="workspace-delete-menu"/g) || []).length, 1);
+assert.match(unattachedGlobalGlossaryMenu, />Удалить запись</);
+assert.match(unattachedGlobalGlossaryMenu, /data-action="workspace-delete-local"[^>]*title="Запись не добавлена в этот чат"[^>]*aria-label="Запись не добавлена в этот чат" disabled>Из чата/);
+assert.match(unattachedGlobalGlossaryMenu, /data-action="workspace-delete-global"[^>]*aria-label="Удалить запись везде">Везде/);
+const attachedGlobalGlossaryMenu = workspaceUi.glossaryMarkup({
+  glossaryRequestedMode: "global",
+  glossarySearch: "state",
+  workspaceDelete: choosingGlobalGlossaryDelete,
+  glossaryEntries: [{ id: "sense", term: "state", translation: "состояние", definition: "Описание.", attached: true }],
+  settings: { analysis: { glossaryTextSize: "normal" } },
+  keyConfigured: true,
+});
+assert.match(attachedGlobalGlossaryMenu, /Уже в этом чате/);
+assert.match(attachedGlobalGlossaryMenu, /data-action="workspace-delete-local"[^>]*aria-label="Удалить только из этого чата">Из чата/);
 const localSavedMarkup = workspaceUi.savedMarkup({
   savedRequestedMode: "local",
   savedSearch: "",
@@ -683,20 +913,60 @@ const localSavedMarkup = workspaceUi.savedMarkup({
 assert.equal((localSavedMarkup.match(/data-action="copy-saved"/g) || []).length, 1);
 assert.match(localSavedMarkup, /class="icon-button workspace-copy-button"/);
 assert.match(localSavedMarkup, /title="Скопировать сохранённый текст" aria-label="Скопировать сохранённый текст"/);
-assert.match(localSavedMarkup, /class="workspace-card-footer saved-card-footer">.*data-action="copy-saved".*class="workspace-card-actions">.*data-action="unlink-saved"/);
-assert.match(localSavedMarkup, /data-action="unlink-saved"/);
-assert.equal(localSavedMarkup.includes("ask-global-saved-delete"), false);
+assert.match(localSavedMarkup, /class="workspace-card-footer saved-card-footer">.*data-action="copy-saved".*class="workspace-card-actions">.*data-action="workspace-delete-toggle"/);
+assert.doesNotMatch(localSavedMarkup, /Убрать из чата|unlink-saved|ask-global-saved-delete/);
+const localSavedDeleteMenu = workspaceUi.savedMarkup({
+  savedRequestedMode: "local",
+  savedSearch: "",
+  workspaceDelete: workspaceUi.transitionWorkspaceDelete(
+    workspaceUi.closedWorkspaceDeleteState(),
+    { type: "trigger", kind: "saved", entryId: "saved" },
+  ),
+  savedEntries: [{ id: "saved", text: "Text", attached: true }],
+});
+assert.match(localSavedDeleteMenu, /data-action="workspace-delete-local"[^>]*aria-label="Удалить только из этого чата">Из чата/);
+const choosingGlobalSavedDelete = workspaceUi.transitionWorkspaceDelete(
+  workspaceUi.closedWorkspaceDeleteState(),
+  { type: "trigger", kind: "saved", entryId: "saved" },
+);
 const globalSavedMarkup = workspaceUi.savedMarkup({
   savedRequestedMode: "global",
   savedSearch: "text",
-  savedConfirmDeleteId: "saved",
+  workspaceDelete: choosingGlobalSavedDelete,
   savedEntries: [{ id: "saved", text: "Text", attached: false }],
 });
 assert.equal((globalSavedMarkup.match(/data-action="copy-saved"/g) || []).length, 1);
-assert.match(globalSavedMarkup, /class="workspace-card-footer saved-card-footer">.*data-action="copy-saved".*class="workspace-card-actions">.*data-action="attach-saved".*data-action="ask-global-saved-delete"/);
-assert.match(globalSavedMarkup, /data-action="ask-global-saved-delete"/);
-assert.match(globalSavedMarkup, /confirm-global-saved-delete/);
+assert.match(globalSavedMarkup, /class="workspace-card-footer saved-card-footer">.*data-action="copy-saved".*class="workspace-card-actions">.*data-action="attach-saved".*data-action="workspace-delete-toggle"/);
+assert.equal((globalSavedMarkup.match(/class="workspace-delete-menu"/g) || []).length, 1);
+assert.match(globalSavedMarkup, /data-action="workspace-delete-local"[^>]*disabled>Из чата/);
+assert.match(globalSavedMarkup, /data-action="workspace-delete-global"[^>]*>Везде/);
+const attachedGlobalSavedMarkup = workspaceUi.savedMarkup({
+  savedRequestedMode: "global",
+  savedSearch: "text",
+  workspaceDelete: choosingGlobalSavedDelete,
+  savedEntries: [{ id: "saved", text: "Text", attached: true }],
+});
+assert.match(attachedGlobalSavedMarkup, /Уже в этом чате/);
+assert.match(attachedGlobalSavedMarkup, /data-action="workspace-delete-local"[^>]*aria-label="Удалить только из этого чата">Из чата/);
+assert.equal(workspaceUi.glossaryMarkup({
+  glossaryRequestedMode: "local",
+  glossarySearch: "",
+  workspaceDelete: choosingGlobalSavedDelete,
+  glossaryEntries: [{ id: "sense", term: "state", translation: "состояние", definition: "Описание.", attached: true }],
+  settings: { analysis: { glossaryTextSize: "normal" } },
+  keyConfigured: true,
+}).includes('class="workspace-delete-menu"'), false, "one shared state cannot render a second kind's menu");
+const deletingSavedMarkup = workspaceUi.savedMarkup({
+  savedRequestedMode: "local",
+  savedSearch: "",
+  workspaceDelete: workspaceUi.transitionWorkspaceDelete(choosingGlobalSavedDelete, { type: "begin", scope: "global" }),
+  savedEntries: [{ id: "saved", text: "Text", attached: true }, { id: "saved-other", text: "Other", attached: true }],
+});
+assert.equal((deletingSavedMarkup.match(/data-action="workspace-delete-toggle"[^>]* disabled/g) || []).length, 2);
+assert.equal((deletingSavedMarkup.match(/data-action="workspace-delete-(?:local|global)"[^>]* disabled/g) || []).length, 2);
 assert.match(workspaceUi.styles(), /\.workspace-copy-button\.is-copied/);
+assert.match(workspaceUi.styles(), /\.workspace-trash-button/);
+assert.match(workspaceUi.styles(), /\.workspace-delete-menu/);
 const unavailableGlossaryMarkup = workspaceUi.glossaryMarkup({
   workspaceStatus: { status: "unavailable", message: "Данные словаря V1 не удалены. Новые изменения Workspace не применены." },
   glossaryRequestedMode: "local",
