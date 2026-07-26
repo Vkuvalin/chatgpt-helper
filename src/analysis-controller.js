@@ -4,7 +4,7 @@
   if (root.ChatGPTHelperAnalysisController) return;
   const contract = root.ChatGPTHelperAnalysisContract;
   const MESSAGES = contract.MESSAGE_TYPES;
-  const ALLOWED_TRIGGERS = new Set(["browser-command", "context-menu"]);
+  const ALLOWED_TRIGGERS = new Set(["browser-command", "context-menu", "inline-assistant"]);
 
   function create(options) {
     let activeRequestId = null;

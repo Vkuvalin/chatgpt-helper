@@ -7,6 +7,12 @@
   const DB_VERSION = 1;
   const WORKSPACE_SCHEMA_VERSION = 2;
   const MAX_QUERY_RESULTS = 200;
+  const MAX_INLINE_SELECTION_LENGTH = 2000;
+  const MAX_INLINE_SELECTION_LINES = 40;
+  const MAX_INLINE_CANDIDATES = 64;
+  const MAX_INLINE_CANDIDATE_LENGTH = 80;
+  const MAX_INLINE_NGRAM_TOKENS = 4;
+  const MAX_INLINE_RESULT_ENTRIES = 100;
   const MAX_SAVED_ITEM_LENGTH = 200000;
   const MAX_TEMPLATE_LENGTH = 200000;
   const MAX_WALLPAPER_SOURCE_BYTES = 6 * 1024 * 1024;
@@ -106,6 +112,7 @@
     GET_CONTEXT: "chatgpt-helper:workspace-get-context",
     REBIND_CONVERSATION: "chatgpt-helper:workspace-rebind-conversation",
     QUERY_GLOSSARY: "chatgpt-helper:workspace-query-glossary",
+    LOOKUP_GLOSSARY_SELECTION: "chatgpt-helper:workspace-lookup-glossary-selection",
     ATTACH_GLOSSARY_SENSE: "chatgpt-helper:workspace-attach-glossary-sense",
     MOVE_GLOSSARY_LINK: "chatgpt-helper:workspace-move-glossary-link",
     UNLINK_GLOSSARY: "chatgpt-helper:workspace-unlink-glossary",
@@ -148,6 +155,12 @@
     }
   }
 
+  function compareText(leftValue, rightValue) {
+    const left = String(leftValue ?? "");
+    const right = String(rightValue ?? "");
+    return left < right ? -1 : (left > right ? 1 : 0);
+  }
+
   function normalizeDashesAndQuotes(value) {
     return String(value)
       .replace(/[‐‑‒–—―−]/g, "-")
@@ -183,6 +196,266 @@
       canonicalTerm,
       normalizedKey: canonicalTerm.toLocaleLowerCase("en-US"),
     });
+  }
+
+  function stripInlineOuterPairs(value) {
+    const pairs = new Map([
+      ["(", ")"],
+      ["[", "]"],
+      ["{", "}"],
+      ['"', '"'],
+      ["'", "'"],
+      ["“", "”"],
+      ["„", "“"],
+      ["‘", "’"],
+      ["«", "»"],
+    ]);
+    let result = String(value || "").trim();
+    let changed = true;
+    while (changed && result.length >= 2) {
+      changed = false;
+      const closing = pairs.get(result[0]);
+      if (closing && result.at(-1) === closing) {
+        result = result.slice(1, -1).trim();
+        changed = true;
+      }
+    }
+    return result;
+  }
+
+  function stripInlineOuterMarkdown(value) {
+    let result = String(value || "").trim();
+    let changed = true;
+    const markers = ["**", "__", "~~", "`", "*", "_", "~"];
+    while (changed) {
+      changed = false;
+      for (const marker of markers) {
+        if (result.length > marker.length * 2
+          && result.startsWith(marker)
+          && result.endsWith(marker)) {
+          result = result.slice(marker.length, -marker.length).trim();
+          changed = true;
+          break;
+        }
+      }
+    }
+    return result;
+  }
+
+  function cleanInlineGlossaryTerm(value) {
+    if (typeof value !== "string") return "";
+    let result = normalizeUnicode(value)
+      .replace(ZERO_WIDTH_RE, "")
+      .replace(/\u00a0/g, " ")
+      .trim();
+    let previous;
+    do {
+      previous = result;
+      result = stripInlineOuterMarkdown(stripInlineOuterPairs(result));
+      result = result.replace(/[.,;:!?…]+$/u, "").trim();
+    } while (result !== previous);
+    return result.replace(/[\t\f\v ]+/g, " ").trim();
+  }
+
+  function normalizeInlineSelectionText(value) {
+    if (typeof value !== "string") return "";
+    return normalizeUnicode(value)
+      .replace(/\r\n?/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(ZERO_WIDTH_RE, "")
+      .trim();
+  }
+
+  function validateInlineSelectionText(value) {
+    if (typeof value !== "string") return { ok: false, error: "INVALID_GLOSSARY_SELECTION" };
+    const text = normalizeInlineSelectionText(value);
+    if (!text) return { ok: false, error: "INVALID_GLOSSARY_SELECTION" };
+    if (text.length > MAX_INLINE_SELECTION_LENGTH) {
+      return { ok: false, error: "GLOSSARY_SELECTION_TOO_LARGE" };
+    }
+    const lineCount = text.split("\n").length;
+    if (lineCount > MAX_INLINE_SELECTION_LINES) {
+      return { ok: false, error: "GLOSSARY_SELECTION_TOO_MANY_LINES" };
+    }
+    return { ok: true, text, lineCount };
+  }
+
+  function inlineLexemes(value, baseIndex) {
+    const source = String(value || "");
+    const lexemes = [];
+    const pattern = /[A-Za-z0-9_+#-]+(?:\.(?=[A-Za-z0-9_+#-])[A-Za-z0-9_+#-]+)*/g;
+    let match;
+    while ((match = pattern.exec(source)) !== null) {
+      const display = match[0];
+      lexemes.push({
+        display,
+        start: Number(baseIndex || 0) + match.index,
+        end: Number(baseIndex || 0) + match.index + display.length,
+        technical: /[A-Za-z]/.test(display),
+      });
+    }
+    return lexemes;
+  }
+
+  function tokenizeGlossaryTerm(value) {
+    const term = canonicalizeTerm(value);
+    if (!term) return [];
+    return inlineLexemes(term.displayTerm, 0)
+      .filter((item) => item.technical)
+      .map((item) => item.display.toLocaleLowerCase("en-US"));
+  }
+
+  function inlineTechnicalGroups(text) {
+    const groups = [];
+    let lineStart = 0;
+    String(text || "").split("\n").forEach((line) => {
+      const lexemes = inlineLexemes(line, lineStart);
+      let group = [];
+      let previous = null;
+      lexemes.forEach((lexeme) => {
+        const localStart = lexeme.start - lineStart;
+        const gap = previous
+          ? line.slice(previous.end - lineStart, localStart)
+          : line.slice(0, localStart);
+        if (!lexeme.technical) {
+          if (group.length) groups.push(group);
+          group = [];
+          previous = lexeme;
+          return;
+        }
+        if (group.length && (!previous?.technical || !/^\s*$/u.test(gap))) {
+          groups.push(group);
+          group = [];
+        }
+        group.push(lexeme);
+        previous = lexeme;
+      });
+      if (group.length) groups.push(group);
+      lineStart += line.length + 1;
+    });
+    return groups;
+  }
+
+  function hasInlineListItemBoundary(value) {
+    return /^\s*(?:[•*+-]|\d+[.)])\s+/u.test(String(value || ""));
+  }
+
+  function createInlineCandidate(displayValue, firstIndex, source, visibility) {
+    const displayTerm = String(displayValue || "").replace(/\s+/gu, " ").trim();
+    if (!displayTerm || displayTerm.length > MAX_INLINE_CANDIDATE_LENGTH) return null;
+    const term = canonicalizeTerm(displayTerm);
+    if (!term) return null;
+    const tokens = tokenizeGlossaryTerm(term.displayTerm);
+    if (!tokens.length || tokens.length > MAX_INLINE_NGRAM_TOKENS) return null;
+    return {
+      displayTerm,
+      normalizedKey: term.normalizedKey,
+      tokens,
+      tokenCount: tokens.length,
+      firstIndex,
+      occurrences: 1,
+      source,
+      visibility,
+    };
+  }
+
+  function extractInlineGlossaryCandidates(value) {
+    const validated = validateInlineSelectionText(value);
+    if (!validated.ok) return validated;
+    const text = validated.text;
+    const groups = inlineTechnicalGroups(text);
+    const byKey = new Map();
+    const cleanedWhole = text.includes("\n") ? "" : cleanInlineGlossaryTerm(text);
+    const hasListItemBoundary = hasInlineListItemBoundary(text);
+    const wholeGroups = cleanedWhole ? inlineTechnicalGroups(cleanedWhole) : [];
+    const wholeLexemes = cleanedWhole ? inlineLexemes(cleanedWhole, 0) : [];
+    const technicalCount = wholeLexemes.filter((item) => item.technical).length;
+    const termMode = Boolean(
+      cleanedWhole
+      && cleanedWhole.length <= MAX_INLINE_CANDIDATE_LENGTH
+      && !hasListItemBoundary
+      && !/(?![A-Za-z])\p{L}/u.test(cleanedWhole)
+      && wholeGroups.length === 1
+      && technicalCount === wholeLexemes.length
+      && technicalCount > 0
+      && technicalCount <= MAX_INLINE_NGRAM_TOKENS
+    );
+
+    function add(candidate) {
+      if (!candidate) return;
+      const occurrenceKey = `${candidate.firstIndex}\u001f${candidate.displayTerm}`;
+      const existing = byKey.get(candidate.normalizedKey);
+      if (!existing) {
+        byKey.set(candidate.normalizedKey, {
+          ...candidate,
+          _occurrences: new Set([occurrenceKey]),
+        });
+        return;
+      }
+      existing._occurrences.add(occurrenceKey);
+      existing.occurrences = existing._occurrences.size;
+      if (candidate.visibility === "primary") existing.visibility = "primary";
+      if (candidate.firstIndex < existing.firstIndex) {
+        existing.displayTerm = candidate.displayTerm;
+        existing.firstIndex = candidate.firstIndex;
+        existing.source = candidate.source;
+      } else if (candidate.firstIndex === existing.firstIndex
+        && candidate.source === "selected-whole") {
+        existing.displayTerm = candidate.displayTerm;
+        existing.source = candidate.source;
+      }
+    }
+
+    if (termMode) {
+      const first = groups[0]?.[0]?.start || 0;
+      add(createInlineCandidate(cleanedWhole, first, "selected-whole", "primary"));
+    }
+
+    groups.forEach((group) => {
+      group.forEach((lexeme, startIndex) => {
+        add(createInlineCandidate(
+          lexeme.display,
+          lexeme.start,
+          "token",
+          termMode ? "lookup-only" : "primary",
+        ));
+        const maximum = Math.min(MAX_INLINE_NGRAM_TOKENS, group.length - startIndex);
+        for (let size = 2; size <= maximum; size += 1) {
+          const last = group[startIndex + size - 1];
+          const display = text.slice(lexeme.start, last.end);
+          add(createInlineCandidate(display, lexeme.start, "ngram", "lookup-only"));
+        }
+      });
+    });
+
+    const candidates = [...byKey.values()]
+      .map((candidate) => {
+        const { _occurrences, ...publicCandidate } = candidate;
+        return Object.freeze({
+          ...publicCandidate,
+          tokens: Object.freeze([...publicCandidate.tokens]),
+          occurrences: _occurrences.size,
+        });
+      })
+      .sort((left, right) => (
+        (left.visibility === "primary" ? 0 : 1)
+        - (right.visibility === "primary" ? 0 : 1)
+        || left.firstIndex - right.firstIndex
+        || (left.visibility === "lookup-only" && right.visibility === "lookup-only"
+          ? right.tokenCount - left.tokenCount
+          : 0)
+        || compareText(left.normalizedKey, right.normalizedKey)
+      ));
+    const candidateCountBeforeLimit = candidates.length;
+    const limited = candidates.slice(0, MAX_INLINE_CANDIDATES);
+    return {
+      ok: true,
+      text,
+      candidates: limited,
+      candidateCountBeforeLimit,
+      candidateCountReturned: limited.length,
+      candidateTruncated: limited.length < candidateCountBeforeLimit,
+    };
   }
 
   function normalizeMeaning(value, maxLength) {
@@ -617,6 +890,12 @@
     DB_VERSION,
     WORKSPACE_SCHEMA_VERSION,
     MAX_QUERY_RESULTS,
+    MAX_INLINE_SELECTION_LENGTH,
+    MAX_INLINE_SELECTION_LINES,
+    MAX_INLINE_CANDIDATES,
+    MAX_INLINE_CANDIDATE_LENGTH,
+    MAX_INLINE_NGRAM_TOKENS,
+    MAX_INLINE_RESULT_ENTRIES,
     MAX_SAVED_ITEM_LENGTH,
     MAX_TEMPLATE_LENGTH,
     MAX_WALLPAPER_SOURCE_BYTES,
@@ -631,6 +910,11 @@
     ENTITY_FAMILIES,
     normalizeUnicode,
     canonicalizeTerm,
+    cleanInlineGlossaryTerm,
+    normalizeInlineSelectionText,
+    validateInlineSelectionText,
+    tokenizeGlossaryTerm,
+    extractInlineGlossaryCandidates,
     normalizeMeaning,
     createSenseNaturalKey,
     normalizeSelectedPlainText,

@@ -21,6 +21,8 @@ const analysisController = globalThis.ChatGPTHelperAnalysisController;
 const analysisUi = globalThis.ChatGPTHelperAnalysisUi;
 const serviceWorkerSource = fs.readFileSync(path.join(__dirname, "../src/service-worker.js"), "utf8");
 const contentScriptSource = fs.readFileSync(path.join(__dirname, "../src/content-script.js"), "utf8");
+const chatGptDomSource = fs.readFileSync(path.join(__dirname, "../src/chatgpt-dom.js"), "utf8");
+const analysisUiSource = fs.readFileSync(path.join(__dirname, "../src/analysis-ui.js"), "utf8");
 const analysisControllerSource = fs.readFileSync(path.join(__dirname, "../src/analysis-controller.js"), "utf8");
 const optionsHtmlSource = fs.readFileSync(path.join(__dirname, "../src/options.html"), "utf8");
 const optionsScriptSource = fs.readFileSync(path.join(__dirname, "../src/options.js"), "utf8");
@@ -29,6 +31,92 @@ const manifestSource = fs.readFileSync(path.join(__dirname, "../manifest.json"),
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function createInlineSelectionCaptureHarness() {
+  const documentValue = {
+    activeElement: null,
+    querySelectorAll() { return []; },
+  };
+  const windowValue = {
+    ChatGPTHelperWorkspaceContract: workspaceContract,
+    document: documentValue,
+    innerWidth: 1280,
+    innerHeight: 720,
+    location: { href: "https://chatgpt.com/c/inline-test" },
+    getComputedStyle() { return { display: "block", visibility: "visible" }; },
+    getSelection() { return null; },
+  };
+  windowValue.window = windowValue;
+  const context = vm.createContext({
+    console,
+    URL,
+    document: documentValue,
+    window: windowValue,
+  });
+  vm.runInContext(chatGptDomSource, context, { filename: "chatgpt-dom.js" });
+  return windowValue.ChatGPTTemplateDom;
+}
+
+function inlineSelectionElement(options) {
+  const value = options || {};
+  const attributes = { ...(value.attributes || {}) };
+  return {
+    nodeType: 1,
+    tagName: value.tagName || "P",
+    isConnected: value.isConnected !== false,
+    isContentEditable: value.isContentEditable === true,
+    parentElement: value.parentElement || null,
+    parentNode: value.parentElement || null,
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(attributes, name) ? attributes[name] : null;
+    },
+    getRootNode() { return value.rootNode || null; },
+  };
+}
+
+function inlineSelectionTextNode(text) {
+  return { nodeType: 3, data: String(text || ""), textContent: String(text || ""), parentNode: null };
+}
+
+function inlineSelectionFragmentElement(tagName, children, attributes) {
+  const values = { ...(attributes || {}) };
+  const node = {
+    nodeType: 1,
+    tagName: String(tagName || "DIV").toUpperCase(),
+    childNodes: Array.isArray(children) ? children : [],
+    parentNode: null,
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(values, name) ? values[name] : null;
+    },
+    setAttribute(name, value) { values[name] = String(value); },
+  };
+  node.childNodes.forEach((child) => { child.parentNode = node; });
+  Object.defineProperty(node, "textContent", {
+    get() { return node.childNodes.map((child) => child.textContent || child.data || "").join(""); },
+  });
+  return node;
+}
+
+function inlineSelectionFixture(options) {
+  const value = options || {};
+  const anchor = value.anchor || inlineSelectionElement();
+  const range = {
+    commonAncestorContainer: anchor,
+    startContainer: value.startContainer || anchor,
+    endContainer: value.endContainer || anchor,
+    collapsed: value.collapsed === true,
+    getClientRects() { return value.rects || []; },
+    cloneContents() { return value.fragment || null; },
+    toString() { return String(value.text || ""); },
+  };
+  const selection = {
+    rangeCount: value.rangeCount === undefined ? 1 : value.rangeCount,
+    isCollapsed: value.collapsed === true,
+    getRangeAt() { return range; },
+    toString() { return String(value.text || ""); },
+  };
+  return { anchor, range, selection };
 }
 
 function validStorage(overrides) {
@@ -80,7 +168,13 @@ function createServiceWorkerHarness(initialStorage, harnessOptions) {
   });
   const ensureConversation = memoryWorkspace.ensureConversation.bind(memoryWorkspace);
   const addAnalysisTerms = memoryWorkspace.addAnalysisTerms.bind(memoryWorkspace);
+  const initializeWorkspace = memoryWorkspace.initialize.bind(memoryWorkspace);
+  let workspaceInitializeCalls = 0;
   let contextResolutionFailures = Number(options.contextResolutionFailures || 0);
+  memoryWorkspace.initialize = async (...args) => {
+    workspaceInitializeCalls += 1;
+    return initializeWorkspace(...args);
+  };
   memoryWorkspace.ensureConversation = async (...args) => {
     if (contextResolutionFailures > 0) {
       contextResolutionFailures -= 1;
@@ -237,7 +331,13 @@ function createServiceWorkerHarness(initialStorage, harnessOptions) {
     ChatGPTHelperConversationContext: conversationContext,
     ChatGPTHelperCommandRegistry: commandRegistry,
     ChatGPTHelperImportExport: importExport,
-    ChatGPTHelperWorkspaceStore: { create() { return memoryWorkspace; }, USER_STORE_NAMES: workspaceStore.USER_STORE_NAMES },
+    ChatGPTHelperWorkspaceStore: {
+      create() { return memoryWorkspace; },
+      USER_STORE_NAMES: workspaceStore.USER_STORE_NAMES,
+      assertGlossaryInvariant: workspaceStore.assertGlossaryInvariant,
+      stableDescriptor: workspaceStore.stableDescriptor,
+      temporaryDescriptor: workspaceStore.temporaryDescriptor,
+    },
     ChatGPTHelperGlossaryStore: { SCHEMA_VERSION: glossary.SCHEMA_VERSION },
     ChatGPTHelperSecretStore: secretStoreHarness,
     ChatGPTHelperOpenRouterClient: openRouterHarness,
@@ -311,6 +411,7 @@ function createServiceWorkerHarness(initialStorage, harnessOptions) {
       sessionSetFailure = { predicate, error: error || new Error("INJECTED_SESSION_SET_FAILURE") };
     },
     injectLocalGetTransform(predicate, transform) { localGetTransform = { predicate, transform }; },
+    workspaceInitializeCalls() { return workspaceInitializeCalls; },
     async waitForMigration() { await vm.runInContext("ensureMigrated()", context); },
     async runStartup() {
       listeners.onStartup();
@@ -532,6 +633,405 @@ function fakeElement(selectorFragment) {
   };
 }
 
+function createInlineUiHarness() {
+  const rootNode = { activeElement: null };
+  const documentValue = {
+    nodeType: 9,
+    activeElement: null,
+    createElement(tagName) { return new InlineFakeElement(tagName); },
+    createElementNS(_namespace, tagName) { return new InlineFakeElement(tagName); },
+  };
+
+  class InlineFakeElement {
+    constructor(tagName) {
+      this.tagName = String(tagName || "div").toUpperCase();
+      this.nodeType = 1;
+      this.parentNode = null;
+      this.children = [];
+      this.attributes = new Map();
+      this.dataset = {};
+      this.style = {
+        setProperty(name, value) { this[name] = value; },
+      };
+      this.className = "";
+      this.id = "";
+      this.type = "";
+      this.hidden = false;
+      this.isConnected = false;
+      this.listeners = new Map();
+      this._textContent = "";
+    }
+
+    set textContent(value) {
+      this.children.forEach((child) => child._setConnected(false));
+      this.children = [];
+      this._textContent = String(value ?? "");
+    }
+
+    get textContent() {
+      return this._textContent + this.children.map((child) => child.textContent).join("");
+    }
+
+    set innerHTML(_value) {
+      throw new Error("INLINE_RENDERER_MUST_NOT_USE_INNER_HTML");
+    }
+
+    get innerHTML() {
+      return "";
+    }
+
+    _setConnected(value) {
+      this.isConnected = value === true;
+      this.children.forEach((child) => child._setConnected(this.isConnected));
+    }
+
+    append(...nodes) {
+      nodes.forEach((node) => this.appendChild(node));
+    }
+
+    appendChild(node) {
+      node.parentNode?.children?.splice(node.parentNode.children.indexOf(node), 1);
+      node.parentNode = this;
+      this.children.push(node);
+      node._setConnected(this.isConnected);
+      return node;
+    }
+
+    replaceChildren(...nodes) {
+      this.children.forEach((child) => child._setConnected(false));
+      this.children = [];
+      this._textContent = "";
+      this.append(...nodes);
+    }
+
+    remove() {
+      if (this.parentNode) {
+        const index = this.parentNode.children.indexOf(this);
+        if (index >= 0) this.parentNode.children.splice(index, 1);
+      }
+      this.parentNode = null;
+      this._setConnected(false);
+    }
+
+    contains(node) {
+      if (node !== null && typeof node?.nodeType !== "number") {
+        throw new TypeError("INLINE_FAKE_CONTAINS_REQUIRES_NODE");
+      }
+      return node === this || this.children.some((child) => child.contains(node));
+    }
+
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+      if (name === "id") this.id = String(value);
+    }
+
+    getAttribute(name) {
+      return this.attributes.has(name) ? this.attributes.get(name) : null;
+    }
+
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+
+    dispatch(type, eventValue) {
+      const event = {
+        button: 0,
+        preventDefault() {},
+        ...eventValue,
+      };
+      (this.listeners.get(type) || []).forEach((listener) => listener(event));
+    }
+
+    click() {
+      this.dispatch("click");
+    }
+
+    focus() {
+      documentValue.activeElement = this;
+      rootNode.activeElement = this;
+    }
+
+    getRootNode() {
+      return rootNode;
+    }
+
+    getBoundingClientRect() {
+      if (this.className === "inline-glossary-trigger") {
+        return { top: 0, right: 36, bottom: 36, left: 0, width: 36, height: 36 };
+      }
+      if (this.className.startsWith("inline-glossary-popover")) {
+        const width = this.className.includes("is-many") ? 420 : 360;
+        return { top: 0, right: width, bottom: 180, left: 0, width, height: 180 };
+      }
+      return { top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0 };
+    }
+  }
+
+  const shell = new InlineFakeElement("div");
+  shell._setConnected(true);
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const windowValue = {
+    innerWidth: 400,
+    innerHeight: 300,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  windowValue.window = windowValue;
+  globalThis.document = documentValue;
+  globalThis.window = windowValue;
+  const ui = analysisUi.create({
+    getShell() { return shell; },
+    getSettings() { return workspaceContract.DEFAULT_ACTIVE_SETTINGS; },
+  });
+  return {
+    ui,
+    shell,
+    rootNode,
+    documentValue,
+    windowValue,
+    restore() {
+      if (previousDocument === undefined) delete globalThis.document;
+      else globalThis.document = previousDocument;
+      if (previousWindow === undefined) delete globalThis.window;
+      else globalThis.window = previousWindow;
+    },
+  };
+}
+
+function inlineDescendants(element) {
+  return [element, ...element.children.flatMap((child) => inlineDescendants(child))];
+}
+
+function createInlineContentHarness(harnessOptions) {
+  const options = harnessOptions || {};
+  const uiCalls = [];
+  const lookupCalls = [];
+  const analysisCalls = [];
+  const timers = new Map();
+  const frames = new Map();
+  let timerId = 0;
+  let frameId = 0;
+  let captureValue = null;
+  let selectionText = "";
+  let lookupImplementation = async () => ({
+    ok: true,
+    groups: [],
+    missing: [],
+    totals: {
+      candidateCountBeforeLimit: 0,
+      candidateCountReturned: 0,
+      matchedCandidateCount: 0,
+      matchedEntryCountBeforeLimit: 0,
+      matchedEntryCountReturned: 0,
+    },
+    truncated: { candidates: false, entries: false },
+  });
+  const state = {
+    analysisBusy: false,
+    workspaceStatus: { status: "ready" },
+    workspaceContext: { scopeKey: "stable:chatgpt.com:inline-content" },
+    inlineGesture: {
+      generation: 0,
+      pointerId: null,
+      pointerType: null,
+      keyboardActive: false,
+      shiftHeld: false,
+      selectionKeys: [],
+      startSignature: "",
+      changed: false,
+      pendingFrame: null,
+      pendingTask: null,
+    },
+    inlineGlossary: {
+      phase: "closed",
+      selectionToken: 0,
+      requestToken: 0,
+      snapshot: null,
+      result: null,
+      error: null,
+    },
+    host: { id: "extension-root" },
+    analysisUi: {
+      showInlineOffer(snapshot, handlers) {
+        uiCalls.push({ phase: "offering", snapshot, handlers });
+        return snapshot.anchorNode?.isConnected === true;
+      },
+      showInlineLoading(snapshot, handlers) {
+        uiCalls.push({ phase: "loading", snapshot, handlers });
+        return snapshot.anchorNode?.isConnected === true;
+      },
+      showInlineResult(snapshot, result, handlers) {
+        uiCalls.push({ phase: "showing", snapshot, result, handlers });
+        return snapshot.anchorNode?.isConnected === true;
+      },
+      showInlineError(snapshot, error, handlers) {
+        uiCalls.push({ phase: "error", snapshot, error, handlers });
+        return snapshot.anchorNode?.isConnected === true;
+      },
+      closeInline() {
+        uiCalls.push({ phase: "closed" });
+        return true;
+      },
+      inlineContainsPath(path) {
+        if (typeof options.inlineContainsPath === "function") {
+          return options.inlineContainsPath(path);
+        }
+        return Array.isArray(path)
+          && (path.includes("inline-trigger") || path.includes("inline-popover"));
+      },
+    },
+    workspaceClient: {
+      async lookupGlossarySelection(text) {
+        lookupCalls.push(text);
+        return lookupImplementation(text);
+      },
+    },
+  };
+  const inlineSource = contentScriptSource.slice(
+    contentScriptSource.indexOf("function inlineSelectionSignature"),
+    contentScriptSource.indexOf("async function deleteWorkspaceEntry"),
+  );
+  const context = vm.createContext({
+    console,
+    __state: state,
+    __workspaceContract: workspaceContract,
+    __capture() { return captureValue; },
+    __analysisCalls: analysisCalls,
+    __timers: timers,
+    __frames: frames,
+    __nextTimerId() { timerId += 1; return timerId; },
+    __nextFrameId() { frameId += 1; return frameId; },
+    __selectionText() { return selectionText; },
+    __location: { href: "https://chatgpt.com/c/inline-content" },
+  });
+  vm.runInContext(`
+    (function createInlineContentTestApi() {
+      "use strict";
+      const state = globalThis.__state;
+      const workspaceContract = globalThis.__workspaceContract;
+      const location = globalThis.__location;
+      const conversationContextModule = { isSupportedPage() { return true; } };
+      const chatGptDom = {
+        captureInlineGlossarySelection() { return globalThis.__capture(); },
+      };
+      const setTimeout = (callback, delay) => {
+        const id = globalThis.__nextTimerId();
+        globalThis.__timers.set(id, { callback, delay });
+        return id;
+      };
+      const clearTimeout = (id) => { globalThis.__timers.delete(id); };
+      const window = {
+        getSelection() {
+          const text = globalThis.__selectionText();
+          return {
+            toString() { return text; },
+            isCollapsed: !text,
+            anchorOffset: 0,
+            focusOffset: text.length,
+          };
+        },
+        requestAnimationFrame(callback) {
+          const id = globalThis.__nextFrameId();
+          globalThis.__frames.set(id, callback);
+          return id;
+        },
+        cancelAnimationFrame(id) { globalThis.__frames.delete(id); },
+      };
+      const closeWorkspaceDelete = () => false;
+      const renderSection = () => {};
+      const refreshGlossary = async () => {};
+      const refreshSaved = async () => {};
+      const handleUiError = () => {};
+      const runAnalysis = async (...args) => {
+        globalThis.__analysisCalls.push({
+          args,
+          phaseAtStart: state.inlineGlossary.phase,
+        });
+        return { ok: true, requestId: "analysis-inline-content" };
+      };
+      ${inlineSource}
+      globalThis.__inlineContentApi = Object.freeze({
+        closeInlineGlossary,
+        inlineSnapshotCurrent,
+        showInlineOffer,
+        activateInlineGlossary,
+        retryInlineGlossary,
+        analyzeInlineGlossaryCandidate,
+        captureInlineGlossarySelection,
+        beginInlineGesture,
+        markInlineGestureSelectionChanged,
+        scheduleInlineGestureSettle,
+        finishInlineKeyboardGestureIfReady,
+        handleInlinePointerDown,
+        handleInlinePointerUp,
+        cancelInlinePointerGesture,
+        handleInlineKeyDown,
+        handleInlineKeyUp,
+        closeInlineGlossaryOutsidePath,
+        handleInlineFocusIn,
+        scheduleInlineGlossaryCloseAfterEvent,
+        handleInlineCopy,
+        handleInlineExternalAction,
+        closeInlineGlossaryForInvalidation,
+        handleWorkspaceContextChange,
+        handleWorkspaceStatusChange,
+      });
+    })();
+  `, context, { filename: "content-script-inline-session.test.js" });
+  return {
+    api: context.__inlineContentApi,
+    state,
+    uiCalls,
+    lookupCalls,
+    analysisCalls,
+    timers,
+    frames,
+    setCapture(value) {
+      captureValue = value;
+      if (value?.ok && typeof value.text === "string") selectionText = value.text;
+    },
+    setSelectionText(value) { selectionText = String(value || ""); },
+    setLookupImplementation(value) { lookupImplementation = value; },
+    setLocationHref(value) { context.__location.href = value; },
+    runTimers() {
+      const pending = [...timers.values()];
+      timers.clear();
+      pending.forEach(({ callback }) => callback());
+    },
+    runFrames() {
+      const pending = [...frames.values()];
+      frames.clear();
+      pending.forEach((callback) => callback());
+    },
+    settleGesture() {
+      this.runFrames();
+      this.runTimers();
+    },
+  };
+}
+
+function inlineContentSnapshot(term, offset) {
+  const value = String(term || "State");
+  const position = Number(offset) || 0;
+  return Object.freeze({
+    ok: true,
+    text: value,
+    anchorRect: Object.freeze({
+      top: 20 + position,
+      right: 100 + position,
+      bottom: 40 + position,
+      left: 20 + position,
+      width: 80,
+      height: 20,
+    }),
+    anchorNode: { isConnected: true },
+    pageUrl: "https://chatgpt.com/c/inline-content",
+  });
+}
+
 function entry(overrides) {
   return {
     id: "term-1",
@@ -558,6 +1058,643 @@ assert.equal(commandRegistry.selectionEligible({ supportedPage: true, isEditable
 assert.equal(commandRegistry.selectionEligible({ supportedPage: true, isEditable: true, selectionText: "text" }), false);
 assert.equal(commandRegistry.composerEligible({ supportedPage: true, isComposer: true }), true);
 
+const inlineSelectionDom = createInlineSelectionCaptureHarness();
+const captureInlineGlossarySelection = inlineSelectionDom.captureInlineGlossarySelection;
+const visibleInlineRects = [
+  { top: -40, right: -10, bottom: -10, left: -40, width: 30, height: 30 },
+  { top: 90, right: 160, bottom: 110, left: 100, width: 60, height: 20 },
+  { top: 120, right: 210, bottom: 142, left: 140, width: 70, height: 22 },
+];
+const successfulInlineSelection = inlineSelectionFixture({
+  text: " **«State.»** ",
+  rects: visibleInlineRects,
+});
+const capturedInlineSelection = captureInlineGlossarySelection({
+  pageUrl: "https://chatgpt.com/c/inline-test",
+  selection: successfulInlineSelection.selection,
+  viewportWidth: 800,
+  viewportHeight: 600,
+});
+assert.equal(capturedInlineSelection.ok, true);
+assert.equal(capturedInlineSelection.text, " **«State.»** ");
+assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "displayTerm"), false);
+assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "canonicalTerm"), false);
+assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "normalizedKey"), false);
+assert.equal(capturedInlineSelection.anchorNode, successfulInlineSelection.anchor);
+assert.deepEqual(
+  { ...capturedInlineSelection.anchorRect },
+  { top: 120, right: 210, bottom: 142, left: 140, width: 70, height: 22 },
+);
+assert.equal(capturedInlineSelection.pageUrl, "https://chatgpt.com/c/inline-test");
+assert.equal(Object.isFrozen(capturedInlineSelection), true);
+assert.equal(Object.isFrozen(capturedInlineSelection.anchorRect), true);
+assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "range"), false);
+assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "selection"), false);
+
+const singleStructuredListFragment = {
+  nodeType: 11,
+  childNodes: [
+    inlineSelectionFragmentElement("UL", [
+      inlineSelectionFragmentElement("LI", [inlineSelectionTextNode("route handler")]),
+    ]),
+  ],
+};
+const singleStructuredListFixture = inlineSelectionFixture({
+  text: "route handler",
+  fragment: singleStructuredListFragment,
+  rects: [{ top: 20, right: 180, bottom: 40, left: 20, width: 160, height: 20 }],
+});
+const capturedSingleStructuredList = captureInlineGlossarySelection({
+  pageUrl: "https://chatgpt.com/c/inline-test",
+  selection: singleStructuredListFixture.selection,
+  viewportWidth: 800,
+  viewportHeight: 600,
+});
+assert.equal(capturedSingleStructuredList.ok, true);
+assert.equal(capturedSingleStructuredList.text, "• route handler");
+assert.deepEqual(
+  workspaceContract.extractInlineGlossaryCandidates(capturedSingleStructuredList.text)
+    .candidates.map((candidate) => [
+      candidate.displayTerm,
+      candidate.source,
+      candidate.visibility,
+    ]),
+  [
+    ["route", "token", "primary"],
+    ["handler", "token", "primary"],
+    ["route handler", "ngram", "lookup-only"],
+  ],
+);
+
+const structuredListFragment = {
+  nodeType: 11,
+  childNodes: [
+    inlineSelectionFragmentElement("UL", [
+      inlineSelectionFragmentElement("LI", [inlineSelectionTextNode("API client")]),
+      inlineSelectionFragmentElement("LI", [inlineSelectionTextNode("SDK server")]),
+    ]),
+  ],
+};
+const structuredListFixture = inlineSelectionFixture({
+  text: "API client SDK server",
+  fragment: structuredListFragment,
+  rects: [{ top: 20, right: 180, bottom: 60, left: 20, width: 160, height: 40 }],
+});
+const capturedStructuredList = captureInlineGlossarySelection({
+  pageUrl: "https://chatgpt.com/c/inline-test",
+  selection: structuredListFixture.selection,
+  viewportWidth: 800,
+  viewportHeight: 600,
+});
+assert.equal(capturedStructuredList.ok, true);
+assert.equal(capturedStructuredList.text, "• API client\n• SDK server");
+const structuredListCandidates = workspaceContract.extractInlineGlossaryCandidates(
+  capturedStructuredList.text,
+);
+assert.equal(
+  structuredListCandidates.candidates.some((candidate) => (
+    candidate.displayTerm === "client SDK"
+  )),
+  false,
+);
+
+const structuredTableFragment = {
+  nodeType: 11,
+  childNodes: [
+    inlineSelectionFragmentElement("TABLE", [
+      inlineSelectionFragmentElement("TBODY", [
+        inlineSelectionFragmentElement("TR", [
+          inlineSelectionFragmentElement("TD", [inlineSelectionTextNode("API")]),
+          inlineSelectionFragmentElement("TD", [inlineSelectionTextNode("client")]),
+        ]),
+        inlineSelectionFragmentElement("TR", [
+          inlineSelectionFragmentElement("TD", [inlineSelectionTextNode("SDK")]),
+          inlineSelectionFragmentElement("TD", [inlineSelectionTextNode("server")]),
+        ]),
+      ]),
+    ]),
+  ],
+};
+const structuredTableFixture = inlineSelectionFixture({
+  text: "API\tclient\nSDK\tserver",
+  fragment: structuredTableFragment,
+  rects: [{ top: 20, right: 200, bottom: 80, left: 20, width: 180, height: 60 }],
+});
+assert.equal(
+  inlineSelectionDom.readSelectionText(
+    structuredTableFixture.selection.toString(),
+    structuredTableFixture.selection,
+  ),
+  "API\nclient\nSDK\nserver",
+);
+const capturedStructuredTable = captureInlineGlossarySelection({
+  pageUrl: "https://chatgpt.com/c/inline-test",
+  selection: structuredTableFixture.selection,
+  viewportWidth: 800,
+  viewportHeight: 600,
+});
+assert.equal(capturedStructuredTable.ok, true);
+assert.equal(capturedStructuredTable.text, "API\nclient\nSDK\nserver");
+assert.equal(
+  workspaceContract.extractInlineGlossaryCandidates(capturedStructuredTable.text)
+    .candidates.some((candidate) => candidate.tokenCount > 1),
+  false,
+);
+
+function inlineCaptureReason(options) {
+  const fixture = inlineSelectionFixture({
+    text: "State",
+    rects: [{ top: 20, right: 80, bottom: 40, left: 20, width: 60, height: 20 }],
+    ...(options || {}),
+  });
+  return captureInlineGlossarySelection({
+    pageUrl: "https://chatgpt.com/c/inline-test",
+    selection: fixture.selection,
+    viewportWidth: 800,
+    viewportHeight: 600,
+    extensionRoot: options?.extensionRoot,
+  }).reason;
+}
+
+assert.equal(inlineCaptureReason({ collapsed: true }), "empty");
+assert.equal(inlineCaptureReason({ rangeCount: 2 }), "multiple-ranges");
+assert.equal(inlineCaptureReason({ text: "line one\nline two" }), undefined);
+assert.equal(inlineCaptureReason({ text: "a".repeat(2000) }), undefined);
+assert.equal(
+  inlineCaptureReason({ text: "a".repeat(2001) }),
+  "GLOSSARY_SELECTION_TOO_LARGE",
+);
+assert.equal(
+  inlineCaptureReason({ text: Array.from({ length: 41 }, () => "API").join("\n") }),
+  "GLOSSARY_SELECTION_TOO_MANY_LINES",
+);
+assert.equal(inlineCaptureReason({ text: "только кириллица" }), "no-latin");
+assert.equal(inlineCaptureReason({
+  rects: [{ top: 20, right: 20, bottom: 20, left: 20, width: 0, height: 0 }],
+}), "no-geometry");
+assert.equal(inlineCaptureReason({
+  anchor: inlineSelectionElement({ isConnected: false }),
+}), "disconnected");
+const editableInlineParent = inlineSelectionElement({
+  tagName: "DIV",
+  attributes: { contenteditable: "true" },
+});
+assert.equal(inlineCaptureReason({
+  anchor: inlineSelectionElement({ parentElement: editableInlineParent }),
+}), "editable");
+assert.equal(inlineCaptureReason({
+  anchor: inlineSelectionElement({
+    tagName: "DIV",
+    attributes: { contenteditable: "plaintext-only" },
+  }),
+}), "editable");
+assert.equal(inlineCaptureReason({
+  anchor: inlineSelectionElement({ isContentEditable: true }),
+}), "editable");
+const extensionInlineAnchor = inlineSelectionElement();
+assert.equal(inlineCaptureReason({
+  anchor: extensionInlineAnchor,
+  extensionRoot: { contains(node) { return node === extensionInlineAnchor; } },
+}), "extension-ui");
+assert.equal(inlineCaptureReason({ text: "one two three four five six seven eight nine" }), undefined);
+assert.equal(inlineCaptureReason({ text: "API/SDK client-side" }), undefined);
+assert.equal(captureInlineGlossarySelection({
+  pageUrl: "https://example.com/",
+  selection: successfulInlineSelection.selection,
+  viewportWidth: 800,
+  viewportHeight: 600,
+}).ok, false);
+
+const inlineBelowPosition = analysisUi.inlinePopoverPosition(
+  { top: 20, bottom: 40, left: 390 },
+  { height: 100 },
+  { width: 400, height: 300 },
+);
+assert.deepEqual(inlineBelowPosition, {
+  left: 32,
+  top: 46,
+  width: 360,
+  maxHeight: 180,
+  placement: "below",
+});
+assert.equal(analysisUi.inlinePopoverPosition(
+  { top: 260, bottom: 280, left: 20 },
+  { height: 100 },
+  { width: 400, height: 300 },
+).placement, "above");
+assert.deepEqual(analysisUi.inlinePopoverPosition(
+  { top: 20, bottom: 40, left: 700 },
+  { height: 100, width: 420 },
+  { width: 800, height: 600 },
+), {
+  left: 372,
+  top: 46,
+  width: 420,
+  maxHeight: 360,
+  placement: "below",
+});
+assert.deepEqual(analysisUi.inlinePopoverPosition(
+  { top: 30, bottom: 40, left: -20 },
+  { height: 200 },
+  { width: 300, height: 100 },
+), {
+  left: 8,
+  top: 32,
+  width: 284,
+  maxHeight: 60,
+  placement: "clamped",
+});
+assert.equal(analysisUi.normalizeInlineGlossaryEntries([
+  { id: "sense-1", term: "State", translation: "состояние", definition: "Определение", attached: true },
+  null,
+  { id: "", term: "ignored", translation: "x", definition: "y" },
+]).length, 1);
+
+const inlineUiHarness = createInlineUiHarness();
+try {
+  const inlineAnchor = { isConnected: true };
+  const inlineSnapshot = Object.freeze({
+    text: "<State> and OpenAPI",
+    anchorNode: inlineAnchor,
+    anchorRect: Object.freeze({
+      top: 20,
+      right: 400,
+      bottom: 40,
+      left: 390,
+      width: 10,
+      height: 20,
+    }),
+  });
+  let retryCount = 0;
+  let analyzeCount = 0;
+  let analyzedCandidate = null;
+  let activateCount = 0;
+  let closeCount = 0;
+  let inlineUi;
+  const handlers = {
+    onActivate() { activateCount += 1; },
+    onRetry() { retryCount += 1; },
+    onAnalyze(candidate) { analyzeCount += 1; analyzedCandidate = candidate; },
+    onClose() {
+      closeCount += 1;
+      inlineUi.closeInline();
+    },
+  };
+  inlineUi = inlineUiHarness.ui;
+  assert.equal(inlineUi.showInlineOffer(inlineSnapshot, handlers), true);
+  const inlineRoot = inlineUiHarness.shell.children[0];
+  const inlineTrigger = inlineRoot.children[0];
+  assert.equal(inlineTrigger.tagName, "BUTTON");
+  assert.equal(inlineTrigger.type, "button");
+  assert.equal(inlineTrigger.getAttribute("aria-label"), "Открыть словарь по выделению");
+  assert.equal(inlineTrigger.getAttribute("title"), "Словарь");
+  assert.equal(inlineTrigger.getAttribute("aria-expanded"), "false");
+  assert.equal(
+    inlineTrigger.getAttribute("aria-controls"),
+    analysisUi.INLINE_POPOVER_ID,
+  );
+  assert.equal(inlineTrigger.textContent, "");
+  assert.equal(inlineTrigger.children.length, 1);
+  const inlineTriggerIcon = inlineTrigger.children[0];
+  assert.equal(inlineTriggerIcon.tagName, "SVG");
+  assert.equal(inlineTriggerIcon.getAttribute("viewBox"), "0 0 24 24");
+  assert.equal(inlineTriggerIcon.getAttribute("width"), "18");
+  assert.equal(inlineTriggerIcon.getAttribute("height"), "18");
+  assert.equal(inlineTriggerIcon.getAttribute("aria-hidden"), "true");
+  assert.equal(inlineTriggerIcon.children.length, 2);
+  assert.equal(inlineTriggerIcon.children.every((element) => element.tagName === "PATH"), true);
+  assert.equal(inlineTrigger.style.left, "356px");
+  assert.equal(inlineUi.inlineContainsPath([inlineTrigger]), true);
+  assert.equal(inlineUi.inlineContainsPath([inlineRoot]), false);
+  assert.equal(inlineUiHarness.rootNode.activeElement, null);
+  inlineTrigger.click();
+  assert.equal(activateCount, 1);
+
+  assert.equal(inlineUi.showInlineLoading(inlineSnapshot, handlers), true);
+  const inlineLive = inlineRoot.children[1];
+  const inlinePopover = inlineRoot.children[2];
+  assert.equal(inlinePopover.getAttribute("role"), "region");
+  assert.equal(inlinePopover.getAttribute("aria-modal"), null);
+  assert.equal(inlineTrigger.getAttribute("aria-expanded"), "true");
+  assert.equal(inlinePopover.hidden, false);
+  assert.equal(inlinePopover.style.left, "32px");
+  assert.equal(inlineUi.inlineContainsPath([inlinePopover]), true);
+  assert.equal(inlineUi.inlineContainsPath([inlinePopover.children[0]]), true);
+  const externalBrowserPath = [
+    inlineUiHarness.documentValue.createElement("main"),
+    inlineUiHarness.documentValue,
+    inlineUiHarness.windowValue,
+  ];
+  assert.throws(
+    () => inlineTrigger.contains(inlineUiHarness.windowValue),
+    /INLINE_FAKE_CONTAINS_REQUIRES_NODE/,
+    "the fake must reject Window-like values like native Node.contains()",
+  );
+  assert.doesNotThrow(() => inlineUi.inlineContainsPath(externalBrowserPath));
+  assert.equal(inlineUi.inlineContainsPath(externalBrowserPath), false);
+  assert.equal(inlineUi.inlineContainsPath([
+    inlinePopover.children[0],
+    inlineUiHarness.documentValue,
+    inlineUiHarness.windowValue,
+  ]), true);
+
+  const productionPathOwner = (path) => inlineUi.inlineContainsPath(path);
+  const samePagePointerHarness = createInlineContentHarness({
+    inlineContainsPath: productionPathOwner,
+  });
+  samePagePointerHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  samePagePointerHarness.api.handleInlinePointerDown({
+    button: 0,
+    isPrimary: true,
+    pointerId: 91,
+    pointerType: "mouse",
+  }, externalBrowserPath);
+  assert.equal(samePagePointerHarness.state.inlineGlossary.phase, "closed");
+  assert.equal(samePagePointerHarness.state.inlineGlossary.snapshot, null);
+  assert.equal(samePagePointerHarness.state.inlineGlossary.result, null);
+  assert.equal(samePagePointerHarness.state.inlineGlossary.error, null);
+  assert.equal(samePagePointerHarness.uiCalls.at(-1).phase, "closed");
+
+  const samePageFocusHarness = createInlineContentHarness({
+    inlineContainsPath: productionPathOwner,
+  });
+  samePageFocusHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  assert.equal(samePageFocusHarness.api.handleInlineFocusIn({
+    composedPath() { return externalBrowserPath; },
+  }), true);
+  assert.equal(samePageFocusHarness.state.inlineGlossary.phase, "closed");
+  assert.equal(samePageFocusHarness.state.inlineGlossary.snapshot, null);
+  assert.equal(samePageFocusHarness.state.inlineGlossary.result, null);
+  assert.equal(samePageFocusHarness.state.inlineGlossary.error, null);
+  assert.equal(samePageFocusHarness.uiCalls.at(-1).phase, "closed");
+  assert.match(inlinePopover.textContent, /Ищем в словаре/);
+  assert.match(inlineLive.textContent, /Ищем в словаре/);
+  assert.equal(inlineUi.inlineOwnsFocus(), false);
+  const inlineCloseButton = inlinePopover.children[0].children[1];
+  assert.equal(inlineCloseButton.className, "inline-glossary-close");
+  assert.equal(inlineUiHarness.rootNode.activeElement, null);
+  inlineTrigger.click();
+  assert.equal(activateCount, 1);
+  assert.equal(inlinePopover.hidden, false);
+
+  const stateCandidate = {
+    displayTerm: "State",
+    normalizedKey: "state",
+    firstIndex: 0,
+    tokenCount: 1,
+    occurrences: 1,
+    source: "token",
+    visibility: "primary",
+  };
+  assert.equal(inlineUi.showInlineResult(inlineSnapshot, {
+    groups: [{
+      candidate: stateCandidate,
+      matchClass: "exact",
+      exactMissing: false,
+      entries: [{
+        id: "sense-one",
+        term: "State",
+        translation: "состояние",
+        definition: "Одно значение.",
+        attached: true,
+        matchClass: "exact",
+      }],
+    }],
+    missing: [],
+    totals: {
+      candidateCountBeforeLimit: 1,
+      candidateCountReturned: 1,
+      matchedCandidateCount: 1,
+      matchedEntryCountBeforeLimit: 1,
+      matchedEntryCountReturned: 1,
+    },
+    truncated: { candidates: false, entries: false },
+  }, handlers), true);
+  assert.match(inlinePopover.textContent, /Одно значение\./);
+  assert.match(inlinePopover.textContent, /Точное совпадение/);
+  assert.match(inlinePopover.textContent, /Точное значение/);
+  assert.doesNotMatch(inlinePopover.textContent, /Показано \d+ из \d+/);
+  assert.equal(
+    inlineDescendants(inlineRoot)
+      .some((element) => element.tagName === "BUTTON" && element.textContent === "Разобрать"),
+    false,
+    "an exact saved primary candidate does not expose a provider action",
+  );
+
+  const openApiCandidate = {
+    displayTerm: "OpenAPI",
+    normalizedKey: "open api",
+    firstIndex: 12,
+    tokenCount: 1,
+    occurrences: 1,
+    source: "token",
+    visibility: "primary",
+  };
+  assert.equal(inlineUi.showInlineResult(inlineSnapshot, {
+    groups: [{
+      candidate: stateCandidate,
+      matchClass: "contiguous",
+      exactMissing: true,
+      entries: [
+        {
+          id: "sense-attached",
+          term: "<img src=x onerror=alert(1)>",
+          translation: "<svg/onload=alert(1)>",
+          definition: "<script>alert(1)</script>",
+          attached: true,
+          matchClass: "contiguous",
+        },
+        {
+          id: "sense-global",
+          term: "State",
+          translation: "режим",
+          definition: "Глобальное значение.",
+          attached: false,
+          matchClass: "full-token",
+        },
+      ],
+    }],
+    missing: [openApiCandidate],
+    totals: {
+      candidateCountBeforeLimit: 3,
+      candidateCountReturned: 2,
+      matchedCandidateCount: 1,
+      matchedEntryCountBeforeLimit: 3,
+      matchedEntryCountReturned: 2,
+    },
+    truncated: { candidates: true, entries: true },
+  }, handlers), true);
+  assert.match(inlinePopover.textContent, /<img src=x onerror=alert\(1\)>/);
+  assert.match(inlinePopover.textContent, /<script>alert\(1\)<\/script>/);
+  assert.match(inlinePopover.textContent, /В этом чате/);
+  assert.match(inlinePopover.textContent, /Общий словарь/);
+  assert.match(inlinePopover.textContent, /Связанное совпадение/);
+  assert.match(inlinePopover.textContent, /Связанные записи/);
+  assert.match(inlinePopover.textContent, /Точного значения «State» нет\./);
+  assert.match(inlinePopover.textContent, /Не найдено/);
+  assert.match(inlinePopover.textContent, /OpenAPI/);
+  assert.match(inlinePopover.textContent, /Показано 2 из 3 кандидатов\./);
+  assert.match(inlinePopover.textContent, /Показано 2 из 3 совпадений\./);
+  assert.equal(inlineDescendants(inlineRoot).some((element) => element.tagName === "IMG"), false);
+  assert.equal(inlineDescendants(inlineRoot).some((element) => element.tagName === "SCRIPT"), false);
+  const candidateActions = inlineDescendants(inlineRoot)
+    .filter((element) => element.tagName === "BUTTON" && element.textContent === "Разобрать");
+  assert.deepEqual(
+    candidateActions.map((element) => element.getAttribute("aria-label")),
+    ["Разобрать State", "Разобрать OpenAPI"],
+  );
+  const analyzeOpenApi = candidateActions.at(-1);
+  analyzeOpenApi.click();
+  assert.equal(analyzeCount, 1);
+  assert.equal(analyzedCandidate.normalizedKey, "open api");
+
+  const lookupOnlyCandidate = {
+    displayTerm: "route handler",
+    normalizedKey: "route handler",
+    firstIndex: 0,
+    tokenCount: 2,
+    occurrences: 1,
+    source: "ngram",
+    visibility: "lookup-only",
+  };
+  assert.equal(inlineUi.showInlineResult(inlineSnapshot, {
+    groups: [{
+      candidate: lookupOnlyCandidate,
+      matchClass: "exact",
+      exactMissing: false,
+      entries: [{
+        id: "sense-route-handler",
+        term: "route handler",
+        translation: "обработчик маршрута",
+        definition: "Обрабатывает маршрут.",
+        attached: false,
+        matchClass: "exact",
+      }],
+    }],
+    missing: [],
+    totals: {
+      candidateCountBeforeLimit: 3,
+      candidateCountReturned: 3,
+      matchedCandidateCount: 3,
+      matchedEntryCountBeforeLimit: 1,
+      matchedEntryCountReturned: 1,
+    },
+    truncated: { candidates: false, entries: false },
+  }, handlers), true);
+  assert.match(inlinePopover.textContent, /route handler/);
+  assert.equal(
+    inlineDescendants(inlineRoot)
+      .some((element) => element.tagName === "BUTTON" && element.textContent === "Разобрать"),
+    false,
+    "matched lookup-only groups do not expose provider actions",
+  );
+
+  const manyMissingCandidates = Array.from({ length: 7 }, (_, index) => ({
+    displayTerm: `Candidate${index}`,
+    normalizedKey: `candidate${index}`,
+    firstIndex: index,
+    tokenCount: 1,
+    occurrences: 1,
+    source: "token",
+    visibility: "primary",
+  }));
+  assert.equal(inlineUi.showInlineResult(inlineSnapshot, {
+    groups: [],
+    missing: manyMissingCandidates,
+    totals: {
+      candidateCountBeforeLimit: 7,
+      candidateCountReturned: 7,
+      matchedCandidateCount: 0,
+      matchedEntryCountBeforeLimit: 0,
+      matchedEntryCountReturned: 0,
+    },
+    truncated: { candidates: false, entries: false },
+  }, handlers), true);
+  assert.equal(inlinePopover.className, "inline-glossary-popover is-many");
+  assert.equal(inlinePopover.style.width, "384px");
+  assert.match(inlineLive.textContent, /0 совпадений, 7 без совпадений/);
+  assert.equal(inlineUi.showInlineLoading(inlineSnapshot, handlers), true);
+  assert.equal(inlinePopover.className, "inline-glossary-popover");
+  assert.equal(inlinePopover.style.width, "360px");
+  assert.match(inlineLive.textContent, /Ищем в словаре/);
+
+  assert.equal(inlineUi.showInlineError(
+    inlineSnapshot,
+    { message: "<unsafe workspace error>" },
+    handlers,
+  ), true);
+  const errorElements = inlineDescendants(inlineRoot);
+  errorElements.find((element) => element.tagName === "BUTTON" && element.textContent === "Повторить").click();
+  assert.equal(retryCount, 1);
+  assert.equal(analyzeCount, 1);
+  assert.equal(
+    errorElements.some((element) => element.tagName === "BUTTON" && element.textContent === "Разобрать"),
+    false,
+  );
+  assert.match(inlinePopover.textContent, /<unsafe workspace error>/);
+  assert.equal(inlineLive.textContent, "Не удалось открыть словарь.");
+  assert.equal(inlineUi.handleInlineEscape(), true);
+  assert.equal(closeCount, 1);
+  assert.equal(inlineRoot.isConnected, false);
+  assert.equal(inlineUi.handleInlineEscape(), false);
+
+  inlineUi.showResult({
+    terms: [{
+      term: "State",
+      translation: "режим",
+      definition: "Новая версия.",
+      status: "replacementAvailable",
+      savedEntry: {
+        id: "saved-state",
+        translation: "состояние",
+        definition: "Сохранённая версия.",
+      },
+      replacementCandidate: {
+        targetSenseId: "saved-state",
+        expectedUpdatedAt: 42,
+        proposed: {
+          translation: "режим",
+          definition: "Новая версия.",
+        },
+      },
+    }],
+  });
+  const replacementElements = inlineDescendants(inlineUiHarness.shell);
+  assert.match(inlineUiHarness.shell.textContent, /Есть другая версия/);
+  const replacementArrow = replacementElements.find(
+    (element) => element.className === "analysis-replace",
+  );
+  assert.ok(replacementArrow);
+  assert.equal(replacementArrow.getAttribute("aria-label"), "Заменить сохранённую версию");
+  assert.equal(replacementArrow.children[0].tagName, "SVG");
+  const replacementTooltip = replacementElements.find(
+    (element) => element.className === "analysis-duplicate-tooltip",
+  );
+  assert.equal(replacementTooltip.getAttribute("role"), "tooltip");
+  assert.match(replacementTooltip.textContent, /Сохранено сейчас/);
+  replacementArrow.dispatch("pointerenter");
+  assert.equal(replacementTooltip.hidden, false);
+  replacementArrow.dispatch("pointerleave");
+  assert.equal(replacementTooltip.hidden, true);
+
+  inlineUi.showResult({
+    terms: [{
+      term: "State",
+      translation: "состояние",
+      definition: "Сохранённая версия.",
+      status: "alreadySaved",
+    }],
+  });
+  assert.match(inlineUiHarness.shell.textContent, /Уже сохранено/);
+  assert.equal(
+    inlineDescendants(inlineUiHarness.shell)
+      .some((element) => element.className === "analysis-replace"),
+    false,
+  );
+} finally {
+  inlineUiHarness.restore();
+}
+
 assert.equal(analysisUi.glossaryTextSizeClass("analysis-result-list", { analysis: { glossaryTextSize: "compact" } }), "analysis-result-list size-compact");
 assert.equal(analysisUi.glossaryTextSizeClass("analysis-result-list", { analysis: { glossaryTextSize: "normal" } }), "analysis-result-list size-normal");
 assert.equal(analysisUi.glossaryTextSizeClass("analysis-result-list", { analysis: { glossaryTextSize: "large" } }), "analysis-result-list size-large");
@@ -567,23 +1704,29 @@ assert.equal(analysisUi.nextFocusableIndex(-1, 3, false), 0);
 assert.equal(analysisUi.nextFocusableIndex(-1, 3, true), 2);
 assert.equal(analysisUi.nextFocusableIndex(0, 0, false), -1);
 const deterministicReplacementTerm = {
-  status: "duplicate",
+  status: "replacementAvailable",
+  translation: "новый перевод",
+  definition: "Новое определение.",
   replacementCandidate: {
-    status: "single",
     targetSenseId: "target-sense",
-    newSenseId: "new-sense",
     expectedUpdatedAt: 42,
+    proposed: {
+      translation: "новый перевод",
+      definition: "Новое определение.",
+    },
   },
 };
 assert.deepEqual(analysisUi.replacementCommandForTerm(deterministicReplacementTerm), {
-  entryId: "target-sense",
-  sourceSenseId: "new-sense",
+  senseId: "target-sense",
   expectedUpdatedAt: 42,
+  replacement: {
+    translation: "новый перевод",
+    definition: "Новое определение.",
+  },
 });
 assert.equal(analysisUi.replacementCommandForTerm({
   ...deterministicReplacementTerm,
   status: "new",
-  replacementCandidate: { status: "multiple", count: 2 },
 }), null);
 assert.equal(analysisUi.replacementCommandForTerm({ status: "new" }), null);
 assert.doesNotMatch(contentScriptSource, /chrome\.storage\.local\.set\s*\(/);
@@ -604,6 +1747,7 @@ assert.match(optionsStylesSource, /html\.theme-pending body \{ visibility: hidde
 assert.match(optionsStylesSource, /@media \(prefers-color-scheme: dark\) \{\s*:root\.theme-system \{/);
 assert.doesNotMatch(optionsStylesSource, /@media \(prefers-color-scheme: dark\) \{\s*:root\s*\{/);
 assert.match(optionsStylesSource, /\.selected-file-name \{[^}]*overflow: hidden;[^}]*text-overflow: ellipsis;[^}]*white-space: nowrap;/);
+assert.match(optionsStylesSource, /\.file-button \{[^}]*font-weight: inherit;/);
 assert.doesNotMatch(optionsScriptSource, /document\.documentElement\.className\s*=/);
 assert.match(optionsScriptSource, /function clearBackupSelection\(kind\)/);
 assert.match(contentScriptSource, /<h3>Настройки расширения<\/h3>/);
@@ -687,6 +1831,8 @@ const workspaceEscapeSource = contentScriptSource.slice(
   contentScriptSource.indexOf('document.addEventListener("pointerdown", function handleOutsidePointer'),
 );
 assert.equal(workspaceEscapeSource.indexOf("state.analysisUi?.handleEscape()")
+  < workspaceEscapeSource.indexOf("state.analysisUi?.handleInlineEscape()"), true);
+assert.equal(workspaceEscapeSource.indexOf("state.analysisUi?.handleInlineEscape()")
   < workspaceEscapeSource.indexOf("closeWorkspaceDeleteAndRender(true)"), true);
 assert.equal(workspaceEscapeSource.indexOf("closeWorkspaceDeleteAndRender(true)")
   < workspaceEscapeSource.indexOf("closeTemplatePreview()"), true);
@@ -704,6 +1850,234 @@ assert.match(selectedTextReaderSource, /chatGptDom\.readSelectionText/);
 assert.match(runSaveSelectionSource, /readSelectedTextSnapshot\(selectionText\)/);
 assert.doesNotMatch(runSaveSelectionSource, /window\.getSelection\?\.\(\)\.toString/);
 
+const inlineCaptureSource = chatGptDomSource.slice(
+  chatGptDomSource.indexOf("function captureInlineGlossarySelection"),
+  chatGptDomSource.indexOf("function normalizeComposerPlainText"),
+);
+assert.match(inlineCaptureSource, /selection\.rangeCount !== 1/);
+assert.match(inlineCaptureSource, /inlineEditableElement/);
+assert.match(inlineCaptureSource, /inlineExtensionElement/);
+assert.match(inlineCaptureSource, /getClientRects/);
+assert.match(inlineCaptureSource, /\.at\(-1\)/);
+assert.match(inlineCaptureSource, /Object\.freeze\(\{\s*top: rect\.top/);
+assert.doesNotMatch(inlineCaptureSource, /cloneRange|removeAllRanges|addRange|insertNode|surroundContents/);
+assert.doesNotMatch(inlineCaptureSource, /\b(?:range|selection)\s*[:,]\s*(?:range|selection)\b/);
+
+const inlineUiRendererSource = analysisUiSource.slice(
+  analysisUiSource.indexOf("function ensureInlineRoot"),
+  analysisUiSource.indexOf("function removeToast"),
+);
+assert.match(inlineUiRendererSource, /document\.createElement\("button"\)/);
+assert.match(inlineUiRendererSource, /inlineTrigger\.type = "button"/);
+assert.match(inlineUiRendererSource, /shell\(\)\?\.appendChild\(inlineRoot\)/);
+assert.match(inlineUiRendererSource, /setAttribute\("role", "region"\)/);
+assert.doesNotMatch(inlineUiRendererSource, /aria-modal|innerHTML/);
+assert.match(inlineUiRendererSource, /setAttribute\("aria-label", "Открыть словарь по выделению"\)/);
+assert.match(inlineUiRendererSource, /setAttribute\("title", "Словарь"\)/);
+assert.match(inlineUiRendererSource, /createElementNS\("http:\/\/www\.w3\.org\/2000\/svg", "svg"\)/);
+assert.match(inlineUiRendererSource, /setAttribute\("aria-hidden", "true"\)/);
+assert.doesNotMatch(inlineUiRendererSource, /📖|label\.textContent = "Словарь"/);
+assert.match(inlineUiRendererSource, /textContent = entry\.term/);
+assert.match(inlineUiRendererSource, /textContent = entry\.definition/);
+assert.match(inlineUiRendererSource, /"В этом чате" : "Общий словарь"/);
+assert.match(inlineUiRendererSource, /result\.totals\.candidateCountReturned/);
+assert.match(inlineUiRendererSource, /result\.totals\.matchedEntryCountReturned/);
+assert.match(inlineUiRendererSource, /inlineLive\.textContent/);
+assert.match(inlineUiRendererSource, /aria-live/);
+assert.match(inlineUiRendererSource, /"Повторить"/);
+assert.match(inlineUiRendererSource, /"Разобрать"/);
+assert.match(
+  inlineUiRendererSource,
+  /group\.candidate\.visibility === "primary" && exactEntries\.length === 0/,
+);
+const inlineErrorRendererSource = inlineUiRendererSource.slice(
+  inlineUiRendererSource.indexOf("function showInlineError"),
+  inlineUiRendererSource.indexOf("function handleInlineEscape"),
+);
+assert.doesNotMatch(inlineErrorRendererSource, /onAnalyze|Разобрать/);
+assert.doesNotMatch(
+  inlineUiRendererSource,
+  /onReplace|attachGlossary|unlinkGlossary|deleteGlossary|reorderGlossary|persist/i,
+);
+const providerLoadingOwnerSource = analysisUiSource.slice(
+  analysisUiSource.indexOf("function showLoading()"),
+  analysisUiSource.indexOf("function showHint"),
+);
+const providerDialogOwnerSource = analysisUiSource.slice(
+  analysisUiSource.indexOf("function dialogFrame"),
+  analysisUiSource.indexOf("function showResult"),
+);
+assert.match(providerLoadingOwnerSource, /function showLoading\(\) \{\s*closeInline\(\);/);
+assert.match(providerDialogOwnerSource, /function dialogFrame\(title\) \{\s*closeInline\(\);/);
+
+const inlineSessionSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function inlineSelectionSignature"),
+  contentScriptSource.indexOf("function handleWorkspaceContextChange"),
+);
+const inlineOfferSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("function showInlineOffer"),
+  inlineSessionSource.indexOf("function inlineLookupOwns"),
+);
+const inlineSnapshotCurrentSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("function inlineSnapshotCurrent"),
+  inlineSessionSource.indexOf("function cancelInlineGestureSettle"),
+);
+const inlineOwnershipSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("function inlineLookupOwns"),
+  inlineSessionSource.indexOf("async function performInlineGlossaryLookup"),
+);
+const inlineLookupDispatchSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("async function performInlineGlossaryLookup"),
+  inlineSessionSource.indexOf("function activateInlineGlossary"),
+);
+const inlineFallbackSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("async function analyzeInlineGlossaryCandidate"),
+  inlineSessionSource.indexOf("function captureInlineGlossarySelection"),
+);
+const inlineSessionCaptureSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("function captureInlineGlossarySelection"),
+  inlineSessionSource.indexOf("function beginInlineGesture"),
+);
+const inlineGestureSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("function beginInlineGesture"),
+);
+assert.match(inlineSessionSource, /phase: "offering"/);
+assert.match(inlineSessionSource, /phase: "loading"/);
+assert.match(inlineSessionSource, /phase: "showing"/);
+assert.match(inlineSessionSource, /phase: "error"/);
+assert.doesNotMatch(inlineOfferSource, /lookupGlossarySelection|openRouter|runAnalysis|sendMessage/);
+assert.match(inlineSessionSource, /const snapshot = Object\.freeze/);
+assert.match(inlineOwnershipSource, /current\.requestToken === requestToken/);
+assert.match(inlineOwnershipSource, /current\.selectionToken === selectionToken/);
+assert.match(inlineOwnershipSource, /current\.snapshot === snapshot/);
+assert.match(inlineOwnershipSource, /inlineSnapshotCurrent\(snapshot\)/);
+assert.match(inlineSnapshotCurrentSource, /snapshot\.pageUrl === location\.href/);
+assert.match(inlineSnapshotCurrentSource, /scopeKey === snapshot\.conversationScope/);
+assert.match(inlineSnapshotCurrentSource, /snapshot\.anchorNode\?\.isConnected === true/);
+assert.match(inlineSnapshotCurrentSource, /state\.workspaceStatus\.status === "ready"/);
+assert.equal(
+  inlineLookupDispatchSource.indexOf("inlineSnapshotCurrent(snapshot)")
+    < inlineLookupDispatchSource.indexOf("lookupGlossarySelection(snapshot.text)"),
+  true,
+);
+assert.doesNotMatch(contentScriptSource, /inlineSelectionSuppression|INLINE_SELECTION_DEBOUNCE_MS/);
+assert.doesNotMatch(contentScriptSource, /function inlinePhaseCommitted/);
+assert.doesNotMatch(inlineUiRendererSource, /function (?:collapseInline|showInlineEmpty)/);
+assert.match(inlineSessionCaptureSource, /generation/);
+assert.match(inlineFallbackSource, /current\.phase !== "showing"/);
+assert.match(inlineFallbackSource, /inlineResultContainsCandidate/);
+assert.match(inlineFallbackSource, /inlineSnapshotCurrent\(snapshot\)/);
+assert.match(inlineFallbackSource, /const displayTerm = candidate\.displayTerm/);
+assert.match(inlineFallbackSource, /const pageUrl = snapshot\.pageUrl/);
+assert.equal(
+  inlineFallbackSource.indexOf("closeInlineGlossary()")
+    < inlineFallbackSource.indexOf('runAnalysis("inline-assistant", displayTerm, pageUrl)'),
+  true,
+);
+assert.doesNotMatch(inlineFallbackSource, /openRouter|provider|context-menu|browser-command/);
+
+assert.match(inlineGestureSource, /generation/);
+assert.match(inlineGestureSource, /requestAnimationFrame/);
+assert.match(inlineGestureSource, /pendingTask = setTimeout/);
+assert.match(inlineGestureSource, /pointerId/);
+assert.match(inlineGestureSource, /supportedInlineSelectionKey/);
+assert.match(inlineGestureSource, /keyboardActive/);
+assert.match(inlineGestureSource, /shiftHeld/);
+assert.match(inlineGestureSource, /selectionKeys/);
+assert.match(inlineGestureSource, /finishInlineKeyboardGestureIfReady/);
+assert.match(contentScriptSource, /document\.addEventListener\("selectionchange", markInlineGestureSelectionChanged\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("pointerup", handleInlinePointerUp, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("keyup", handleInlineKeyUp, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("pointercancel", cancelInlinePointerGesture, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("focusin", handleInlineFocusIn, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("copy", handleInlineCopy, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("cut", handleInlineExternalAction, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("paste", handleInlineExternalAction, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /document\.addEventListener\("beforeinput", handleInlineExternalAction, \{ capture: true \}\)/);
+assert.match(contentScriptSource, /window\.addEventListener\("blur"/);
+const inlineOutsidePointerSource = contentScriptSource.slice(
+  contentScriptSource.indexOf('document.addEventListener("pointerdown", function handleOutsidePointer'),
+  contentScriptSource.indexOf('window.addEventListener("focus", function handleWindowFocus'),
+);
+assert.match(inlineSessionSource, /function closeInlineGlossaryOutsidePath[\s\S]*inlineContainsPath\(path\)/);
+assert.match(inlineOutsidePointerSource, /handleInlinePointerDown\(event, path\)/);
+assert.match(inlineOutsidePointerSource, /\}, \{ capture: true \}\);/);
+assert.match(inlineOutsidePointerSource, /document\.addEventListener\("scroll"/);
+assert.match(inlineOutsidePointerSource, /\{ capture: true, passive: true \}/);
+const inlineExternalCloseSource = inlineSessionSource.slice(
+  inlineSessionSource.indexOf("function handleInlineFocusIn"),
+  inlineSessionSource.indexOf("function closeInlineGlossaryForInvalidation"),
+);
+assert.match(inlineExternalCloseSource, /function scheduleInlineGlossaryCloseAfterEvent[\s\S]*setTimeout/);
+assert.doesNotMatch(inlineExternalCloseSource, /preventDefault|stopPropagation/);
+const inlinePathOwnerSource = inlineUiRendererSource.slice(
+  inlineUiRendererSource.indexOf("function inlineContainsPath"),
+  inlineUiRendererSource.indexOf("function inlineOwnsFocus"),
+);
+assert.match(inlinePathOwnerSource, /\[inlineTrigger, inlinePopover\]/);
+assert.doesNotMatch(inlinePathOwnerSource, /path\.includes\(inlineRoot\)|inlineRoot\.contains/);
+const inlineResizeSource = contentScriptSource.slice(
+  contentScriptSource.indexOf('window.addEventListener("resize", function handleWindowResize'),
+  contentScriptSource.indexOf("chrome.runtime.onMessage.addListener"),
+);
+assert.equal(
+  inlineResizeSource.indexOf("closeInlineGlossary")
+    < inlineResizeSource.indexOf("closeTemplatePreview"),
+  true,
+);
+const inlineToggleMessageSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("if (message?.type === TOGGLE_MESSAGE)"),
+  contentScriptSource.indexOf("if (message?.type === commandRegistry.CONTENT_MESSAGE_TYPES.ANALYZE"),
+);
+assert.equal(
+  inlineToggleMessageSource.indexOf("closeInlineGlossary()")
+    < inlineToggleMessageSource.indexOf("ensureMounted()"),
+  true,
+);
+const inlineInvalidationStart = contentScriptSource.indexOf(
+  "if (message?.type === workspaceContract.MESSAGE_TYPES.CHANGED)",
+);
+const inlineInvalidationSource = contentScriptSource.slice(
+  inlineInvalidationStart,
+  contentScriptSource.indexOf("    return false;\n  });", inlineInvalidationStart),
+);
+assert.match(inlineSessionSource, /ENTITY_FAMILIES\.ALL, workspaceContract\.ENTITY_FAMILIES\.GLOSSARY/);
+assert.match(inlineInvalidationSource, /closeInlineGlossaryForInvalidation\(message\.entityFamily\)/);
+assert.doesNotMatch(
+  inlineInvalidationSource.slice(
+    inlineInvalidationSource.indexOf("ENTITY_FAMILIES.SAVED"),
+    inlineInvalidationSource.indexOf("ENTITY_FAMILIES.CONVERSATIONS"),
+  ),
+  /closeInlineGlossary/,
+);
+const inlineContextSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function handleWorkspaceContextChange"),
+  contentScriptSource.indexOf("async function deleteWorkspaceEntry"),
+);
+assert.match(
+  inlineContextSource,
+  /function handleWorkspaceContextChange[\s\S]*closeInlineGlossary\(\)/,
+);
+assert.match(
+  inlineContextSource,
+  /status\.status === "unavailable"[\s\S]*closeInlineGlossary\(\)/,
+);
+const inlineMountSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function mount()"),
+  contentScriptSource.indexOf("async function loadStorage"),
+);
+assert.match(
+  inlineMountSource,
+  /function mount\(\) \{[\s\S]*closeInlineGlossary\(\)/,
+);
+assert.match(inlineMountSource, /!state\.inlineGlossary\.snapshot\?\.anchorNode\?\.isConnected[\s\S]*closeInlineGlossary/);
+const inlineAnalysisStartSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("async function runAnalysis"),
+  contentScriptSource.indexOf("async function runSaveSelection"),
+);
+assert.match(inlineAnalysisStartSource, /closeInlineGlossary\(\)/);
+assert.match(contentScriptSource, /const mountObserver = new MutationObserver\(ensureMounted\)/);
+
 assert.equal(
   contract.MESSAGE_TYPES.KEY_STATUS_CHANGED,
   "chatgpt-helper:openrouter-key-status-changed",
@@ -712,6 +2086,11 @@ const analysisStyles = analysisUi.styles();
 assert.match(analysisStyles, /\.analysis-replace \{[^}]*display: inline-flex;[^}]*padding: 0;[^}]*align-items: center;[^}]*justify-content: center;[^}]*line-height: 0;/);
 assert.match(analysisStyles, /\.analysis-replace svg \{[^}]*display: block;[^}]*width: 16px;[^}]*height: 16px;/);
 assert.doesNotMatch(analysisStyles, /analysis-search-clear/);
+assert.match(analysisStyles, /\.inline-glossary-root \{[^}]*position: fixed;[^}]*pointer-events: none;/);
+assert.match(analysisStyles, /\.inline-glossary-trigger \{[^}]*position: fixed;[^}]*width: 36px;[^}]*height: 36px;[^}]*border-radius: 50%;[^}]*pointer-events: auto;/);
+assert.match(analysisStyles, /\.inline-glossary-trigger svg \{[^}]*width: 18px;[^}]*height: 18px;[^}]*stroke-width: 1\.8;/);
+assert.match(analysisStyles, /\.inline-glossary-popover \{[^}]*width: min\(360px, calc\(100vw - 16px\)\);[^}]*max-height: min\(420px, 60vh\);[^}]*grid-template-rows: auto minmax\(0, 1fr\);[^}]*overflow: hidden;/);
+assert.match(analysisStyles, /\.inline-glossary-body \{[^}]*overflow-y: auto;[^}]*overscroll-behavior: contain;/);
 const keyMarkupState = {
   glossaryEntries: [],
   glossarySearch: "query",
@@ -1198,98 +2577,587 @@ async function runOptionsPageBehaviorTests() {
 
 async function runAsyncTests() {
   await runOptionsPageBehaviorTests();
-  const retryTerm = {
-    status: "duplicate",
-    conceptId: "concept-retry",
+
+  function inlineBatchResponse(candidate, entries) {
+    const normalizedEntries = Array.isArray(entries) ? entries : [];
+    return {
+      ok: true,
+      groups: normalizedEntries.length ? [{
+        candidate,
+        matchClass: normalizedEntries[0].matchClass || "exact",
+        exactMissing: !normalizedEntries.some((entryValue) => entryValue.matchClass === "exact"),
+        entries: normalizedEntries,
+      }] : [],
+      missing: normalizedEntries.length ? [] : [candidate],
+      totals: {
+        candidateCountBeforeLimit: 1,
+        candidateCountReturned: 1,
+        matchedCandidateCount: normalizedEntries.length ? 1 : 0,
+        matchedEntryCountBeforeLimit: normalizedEntries.length,
+        matchedEntryCountReturned: normalizedEntries.length,
+      },
+      truncated: { candidates: false, entries: false },
+    };
+  }
+
+  const stateCandidate = {
+    displayTerm: "State",
+    normalizedKey: "state",
+    firstIndex: 0,
+    tokenCount: 1,
+    occurrences: 1,
+    source: "token",
+    visibility: "primary",
+  };
+  const stateBatch = inlineBatchResponse(stateCandidate, [{
+    id: "sense-state",
+    senseId: "sense-state",
+    conceptId: "concept-state",
+    term: "State",
+    canonicalTerm: "State",
+    normalizedTerm: "state",
+    translation: "состояние",
+    definition: "Состояние системы.",
+    attached: true,
+    createdAt: 1,
+    updatedAt: 2,
+    matchClass: "exact",
+  }]);
+
+  const pointerGestureHarness = createInlineContentHarness();
+  const pointerSnapshot = inlineContentSnapshot("State and OpenAPI", 0);
+  pointerGestureHarness.setCapture(pointerSnapshot);
+  pointerGestureHarness.api.markInlineGestureSelectionChanged();
+  assert.equal(pointerGestureHarness.state.inlineGlossary.phase, "closed");
+  pointerGestureHarness.api.handleInlinePointerDown({
+    button: 0,
+    isPrimary: true,
+    pointerId: 7,
+    pointerType: "mouse",
+  }, []);
+  for (let index = 0; index < 20; index += 1) {
+    pointerGestureHarness.api.markInlineGestureSelectionChanged();
+  }
+  assert.equal(pointerGestureHarness.frames.size, 0);
+  pointerGestureHarness.api.handleInlinePointerUp({ pointerId: 7 });
+  assert.equal(pointerGestureHarness.frames.size, 1);
+  assert.equal(pointerGestureHarness.state.inlineGlossary.phase, "closed");
+  pointerGestureHarness.settleGesture();
+  assert.equal(pointerGestureHarness.state.inlineGlossary.phase, "offering");
+  assert.equal(
+    pointerGestureHarness.uiCalls.filter((call) => call.phase === "offering").length,
+    1,
+    "a long drag produces exactly one offer after pointerup, RAF, and the bounded task",
+  );
+
+  const staleSettleHarness = createInlineContentHarness();
+  staleSettleHarness.setCapture(inlineContentSnapshot("OldSelection", 0));
+  staleSettleHarness.api.handleInlinePointerDown({
+    button: 0,
+    isPrimary: true,
+    pointerId: 1,
+    pointerType: "mouse",
+  }, []);
+  staleSettleHarness.api.markInlineGestureSelectionChanged();
+  staleSettleHarness.api.handleInlinePointerUp({ pointerId: 1 });
+  staleSettleHarness.setCapture(inlineContentSnapshot("NewSelection", 20));
+  staleSettleHarness.api.handleInlinePointerDown({
+    button: 0,
+    isPrimary: true,
+    pointerId: 2,
+    pointerType: "mouse",
+  }, []);
+  staleSettleHarness.settleGesture();
+  assert.equal(staleSettleHarness.state.inlineGlossary.phase, "closed");
+  staleSettleHarness.api.cancelInlinePointerGesture({ pointerId: 2 });
+  staleSettleHarness.api.handleInlinePointerUp({ pointerId: 2 });
+  staleSettleHarness.settleGesture();
+  assert.equal(staleSettleHarness.state.inlineGlossary.phase, "closed");
+
+  const keyboardChordHarness = createInlineContentHarness();
+  keyboardChordHarness.setCapture(inlineContentSnapshot("GraphRAG", 0));
+  for (let cycle = 0; cycle < 2; cycle += 1) {
+    keyboardChordHarness.api.handleInlineKeyDown({
+      key: "ArrowRight",
+      shiftKey: true,
+      altKey: false,
+      composedPath() { return []; },
+    });
+    keyboardChordHarness.api.markInlineGestureSelectionChanged();
+    keyboardChordHarness.api.handleInlineKeyUp({ key: "ArrowRight", shiftKey: true });
+    keyboardChordHarness.settleGesture();
+    assert.equal(keyboardChordHarness.state.inlineGlossary.phase, "closed");
+    assert.equal(keyboardChordHarness.frames.size, 0);
+  }
+  keyboardChordHarness.api.handleInlineKeyUp({ key: "Shift", shiftKey: false });
+  assert.equal(keyboardChordHarness.frames.size, 1);
+  keyboardChordHarness.settleGesture();
+  assert.equal(keyboardChordHarness.state.inlineGlossary.phase, "offering");
+  assert.equal(
+    keyboardChordHarness.uiCalls.filter((call) => call.phase === "offering").length,
+    1,
+    "repeated selection-key cycles settle once after Shift is released",
+  );
+  keyboardChordHarness.api.handleInlineKeyDown({
+    key: "c",
+    ctrlKey: true,
+    shiftKey: false,
+    altKey: false,
+    composedPath() { return []; },
+  });
+  assert.equal(keyboardChordHarness.state.inlineGlossary.phase, "offering");
+  keyboardChordHarness.runTimers();
+  assert.equal(keyboardChordHarness.state.inlineGlossary.phase, "closed");
+  keyboardChordHarness.api.handleInlineKeyUp({ key: "ArrowRight", shiftKey: false });
+  keyboardChordHarness.settleGesture();
+  assert.equal(keyboardChordHarness.state.inlineGlossary.phase, "closed");
+
+  const shiftFirstReleaseHarness = createInlineContentHarness();
+  shiftFirstReleaseHarness.setCapture(inlineContentSnapshot("DTO", 0));
+  shiftFirstReleaseHarness.api.handleInlineKeyDown({
+    key: "ArrowLeft",
+    shiftKey: true,
+    altKey: false,
+    composedPath() { return []; },
+  });
+  shiftFirstReleaseHarness.api.markInlineGestureSelectionChanged();
+  shiftFirstReleaseHarness.api.handleInlineKeyUp({ key: "Shift", shiftKey: false });
+  assert.equal(shiftFirstReleaseHarness.frames.size, 0);
+  shiftFirstReleaseHarness.api.handleInlineKeyUp({ key: "ArrowLeft", shiftKey: false });
+  shiftFirstReleaseHarness.settleGesture();
+  assert.equal(shiftFirstReleaseHarness.state.inlineGlossary.phase, "offering");
+
+  const supportedKeyboardGestures = [
+    ...["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]
+      .map((key) => ({ key })),
+    ...["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]
+      .map((key) => ({ key, ctrlKey: true })),
+    ...["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]
+      .map((key) => ({ key, metaKey: true })),
+  ];
+  for (const keyboard of supportedKeyboardGestures) {
+    const harness = createInlineContentHarness();
+    harness.setCapture(inlineContentSnapshot(`Selected ${keyboard.key}`, 0));
+    harness.api.handleInlineKeyDown({
+      ...keyboard,
+      shiftKey: true,
+      altKey: false,
+      composedPath() { return []; },
+    });
+    harness.api.markInlineGestureSelectionChanged();
+    harness.api.handleInlineKeyUp({ key: keyboard.key });
+    harness.settleGesture();
+    assert.equal(
+      harness.state.inlineGlossary.phase,
+      "offering",
+      `supported keyboard gesture offers after keyup: ${JSON.stringify(keyboard)}`,
+    );
+  }
+  for (const keyboard of [
+    { key: "Home", ctrlKey: true },
+    { key: "End", metaKey: true },
+    { key: "PageUp", ctrlKey: true },
+    { key: "PageDown", metaKey: true },
+  ]) {
+    const harness = createInlineContentHarness();
+    harness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+    harness.api.handleInlineKeyDown({
+      ...keyboard,
+      shiftKey: true,
+      altKey: false,
+      composedPath() { return []; },
+    });
+    harness.api.handleInlineKeyUp({ key: keyboard.key });
+    harness.settleGesture();
+    assert.equal(harness.state.inlineGlossary.phase, "closed");
+    assert.equal(
+      harness.uiCalls.filter((call) => call.phase === "offering").length,
+      1,
+      `unsupported modified key cannot create a trailing offer: ${JSON.stringify(keyboard)}`,
+    );
+  }
+
+  const ordinaryKeyTrailingHarness = createInlineContentHarness();
+  ordinaryKeyTrailingHarness.setCapture(inlineContentSnapshot("State", 0));
+  ordinaryKeyTrailingHarness.api.handleInlineKeyDown({
+    key: "ArrowRight",
+    shiftKey: true,
+    altKey: false,
+    composedPath() { return []; },
+  });
+  ordinaryKeyTrailingHarness.api.markInlineGestureSelectionChanged();
+  ordinaryKeyTrailingHarness.api.handleInlineKeyDown({
+    key: "x",
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    composedPath() { return []; },
+  });
+  ordinaryKeyTrailingHarness.api.handleInlineKeyUp({ key: "ArrowRight" });
+  ordinaryKeyTrailingHarness.settleGesture();
+  assert.equal(ordinaryKeyTrailingHarness.state.inlineGlossary.phase, "closed");
+  assert.equal(
+    ordinaryKeyTrailingHarness.uiCalls.some((call) => call.phase === "offering"),
+    false,
+  );
+
+  const staleKeyboardSettleHarness = createInlineContentHarness();
+  staleKeyboardSettleHarness.setCapture(inlineContentSnapshot("State", 0));
+  staleKeyboardSettleHarness.api.handleInlineKeyDown({
+    key: "ArrowRight",
+    shiftKey: true,
+    altKey: false,
+    composedPath() { return []; },
+  });
+  staleKeyboardSettleHarness.api.markInlineGestureSelectionChanged();
+  staleKeyboardSettleHarness.api.handleInlineKeyUp({ key: "ArrowRight", shiftKey: true });
+  staleKeyboardSettleHarness.api.handleInlineKeyUp({ key: "Shift", shiftKey: false });
+  assert.equal(staleKeyboardSettleHarness.frames.size, 1);
+  staleKeyboardSettleHarness.api.closeInlineGlossaryOutsidePath(["composer"]);
+  staleKeyboardSettleHarness.settleGesture();
+  assert.equal(staleKeyboardSettleHarness.state.inlineGlossary.phase, "closed");
+  assert.equal(
+    staleKeyboardSettleHarness.uiCalls.some((call) => call.phase === "offering"),
+    false,
+    "outside close invalidates a pending keyboard settle",
+  );
+
+  for (const cancelEvent of [
+    { pointerId: 41, kind: "pointercancel" },
+    { pointerId: 42, kind: "lostpointercapture" },
+    { kind: "blur" },
+  ]) {
+    const harness = createInlineContentHarness();
+    const pointerId = cancelEvent.pointerId || 43;
+    harness.setCapture(inlineContentSnapshot("State", 0));
+    harness.api.handleInlinePointerDown({
+      button: 0,
+      isPrimary: true,
+      pointerId,
+      pointerType: "mouse",
+    }, []);
+    harness.api.markInlineGestureSelectionChanged();
+    if (cancelEvent.kind === "blur") harness.api.closeInlineGlossary();
+    else harness.api.cancelInlinePointerGesture({ pointerId });
+    harness.api.handleInlinePointerUp({ pointerId });
+    harness.settleGesture();
+    assert.equal(harness.state.inlineGlossary.phase, "closed");
+    assert.equal(
+      harness.uiCalls.some((call) => call.phase === "offering"),
+      false,
+      `${cancelEvent.kind} cancels without a trailing offer`,
+    );
+  }
+
+  for (const closeAction of [
+    (harness) => harness.api.handleWorkspaceContextChange({
+      scopeKey: "stable:chatgpt.com:changed-context",
+    }),
+    (harness) => harness.api.handleWorkspaceStatusChange({
+      status: "unavailable",
+      context: null,
+      errorCode: "RECOVERY_REQUIRED",
+      message: "Unavailable",
+    }),
+  ]) {
+    const harness = createInlineContentHarness();
+    harness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+    closeAction(harness);
+    assert.equal(harness.state.inlineGlossary.phase, "closed");
+    assert.equal(harness.state.inlineGlossary.snapshot, null);
+  }
+
+  const sameTermReselectionHarness = createInlineContentHarness();
+  const sameSnapshot = inlineContentSnapshot("State", 0);
+  sameTermReselectionHarness.setCapture(sameSnapshot);
+  for (const pointerId of [11, 12]) {
+    sameTermReselectionHarness.api.handleInlinePointerDown({
+      button: 0,
+      isPrimary: true,
+      pointerId,
+      pointerType: "mouse",
+    }, []);
+    sameTermReselectionHarness.api.markInlineGestureSelectionChanged();
+    sameTermReselectionHarness.api.handleInlinePointerUp({ pointerId });
+    sameTermReselectionHarness.settleGesture();
+    assert.equal(sameTermReselectionHarness.state.inlineGlossary.phase, "offering");
+    sameTermReselectionHarness.api.closeInlineGlossary();
+  }
+  assert.equal(
+    sameTermReselectionHarness.uiCalls.filter((call) => call.phase === "offering").length,
+    2,
+    "an intentional same-term re-selection is not suppressed",
+  );
+
+  const lookupHarness = createInlineContentHarness();
+  lookupHarness.api.showInlineOffer(inlineContentSnapshot("State and OpenAPI", 0));
+  lookupHarness.setLookupImplementation(async () => stateBatch);
+  await lookupHarness.api.activateInlineGlossary();
+  assert.equal(lookupHarness.state.inlineGlossary.phase, "showing");
+  assert.deepEqual(lookupHarness.lookupCalls, ["State and OpenAPI"]);
+  assert.equal(
+    lookupHarness.state.inlineGlossary.snapshot.conversationScope,
+    "stable:chatgpt.com:inline-content",
+  );
+  assert.equal(
+    lookupHarness.uiCalls.find((call) => call.phase === "showing").result,
+    stateBatch,
+  );
+  const invalidCandidate = { ...stateCandidate, normalizedKey: "other" };
+  assert.equal(
+    (await lookupHarness.api.analyzeInlineGlossaryCandidate(invalidCandidate)).ignored,
+    true,
+  );
+  const analyzed = await lookupHarness.api.analyzeInlineGlossaryCandidate(stateCandidate);
+  assert.equal(analyzed.ok, true);
+  assert.deepEqual(clone(lookupHarness.analysisCalls), [{
+    args: ["inline-assistant", "State", "https://chatgpt.com/c/inline-content"],
+    phaseAtStart: "closed",
+  }]);
+
+  const staleLookupHarness = createInlineContentHarness();
+  const deferredLookup = createDeferredPromise();
+  staleLookupHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  staleLookupHarness.setLookupImplementation(() => deferredLookup.promise);
+  const staleActivation = staleLookupHarness.api.activateInlineGlossary();
+  staleLookupHarness.api.closeInlineGlossary();
+  deferredLookup.resolve(stateBatch);
+  assert.equal((await staleActivation).ignored, true);
+  assert.equal(
+    staleLookupHarness.uiCalls.some((call) => call.phase === "showing"),
+    false,
+  );
+
+  const retryHarness = createInlineContentHarness();
+  retryHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  retryHarness.setLookupImplementation(async () => ({
+    ok: false,
+    error: { code: "WORKSPACE_OPERATION_FAILED", message: "Temporary failure" },
+  }));
+  await retryHarness.api.activateInlineGlossary();
+  assert.equal(retryHarness.state.inlineGlossary.phase, "error");
+  retryHarness.setLookupImplementation(async () => stateBatch);
+  await retryHarness.api.retryInlineGlossary();
+  assert.equal(retryHarness.state.inlineGlossary.phase, "showing");
+  assert.deepEqual(retryHarness.lookupCalls, ["State", "State"]);
+
+  for (const mutate of [
+    (harness) => harness.setLocationHref("https://chatgpt.com/c/next"),
+    (harness) => { harness.state.workspaceContext = null; },
+    (harness) => { harness.state.inlineGlossary.snapshot.anchorNode.isConnected = false; },
+  ]) {
+    const ownershipHarness = createInlineContentHarness();
+    ownershipHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+    mutate(ownershipHarness);
+    const response = await ownershipHarness.api.activateInlineGlossary();
+    assert.equal(response.ignored, true);
+    assert.equal(ownershipHarness.lookupCalls.length, 0);
+  }
+
+  const internalPathHarness = createInlineContentHarness();
+  internalPathHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  internalPathHarness.api.handleInlinePointerDown({
+    button: 0,
+    isPrimary: true,
+    pointerId: 9,
+    pointerType: "mouse",
+  }, ["inline-trigger"]);
+  assert.equal(internalPathHarness.state.inlineGlossary.phase, "offering");
+  assert.equal(internalPathHarness.api.closeInlineGlossaryOutsidePath(["inline-popover"]), false);
+  assert.equal(internalPathHarness.api.handleInlineFocusIn({
+    composedPath() { return ["inline-popover"]; },
+  }), false);
+  assert.equal(internalPathHarness.state.inlineGlossary.phase, "offering");
+  assert.equal(
+    internalPathHarness.api.closeInlineGlossaryOutsidePath(["inline-root"]),
+    true,
+    "the full-screen root is not an internal interaction surface",
+  );
+
+  for (const outsidePointer of [
+    { label: "same-page free space", path(harness) { return ["page"]; }, startsPotentialGesture: true },
+    { label: "composer", path(harness) { return ["composer"]; }, startsPotentialGesture: true },
+    { label: "extension sidebar", path(harness) { return [harness.state.host, "sidebar"]; }, startsPotentialGesture: false },
+  ]) {
+    const harness = createInlineContentHarness();
+    const snapshot = inlineContentSnapshot("State", 0);
+    harness.setCapture(snapshot);
+    harness.api.showInlineOffer(snapshot);
+    const offerCount = harness.uiCalls.filter((call) => call.phase === "offering").length;
+    harness.api.handleInlinePointerDown({
+      button: 0,
+      isPrimary: true,
+      pointerId: 71,
+      pointerType: "mouse",
+    }, outsidePointer.path(harness));
+    assert.equal(harness.state.inlineGlossary.phase, "closed", `${outsidePointer.label} closes`);
+    assert.equal(
+      harness.state.inlineGesture.pointerId !== null,
+      outsidePointer.startsPotentialGesture,
+      `${outsidePointer.label} pointer ownership`,
+    );
+    harness.api.handleInlinePointerUp({ pointerId: 71 });
+    harness.settleGesture();
+    assert.equal(harness.state.inlineGlossary.phase, "closed");
+    assert.equal(
+      harness.uiCalls.filter((call) => call.phase === "offering").length,
+      offerCount,
+      `${outsidePointer.label} cannot close-to-reoffer an unchanged selection`,
+    );
+  }
+
+  const externalFocusHarness = createInlineContentHarness();
+  externalFocusHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  assert.equal(externalFocusHarness.api.handleInlineFocusIn({
+    composedPath() { return ["composer"]; },
+  }), true);
+  assert.equal(externalFocusHarness.state.inlineGlossary.phase, "closed");
+
+  const copyHarness = createInlineContentHarness();
+  copyHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  let copyPrevented = false;
+  copyHarness.api.handleInlineCopy({
+    preventDefault() { copyPrevented = true; },
+  });
+  assert.equal(copyPrevented, false);
+  assert.equal(copyHarness.state.inlineGlossary.phase, "offering");
+  copyHarness.runTimers();
+  assert.equal(copyHarness.state.inlineGlossary.phase, "closed");
+
+  for (const action of ["cut", "paste", "beforeinput"]) {
+    const harness = createInlineContentHarness();
+    harness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+    assert.equal(harness.api.handleInlineExternalAction({ type: action }), true);
+    assert.equal(harness.state.inlineGlossary.phase, "closed", `${action} closes inline UI`);
+  }
+
+  const invalidationHarness = createInlineContentHarness();
+  invalidationHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  assert.equal(invalidationHarness.api.closeInlineGlossaryForInvalidation(
+    workspaceContract.ENTITY_FAMILIES.SAVED,
+  ), false);
+  assert.equal(invalidationHarness.state.inlineGlossary.phase, "offering");
+  assert.equal(invalidationHarness.api.closeInlineGlossaryForInvalidation(
+    workspaceContract.ENTITY_FAMILIES.GLOSSARY,
+  ), true);
+
+  const conflictTerm = {
+    status: "replacementAvailable",
     translation: "состояние",
     definition: "Новое определение.",
-    savedEntry: {
-      id: "target-sense",
-      conceptId: "concept-retry",
-      translation: "состояние",
-      definition: "Старое определение.",
-      updatedAt: 42,
-    },
     replacementCandidate: {
-      status: "single",
       targetSenseId: "target-sense",
-      newSenseId: "new-sense",
       expectedUpdatedAt: 42,
+      current: { translation: "состояние", definition: "Старое определение." },
+      proposed: { translation: "состояние", definition: "Новое определение." },
     },
   };
-  const replacementRequests = [];
-  const firstReplacement = await analysisUi.runReplacementAction(retryTerm, async (command) => {
-    replacementRequests.push(clone(command));
+  const conflictRequests = [];
+  const conflictOutcome = await analysisUi.runReplacementAction(conflictTerm, async (command) => {
+    conflictRequests.push(clone(command));
     return {
       ok: false,
       error: contract.makeError("GLOSSARY_ENTRY_CHANGED"),
       current: {
-        id: "target-sense-current",
-        conceptId: "concept-retry",
+        id: "current-sense",
         translation: "состояние",
         definition: "Текущее определение.",
         updatedAt: 84,
       },
     };
   });
-  assert.equal(firstReplacement.status, "stale");
-  assert.equal(replacementRequests.length, 1);
-  assert.equal(replacementRequests[0].expectedUpdatedAt, 42);
-  assert.equal(retryTerm.savedEntry.definition, "Текущее определение.");
-  assert.equal(retryTerm.replacementCandidate.targetSenseId, "target-sense-current");
-  assert.equal(retryTerm.replacementCandidate.newSenseId, "new-sense");
-  assert.equal(retryTerm.replacementCandidate.expectedUpdatedAt, 84);
-  const secondReplacement = await analysisUi.runReplacementAction(retryTerm, async (command) => {
-    replacementRequests.push(clone(command));
-    return { ok: true, entry: { id: command.entryId, definition: "Новое определение." } };
+  assert.equal(conflictOutcome.status, "replacementAvailable");
+  assert.equal(conflictTerm.status, "replacementAvailable");
+  assert.equal(conflictRequests.length, 1, "stale replacement is not retried automatically");
+  assert.deepEqual(analysisUi.replacementCommandForTerm(conflictTerm), {
+    senseId: "current-sense",
+    expectedUpdatedAt: 84,
+    replacement: {
+      translation: "состояние",
+      definition: "Новое определение.",
+    },
   });
-  assert.equal(secondReplacement.status, "replaced");
-  assert.equal(replacementRequests.length, 2);
-  assert.equal(replacementRequests[1].entryId, "target-sense-current");
-  assert.equal(replacementRequests[1].sourceSenseId, "new-sense");
-  assert.equal(replacementRequests[1].expectedUpdatedAt, 84);
-  assert.equal(retryTerm.status, "replaced");
-  assert.equal(analysisUi.replacementCommandForTerm(retryTerm), null);
-
-  for (const invalidCurrent of [
-    null,
-    {
-      id: "target-sense",
-      conceptId: "different-concept",
-      translation: "состояние",
-      definition: "Старое определение.",
-      updatedAt: 84,
-    },
-    {
-      id: "target-sense",
-      conceptId: "concept-retry",
-      translation: "состояние",
-      definition: "Новое определение.",
-      updatedAt: 84,
-    },
-  ]) {
-    const invalidTerm = {
-      status: "duplicate",
-      conceptId: "concept-retry",
-      translation: "состояние",
-      definition: "Новое определение.",
-      replacementCandidate: {
-        status: "single",
-        targetSenseId: "target-sense",
-        newSenseId: "new-sense",
-        expectedUpdatedAt: 42,
+  assert.deepEqual(conflictTerm.savedEntry, {
+    id: "current-sense",
+    translation: "состояние",
+    definition: "Текущее определение.",
+    updatedAt: 84,
+  });
+  const reconfirmedOutcome = await analysisUi.runReplacementAction(conflictTerm, async (command) => {
+    conflictRequests.push(clone(command));
+    return {
+      ok: true,
+      changed: true,
+      entry: {
+        id: "current-sense",
+        translation: "состояние",
+        definition: "Новое определение.",
+        updatedAt: 85,
       },
     };
-    let invalidRequests = 0;
-    const invalidOutcome = await analysisUi.runReplacementAction(invalidTerm, async () => {
-      invalidRequests += 1;
-      return { ok: false, error: contract.makeError("GLOSSARY_ENTRY_CHANGED"), current: invalidCurrent };
-    });
-    assert.equal(invalidOutcome.status, "invalid");
-    assert.equal(invalidRequests, 1);
-    assert.equal(invalidTerm.replacementCandidate.newSenseId, "new-sense");
-    assert.equal(analysisUi.replacementCommandForTerm(invalidTerm), null);
-  }
+  });
+  assert.equal(reconfirmedOutcome.status, "replaced");
+  assert.equal(conflictRequests.length, 2);
+  assert.equal(conflictRequests[1].senseId, "current-sense");
+  assert.equal(conflictRequests[1].expectedUpdatedAt, 84);
+
+  const alreadySavedAfterStale = {
+    status: "replacementAvailable",
+    translation: "состояние",
+    definition: "Новое определение.",
+    replacementCandidate: {
+      targetSenseId: "target-sense",
+      expectedUpdatedAt: 42,
+      current: { translation: "состояние", definition: "Старое определение." },
+      proposed: { translation: "состояние", definition: "Новое определение." },
+    },
+  };
+  const alreadySavedOutcome = await analysisUi.runReplacementAction(
+    alreadySavedAfterStale,
+    async () => ({
+      ok: false,
+      error: contract.makeError("GLOSSARY_ENTRY_CHANGED"),
+      current: {
+        id: "target-sense",
+        translation: " Состояние ",
+        definition: "Новое   определение.",
+        updatedAt: 84,
+      },
+    }),
+  );
+  assert.equal(alreadySavedOutcome.status, "alreadySaved");
+  assert.equal(alreadySavedAfterStale.status, "alreadySaved");
+  assert.equal(alreadySavedAfterStale.replacementCandidate, null);
+  assert.equal(analysisUi.replacementCommandForTerm(alreadySavedAfterStale), null);
+
+  const successfulReplacementTerm = {
+    status: "replacementAvailable",
+    translation: "состояние",
+    definition: "Новое определение.",
+    replacementCandidate: {
+      targetSenseId: "target-sense",
+      expectedUpdatedAt: 42,
+      proposed: { translation: "состояние", definition: "Новое определение." },
+    },
+  };
+  const replacementRequests = [];
+  const replacementOutcome = await analysisUi.runReplacementAction(
+    successfulReplacementTerm,
+    async (command) => {
+      replacementRequests.push(clone(command));
+      return {
+        ok: true,
+        changed: true,
+        entry: { id: "target-sense", definition: "Новое определение." },
+      };
+    },
+  );
+  assert.equal(replacementOutcome.status, "replaced");
+  assert.deepEqual(replacementRequests, [{
+    senseId: "target-sense",
+    expectedUpdatedAt: 42,
+    replacement: { translation: "состояние", definition: "Новое определение." },
+  }]);
 
   const previousChrome = globalThis.chrome;
   const previousDocument = globalThis.document;
@@ -1302,6 +3170,9 @@ async function runAsyncTests() {
       runtime: {
         async sendMessage(message) {
           controllerMessages.push(clone(message));
+          if (message.type === contract.MESSAGE_TYPES.ANALYZE_SELECTED_TERMS) {
+            return { ok: true, requestId: message.snapshot.requestId, terms: [] };
+          }
           return { ok: true, configured: true };
         },
         onMessage: { addListener(listener) { controllerRuntimeListener = listener; } },
@@ -1319,8 +3190,26 @@ async function runAsyncTests() {
       configured: "true",
     }, {}, () => {}), false);
     assert.deepEqual(receivedKeyStatuses, [true]);
+    const beforeInvalidTrigger = controllerMessages.length;
+    const invalidTriggerResponse = await controller.start(
+      "State",
+      "arbitrary-trigger",
+      "https://chatgpt.com/c/inline-controller",
+    );
+    assert.equal(invalidTriggerResponse.ok, false);
+    assert.equal(invalidTriggerResponse.error.code, "REQUEST_CONTRACT_ERROR");
+    assert.equal(controllerMessages.length, beforeInvalidTrigger);
+    const inlineControllerResponse = await controller.start(
+      "State",
+      "inline-assistant",
+      "https://chatgpt.com/c/inline-controller",
+    );
+    assert.equal(inlineControllerResponse.ok, true);
+    assert.equal(controllerMessages[0].type, contract.MESSAGE_TYPES.ANALYZE_SELECTED_TERMS);
+    assert.equal(controllerMessages[0].snapshot.trigger, "inline-assistant");
+    assert.equal(controllerMessages[0].snapshot.text, "State");
     assert.equal(await controller.getKeyStatus(), true);
-    assert.deepEqual(controllerMessages, [{ type: contract.MESSAGE_TYPES.GET_KEY_STATUS }]);
+    assert.deepEqual(controllerMessages.at(-1), { type: contract.MESSAGE_TYPES.GET_KEY_STATUS });
   } finally {
     if (previousChrome === undefined) delete globalThis.chrome;
     else globalThis.chrome = previousChrome;
@@ -1418,6 +3307,59 @@ async function runAsyncTests() {
   assert.equal(futureSchemaMigration.storage.glossarySchemaVersion, 7);
   assert.deepEqual(futureSchemaMigration.storage.glossaryEntries, futureGlossary);
 
+  const conflictingMigrationStorage = validStorage({
+    glossarySchemaVersion: 1,
+    glossaryEntries: [
+      {
+        id: "legacy-conflict-a",
+        term: "WorkflowOrchestrator",
+        translation: "оркестратор",
+        definition: "Первая версия.",
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      {
+        id: "legacy-conflict-b",
+        term: "workflow orchestrator",
+        translation: "оркестратор",
+        definition: "Первая версия.",
+        createdAt: 3,
+        updatedAt: 4,
+      },
+    ],
+  });
+  const conflictingMigrationHarness = createServiceWorkerHarness(conflictingMigrationStorage);
+  await assert.rejects(
+    conflictingMigrationHarness.waitForMigration(),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+  assert.deepEqual(conflictingMigrationHarness.setCalls, []);
+  assert.deepEqual(
+    conflictingMigrationHarness.storage.glossaryEntries,
+    conflictingMigrationStorage.glossaryEntries,
+  );
+  assert.equal(
+    conflictingMigrationHarness.storage.glossarySchemaVersion,
+    conflictingMigrationStorage.glossarySchemaVersion,
+  );
+  assert.equal(conflictingMigrationHarness.memoryWorkspace.snapshot().glossaryConcepts.length, 0);
+  assert.equal(conflictingMigrationHarness.memoryWorkspace.snapshot().glossarySenses.length, 0);
+  assert.equal(
+    await conflictingMigrationHarness.memoryWorkspace.getMetaValue("v1GlossaryMigrationState"),
+    null,
+  );
+  assert.equal(conflictingMigrationHarness.workspaceInitializeCalls(), 0);
+  assert.equal(conflictingMigrationHarness.evaluate("workspaceRecoveryRequired"), true);
+  const conflictingMigrationBlocked = await conflictingMigrationHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.GET_CONTEXT,
+    pageUrl: "https://chatgpt.com/c/migration-conflict",
+  }, {
+    tab: { id: 303, url: "https://chatgpt.com/c/migration-conflict" },
+    url: "https://chatgpt.com/c/migration-conflict",
+  });
+  assert.equal(conflictingMigrationBlocked.ok, false);
+  assert.equal(conflictingMigrationBlocked.error.code, "RECOVERY_REQUIRED");
+
   assert.equal(noOpMigration.evaluate(
     'isSupportedAnalysisPageTransition("https://chatgpt.com/c/first", "https://chatgpt.com/c/second")',
   ), true);
@@ -1510,6 +3452,79 @@ async function runAsyncTests() {
   await lockedImportHarness.waitForMigration();
   lockedImportHarness.sessionStorage["chatgpt-helper:import-lock"] = { operationId: "other", expiresAt: Date.now() + 60_000 };
   assert.equal((await lockedImportHarness.handleMessage(mergeDataMessage, optionsSender)).error.code, "IMPORT_LOCKED");
+
+  const conflictingImportHarness = createServiceWorkerHarness(validStorage(), {
+    tabs: [{ id: 304, url: "https://chatgpt.com/c/import-conflict" }],
+  });
+  await conflictingImportHarness.waitForMigration();
+  const conflictingImportSender = {
+    tab: { id: 304, url: "https://chatgpt.com/c/import-conflict" },
+    url: "https://chatgpt.com/c/import-conflict",
+  };
+  const conflictingImportContext = await conflictingImportHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.GET_CONTEXT,
+    pageUrl: conflictingImportSender.url,
+  }, conflictingImportSender);
+  await conflictingImportHarness.memoryWorkspace.addAnalysisTerms([{
+    term: "State",
+    translation: "состояние",
+    definition: "Сохранённая версия.",
+  }], conflictingImportContext.context.scopeKey);
+  const conflictingImportText = importExport.createDataExport({
+    templates: [],
+    conversations: [],
+    glossaryConcepts: [{
+      id: "import-conflict-concept",
+      displayTerm: "state",
+      createdAt: 1,
+      updatedAt: 2,
+    }],
+    glossarySenses: [{
+      id: "import-conflict-sense",
+      conceptId: "import-conflict-concept",
+      translation: "состояние",
+      definition: "Другая версия.",
+      createdAt: 1,
+      updatedAt: 2,
+    }],
+    glossaryLinks: [],
+    savedItems: [],
+    savedItemLinks: [],
+  }, {
+    datasetId: "10000000-2000-4000-8000-000000000001",
+    exportedAt: "2026-07-25T12:00:00.000Z",
+  }).text;
+  let conflictingImportBackupCalls = 0;
+  const originalConflictingPutBackup = conflictingImportHarness.memoryWorkspace
+    .putImportBackup.bind(conflictingImportHarness.memoryWorkspace);
+  conflictingImportHarness.memoryWorkspace.putImportBackup = async (...args) => {
+    conflictingImportBackupCalls += 1;
+    return originalConflictingPutBackup(...args);
+  };
+  const conflictingImportBefore = conflictingImportHarness.memoryWorkspace.snapshot();
+  const conflictingImportSetCalls = conflictingImportHarness.setCalls.length;
+  const conflictingImportMessages = conflictingImportHarness.tabMessages.length;
+  for (const type of [
+    workspaceContract.MESSAGE_TYPES.IMPORT_DATA_PREVIEW,
+    workspaceContract.MESSAGE_TYPES.IMPORT_DATA_APPLY,
+  ]) {
+    const response = await conflictingImportHarness.handleMessage({
+      type,
+      text: conflictingImportText,
+      mode: "merge",
+    }, optionsSender);
+    assert.equal(response.ok, false);
+    assert.equal(response.error.code, "GLOSSARY_IMPORT_CONFLICT");
+  }
+  assert.equal(conflictingImportBackupCalls, 0);
+  assert.equal(
+    await conflictingImportHarness.memoryWorkspace.getMetaValue("dataImportOperation"),
+    null,
+  );
+  assert.equal(await conflictingImportHarness.memoryWorkspace.getImportBackup("data"), null);
+  assert.deepEqual(conflictingImportHarness.memoryWorkspace.snapshot(), conflictingImportBefore);
+  assert.equal(conflictingImportHarness.setCalls.length, conflictingImportSetCalls);
+  assert.equal(conflictingImportHarness.tabMessages.length, conflictingImportMessages);
 
   async function assertExclusiveImport(firstMessage, secondMessage) {
     const harness = createServiceWorkerHarness(validStorage());
@@ -1954,7 +3969,7 @@ async function runAsyncTests() {
   assert.deepEqual(barrierHarness.storage.settings, beforeBarrierStorage.settings);
   pausedMerge.release();
   const rolledBackBarrier = await applyingWithBarrier;
-  assert.equal(rolledBackBarrier.rolledBack, true);
+  assert.equal(rolledBackBarrier.rolledBack, true, JSON.stringify(rolledBackBarrier));
   assert.deepEqual(await barrierHarness.memoryWorkspace.snapshotUserData(), beforeBarrierWorkspace);
   assert.deepEqual(barrierHarness.storage.templates, beforeBarrierStorage.templates);
   assert.deepEqual(barrierHarness.storage.settings, beforeBarrierStorage.settings);
@@ -2251,6 +4266,66 @@ async function runAsyncTests() {
   await assert.rejects(templateRollbackFailureHarness.recoverPendingImports(), /rollback template failure/);
   assert.notEqual(await templateRollbackFailureHarness.memoryWorkspace.getMetaValue("dataImportOperation"), null);
 
+  const invalidBackupHarness = createServiceWorkerHarness(validStorage(), {
+    tabs: [{ id: 315, url: "https://chatgpt.com/c/invalid-backup" }],
+  });
+  await invalidBackupHarness.waitForMigration();
+  const invalidBackupSender = {
+    tab: { id: 315, url: "https://chatgpt.com/c/invalid-backup" },
+    url: "https://chatgpt.com/c/invalid-backup",
+  };
+  await invalidBackupHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.GET_CONTEXT,
+    pageUrl: invalidBackupSender.url,
+  }, invalidBackupSender);
+  const invalidBackupActiveData = await invalidBackupHarness.memoryWorkspace.snapshotUserData();
+  const invalidBackupPayload = clone(invalidBackupActiveData);
+  invalidBackupPayload.glossaryLinks.push({
+    id: "invalid-backup-link",
+    senseId: "missing-backup-sense",
+    conversationId: invalidBackupPayload.conversations[0].id,
+    linkKey: `missing-backup-sense\u001f${invalidBackupPayload.conversations[0].id}`,
+    localOrder: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 1,
+  });
+  await invalidBackupHarness.memoryWorkspace.putImportBackup("data", {
+    templates: clone(invalidBackupHarness.storage.templates),
+    recentTemplateIds: clone(invalidBackupHarness.storage.recentTemplateIds),
+    workspace: invalidBackupPayload,
+  });
+  await invalidBackupHarness.memoryWorkspace.setMetaValue("dataImportOperation", {
+    operationId: "invalid-historical-backup",
+    kind: "data",
+    mode: "replace",
+    phase: "workspace-applied",
+    startedAt: 1,
+  });
+  const invalidBackupStorageBefore = clone(invalidBackupHarness.storage);
+  const invalidBackupMessagesBefore = invalidBackupHarness.tabMessages.length;
+  await assert.rejects(
+    invalidBackupHarness.recoverPendingImports(),
+    /DATA_BACKUP_INVALID/,
+  );
+  assert.deepEqual(
+    await invalidBackupHarness.memoryWorkspace.snapshotUserData(),
+    invalidBackupActiveData,
+  );
+  assert.deepEqual(invalidBackupHarness.storage, invalidBackupStorageBefore);
+  assert.notEqual(
+    await invalidBackupHarness.memoryWorkspace.getMetaValue("dataImportOperation"),
+    null,
+  );
+  assert.notEqual(await invalidBackupHarness.memoryWorkspace.getImportBackup("data"), null);
+  assert.equal(invalidBackupHarness.evaluate("workspaceRecoveryRequired"), true);
+  const invalidBackupBlocked = await invalidBackupHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.GET_CONTEXT,
+    pageUrl: invalidBackupSender.url,
+  }, invalidBackupSender);
+  assert.equal(invalidBackupBlocked.ok, false);
+  assert.equal(invalidBackupBlocked.error.code, "RECOVERY_REQUIRED");
+  assert.equal(invalidBackupHarness.tabMessages.length, invalidBackupMessagesBefore);
+
   const successfulDataApplyHarness = createServiceWorkerHarness(validStorage(), {
     tabs: [{ id: 32, url: "https://chatgpt.com/c/import-broadcast" }],
   });
@@ -2527,6 +4602,189 @@ async function runAsyncTests() {
   assert.equal(missingKeyAfterContextFailure.analysisTermWriteCalls(), 0);
   assert.equal(missingKeyAfterContextFailure.evaluate("activeRequests.size"), 0);
 
+  let inlineWorkerProviderCalls = 0;
+  const inlineLookupHarness = createServiceWorkerHarness(validStorage(), {
+    keyConfigured: true,
+    openRouterClient: {
+      async analyze() {
+        inlineWorkerProviderCalls += 1;
+        return { ok: true, terms: [] };
+      },
+    },
+  });
+  const inlineWorkerSender = {
+    tab: { id: 59, url: "https://chatgpt.com/c/inline-worker" },
+    url: "https://chatgpt.com/c/inline-worker",
+  };
+  const inlineWorkerContext = await inlineLookupHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.GET_CONTEXT,
+    pageUrl: inlineWorkerSender.tab.url,
+  }, inlineWorkerSender);
+  assert.equal(inlineWorkerContext.ok, true);
+  const inlineWorkerTerms = Array.from({ length: 22 }, (_, index) => ({
+    term: `State component ${String(index).padStart(2, "0")}`,
+    translation: `значение ${String(index).padStart(2, "0")}`,
+    definition: `Связанное значение ${String(index).padStart(2, "0")}.`,
+  }));
+  await inlineLookupHarness.memoryWorkspace.addAnalysisTerms(
+    inlineWorkerTerms,
+    inlineWorkerContext.context.scopeKey,
+  );
+  const inlineWorkerStateBeforeLookup = inlineLookupHarness.memoryWorkspace.snapshot();
+  const inlineWorkerSessionBeforeLookup = clone(inlineLookupHarness.sessionStorage);
+  const inlineWorkerSetCallsBeforeLookup = inlineLookupHarness.setCalls.length;
+  const inlineWorkerRemoveCallsBeforeLookup = inlineLookupHarness.removeCalls.length;
+  const inlineWorkerTabMessagesBeforeLookup = inlineLookupHarness.tabMessages.length;
+  const inlineWorkerAnalysisWritesBeforeLookup = inlineLookupHarness.analysisTermWriteCalls();
+  const inlineWorkerGlossaryRevisionBeforeLookup = await inlineLookupHarness.memoryWorkspace
+    .getMetaValue(`revision:${workspaceContract.ENTITY_FAMILIES.GLOSSARY}`);
+  const pausedInlineWorkerLookup = inlineLookupHarness.pauseWorkspaceMethod("lookupGlossarySelection");
+  const inlineWorkerLookupPromise = inlineLookupHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
+    conversationScope: inlineWorkerContext.context.scopeKey,
+    text: "State / UnknownTerm",
+  }, inlineWorkerSender);
+  await pausedInlineWorkerLookup.entered;
+  assert.equal(pausedInlineWorkerLookup.calls(), 1);
+  assert.equal(inlineLookupHarness.evaluate("activeUserMutations.size"), 0);
+  assert.equal(inlineLookupHarness.evaluate("pendingLocalMutations"), 0);
+  assert.equal(inlineLookupHarness.evaluate("activeImport"), null);
+  assert.equal(inlineLookupHarness.evaluate("activeRequests.size"), 0);
+  pausedInlineWorkerLookup.release();
+  const inlineWorkerLookup = await inlineWorkerLookupPromise;
+  assert.equal(inlineWorkerLookup.ok, true);
+  assert.equal(inlineWorkerLookup.groups.length, 1);
+  assert.equal(inlineWorkerLookup.groups[0].entries.length, 22);
+  assert.equal(
+    inlineWorkerLookup.groups[0].entries.every((item) => item.matchClass === "contiguous"),
+    true,
+  );
+  assert.ok(inlineWorkerLookup.missing.some((candidate) => (
+    candidate.normalizedKey === "unknown term"
+  )));
+  assert.equal(inlineWorkerProviderCalls, 0);
+  assert.equal(inlineLookupHarness.setCalls.length, inlineWorkerSetCallsBeforeLookup);
+  assert.equal(inlineLookupHarness.removeCalls.length, inlineWorkerRemoveCallsBeforeLookup);
+  assert.equal(inlineLookupHarness.tabMessages.length, inlineWorkerTabMessagesBeforeLookup);
+  assert.equal(inlineLookupHarness.analysisTermWriteCalls(), inlineWorkerAnalysisWritesBeforeLookup);
+  assert.equal(inlineLookupHarness.evaluate("activeUserMutations.size"), 0);
+  assert.deepEqual(inlineLookupHarness.sessionStorage, inlineWorkerSessionBeforeLookup);
+  assert.deepEqual(inlineLookupHarness.memoryWorkspace.snapshot(), inlineWorkerStateBeforeLookup);
+  assert.equal(
+    await inlineLookupHarness.memoryWorkspace
+      .getMetaValue(`revision:${workspaceContract.ENTITY_FAMILIES.GLOSSARY}`),
+    inlineWorkerGlossaryRevisionBeforeLookup,
+  );
+  const inlineUnknownLookup = await inlineLookupHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
+    conversationScope: inlineWorkerContext.context.scopeKey,
+    text: "UnknownTerm",
+  }, inlineWorkerSender);
+  assert.equal(inlineUnknownLookup.ok, true);
+  assert.equal(inlineUnknownLookup.groups.length, 0);
+  assert.equal(inlineUnknownLookup.missing[0].normalizedKey, "unknown term");
+  const inlineInvalidTermLookup = await inlineLookupHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
+    conversationScope: inlineWorkerContext.context.scopeKey,
+    text: "",
+  }, inlineWorkerSender);
+  assert.equal(inlineInvalidTermLookup.ok, false);
+  assert.equal(inlineInvalidTermLookup.error.code, "INVALID_GLOSSARY_SELECTION");
+  const inlineForeignScopeLookup = await inlineLookupHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
+    conversationScope: "stable:chatgpt.com:another-conversation",
+    text: "State",
+  }, inlineWorkerSender);
+  assert.equal(inlineForeignScopeLookup.ok, false);
+  assert.equal(inlineForeignScopeLookup.error.code, "INVALID_CONVERSATION_SCOPE");
+  assert.equal(inlineWorkerProviderCalls, 0);
+
+  const rejectedWorkerTrigger = await inlineLookupHarness.handleMessage({
+    type: contract.MESSAGE_TYPES.ANALYZE_SELECTED_TERMS,
+    snapshot: {
+      requestId: "analysis-inline-rejected-01",
+      trigger: "arbitrary-trigger",
+      text: "State",
+      pageUrl: inlineWorkerSender.tab.url,
+      createdAt: 1,
+    },
+  }, inlineWorkerSender);
+  assert.equal(rejectedWorkerTrigger.ok, false);
+  assert.equal(inlineWorkerProviderCalls, 0);
+  const acceptedWorkerTrigger = await inlineLookupHarness.handleMessage({
+    type: contract.MESSAGE_TYPES.ANALYZE_SELECTED_TERMS,
+    snapshot: {
+      requestId: "analysis-inline-accepted-01",
+      trigger: "inline-assistant",
+      text: "State",
+      pageUrl: inlineWorkerSender.tab.url,
+      createdAt: 2,
+    },
+  }, inlineWorkerSender);
+  assert.equal(acceptedWorkerTrigger.ok, true);
+  assert.equal(acceptedWorkerTrigger.requestId, "analysis-inline-accepted-01");
+  assert.equal(inlineWorkerProviderCalls, 1);
+
+  const invariantAnalysisHarness = createServiceWorkerHarness(validStorage(), {
+    keyConfigured: true,
+    analysisWriteError: new Error("GLOSSARY_INVARIANT_VIOLATION"),
+    openRouterClient: {
+      async analyze() {
+        return {
+          ok: true,
+          terms: [{
+            term: "State",
+            translation: "состояние",
+            definition: "Определение.",
+          }],
+        };
+      },
+    },
+    tabs: [{ id: 64, url: "https://chatgpt.com/c/analysis-invariant" }],
+  });
+  const invariantAnalysisSender = {
+    tab: { id: 64, url: "https://chatgpt.com/c/analysis-invariant" },
+    url: "https://chatgpt.com/c/analysis-invariant",
+  };
+  await invariantAnalysisHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.GET_CONTEXT,
+    pageUrl: invariantAnalysisSender.url,
+  }, invariantAnalysisSender);
+  const invariantAnalysisBefore = invariantAnalysisHarness.memoryWorkspace.snapshot();
+  const invariantAnalysisGlossaryBefore = {
+    concepts: clone(invariantAnalysisBefore.glossaryConcepts),
+    senses: clone(invariantAnalysisBefore.glossarySenses),
+    links: clone(invariantAnalysisBefore.glossaryLinks),
+    revision: clone(invariantAnalysisBefore.meta.find(
+      (item) => item.key === `revision:${workspaceContract.ENTITY_FAMILIES.GLOSSARY}`,
+    )?.value),
+  };
+  const invariantAnalysisMessagesBefore = invariantAnalysisHarness.tabMessages.length;
+  const invariantAnalysisResponse = await invariantAnalysisHarness.handleMessage({
+    type: contract.MESSAGE_TYPES.ANALYZE_SELECTED_TERMS,
+    snapshot: {
+      requestId: "analysis-invariant-01",
+      trigger: "inline-assistant",
+      text: "State",
+      pageUrl: invariantAnalysisSender.url,
+      createdAt: 1,
+    },
+  }, invariantAnalysisSender);
+  assert.equal(invariantAnalysisResponse.ok, false);
+  assert.equal(invariantAnalysisResponse.requestId, "analysis-invariant-01");
+  assert.equal(invariantAnalysisResponse.error.code, "GLOSSARY_INVARIANT_VIOLATION");
+  assert.equal(invariantAnalysisHarness.analysisTermWriteCalls(), 1);
+  const invariantAnalysisAfter = invariantAnalysisHarness.memoryWorkspace.snapshot();
+  assert.deepEqual({
+    concepts: invariantAnalysisAfter.glossaryConcepts,
+    senses: invariantAnalysisAfter.glossarySenses,
+    links: invariantAnalysisAfter.glossaryLinks,
+    revision: invariantAnalysisAfter.meta.find(
+      (item) => item.key === `revision:${workspaceContract.ENTITY_FAMILIES.GLOSSARY}`,
+    )?.value,
+  }, invariantAnalysisGlossaryBefore);
+  assert.equal(invariantAnalysisHarness.tabMessages.length, invariantAnalysisMessagesBefore);
+
   const workspaceHarness = createServiceWorkerHarness(validStorage(), {
     tabs: [
       { id: 61, url: "https://chatgpt.com/c/workspace-one" },
@@ -2663,15 +4921,21 @@ async function runAsyncTests() {
     translation: "состояние",
     definition: "Исправленное определение.",
   }], replacementContext.context.scopeKey);
+  assert.equal(candidateSense.results[0].status, "replacementAvailable");
+  const replacementStateBefore = replacementHarness.memoryWorkspace.snapshot();
+  assert.equal(replacementStateBefore.glossarySenses.length, 1);
   const replacementCommand = {
     senseId: originalSense.results[0].id,
-    sourceSenseId: candidateSense.results[0].id,
     expectedUpdatedAt: candidateSense.results[0].replacementCandidate.expectedUpdatedAt,
+    replacement: candidateSense.results[0].replacementCandidate.proposed,
   };
   const missingExpectedAt = await replacementHarness.handleMessage({
     type: workspaceContract.MESSAGE_TYPES.REPLACE_GLOSSARY_SENSE,
     conversationScope: replacementContext.context.scopeKey,
-    command: { senseId: replacementCommand.senseId, sourceSenseId: replacementCommand.sourceSenseId },
+    command: {
+      senseId: replacementCommand.senseId,
+      replacement: replacementCommand.replacement,
+    },
   }, replacementSender);
   assert.equal(missingExpectedAt.ok, false);
   assert.equal(missingExpectedAt.error.code, "REQUEST_CONTRACT_ERROR");
@@ -2682,6 +4946,14 @@ async function runAsyncTests() {
   }, replacementSender);
   assert.equal(malformedExpectedAt.ok, false);
   assert.equal(malformedExpectedAt.error.code, "REQUEST_CONTRACT_ERROR");
+  const obsoleteSourceSense = await replacementHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.REPLACE_GLOSSARY_SENSE,
+    conversationScope: replacementContext.context.scopeKey,
+    command: { ...replacementCommand, sourceSenseId: "obsolete-source-sense" },
+  }, replacementSender);
+  assert.equal(obsoleteSourceSense.ok, false);
+  assert.equal(obsoleteSourceSense.error.code, "REQUEST_CONTRACT_ERROR");
+  assert.deepEqual(replacementHarness.memoryWorkspace.snapshot(), replacementStateBefore);
   const staleReplacement = await replacementHarness.handleMessage({
     type: workspaceContract.MESSAGE_TYPES.REPLACE_GLOSSARY_SENSE,
     conversationScope: replacementContext.context.scopeKey,
@@ -2690,15 +4962,34 @@ async function runAsyncTests() {
   assert.equal(staleReplacement.ok, false);
   assert.equal(staleReplacement.error.code, "GLOSSARY_ENTRY_CHANGED");
   assert.equal(staleReplacement.current.id, replacementCommand.senseId);
-  assert.equal(replacementHarness.memoryWorkspace.snapshot().glossarySenses.length, 2);
+  assert.equal(replacementHarness.memoryWorkspace.snapshot().glossarySenses.length, 1);
   const currentReplacement = await replacementHarness.handleMessage({
     type: workspaceContract.MESSAGE_TYPES.REPLACE_GLOSSARY_SENSE,
     conversationScope: replacementContext.context.scopeKey,
     command: replacementCommand,
   }, replacementSender);
   assert.equal(currentReplacement.ok, true);
+  assert.equal(currentReplacement.changed, true);
   assert.equal(currentReplacement.entry.id, replacementCommand.senseId);
-  assert.equal(replacementHarness.memoryWorkspace.snapshot().glossarySenses.length, 1);
+  const replacementStateAfter = replacementHarness.memoryWorkspace.snapshot();
+  assert.equal(replacementStateAfter.glossarySenses.length, 1);
+  assert.equal(
+    replacementStateAfter.glossarySenses[0].createdAt,
+    replacementStateBefore.glossarySenses[0].createdAt,
+  );
+  assert.deepEqual(replacementStateAfter.glossaryLinks, replacementStateBefore.glossaryLinks);
+  const broadcastCountAfterReplacement = replacementHarness.tabMessages.length;
+  const idempotentWorkerReplacement = await replacementHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.REPLACE_GLOSSARY_SENSE,
+    conversationScope: replacementContext.context.scopeKey,
+    command: {
+      ...replacementCommand,
+      expectedUpdatedAt: currentReplacement.entry.updatedAt,
+    },
+  }, replacementSender);
+  assert.equal(idempotentWorkerReplacement.ok, true);
+  assert.equal(idempotentWorkerReplacement.changed, false);
+  assert.equal(replacementHarness.tabMessages.length, broadcastCountAfterReplacement);
 
   const commandHarness = createServiceWorkerHarness(validStorage(), {
     tabs: [{ id: 82, url: "https://chatgpt.com/c/active-fallback" }],

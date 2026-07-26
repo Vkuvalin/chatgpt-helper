@@ -5,6 +5,9 @@
   const contract = root.ChatGPTHelperAnalysisContract;
   const workspaceContract = root.ChatGPTHelperWorkspaceContract;
   const DIALOG_HEADING_ID = "chatgpt-helper-analysis-dialog-title";
+  const INLINE_POPOVER_ID = "chatgpt-helper-inline-glossary-popover";
+  const INLINE_VIEWPORT_MARGIN = 8;
+  const INLINE_ANCHOR_GAP = 6;
   const FOCUSABLE_SELECTOR = [
     "a[href]", "button:not([disabled])", "input:not([disabled])", "select:not([disabled])",
     "textarea:not([disabled])", "[tabindex]:not([tabindex='-1'])", "[contenteditable='true']",
@@ -45,6 +48,136 @@
     return `${baseClass} size-${size}`;
   }
 
+  function normalizeInlineGlossaryEntries(value) {
+    if (!Array.isArray(value)) return [];
+    return value.flatMap((entry) => {
+      if (!entry || typeof entry !== "object"
+        || typeof entry.id !== "string" || !entry.id
+        || typeof entry.term !== "string"
+        || typeof entry.translation !== "string"
+        || typeof entry.definition !== "string") return [];
+      return [{
+        id: entry.id,
+        senseId: typeof entry.senseId === "string" ? entry.senseId : entry.id,
+        conceptId: typeof entry.conceptId === "string" ? entry.conceptId : "",
+        term: entry.term,
+        canonicalTerm: typeof entry.canonicalTerm === "string" ? entry.canonicalTerm : entry.term,
+        normalizedTerm: typeof entry.normalizedTerm === "string" ? entry.normalizedTerm : "",
+        translation: entry.translation,
+        definition: entry.definition,
+        matchClass: ["exact", "contiguous", "full-token"].includes(entry.matchClass)
+          ? entry.matchClass
+          : "exact",
+        attached: entry.attached === true,
+        createdAt: Number(entry.createdAt) || 0,
+        updatedAt: Number(entry.updatedAt) || 0,
+      }];
+    });
+  }
+
+  function normalizeInlineCandidate(value) {
+    if (!value || typeof value !== "object"
+      || typeof value.displayTerm !== "string" || !value.displayTerm.trim()
+      || typeof value.normalizedKey !== "string" || !value.normalizedKey) return null;
+    return {
+      displayTerm: value.displayTerm.trim(),
+      normalizedKey: value.normalizedKey,
+      firstIndex: Number.isInteger(value.firstIndex) ? value.firstIndex : 0,
+      tokenCount: Number.isInteger(value.tokenCount) ? value.tokenCount : 1,
+      occurrences: Number.isInteger(value.occurrences) ? value.occurrences : 1,
+      source: typeof value.source === "string" ? value.source : "token",
+      visibility: value.visibility === "primary" ? "primary" : "lookup-only",
+    };
+  }
+
+  function normalizeInlineGlossaryResult(value) {
+    const result = value && typeof value === "object" ? value : {};
+    const groups = (Array.isArray(result.groups) ? result.groups : []).flatMap((group) => {
+      const candidate = normalizeInlineCandidate(group?.candidate);
+      const entries = normalizeInlineGlossaryEntries(group?.entries);
+      if (!candidate || !entries.length) return [];
+      return [{
+        candidate,
+        matchClass: ["exact", "contiguous", "full-token"].includes(group.matchClass)
+          ? group.matchClass
+          : entries[0].matchClass,
+        exactMissing: group.exactMissing === true,
+        entries,
+      }];
+    });
+    const missing = (Array.isArray(result.missing) ? result.missing : [])
+      .map(normalizeInlineCandidate)
+      .filter(Boolean);
+    const totals = result.totals && typeof result.totals === "object" ? result.totals : {};
+    return {
+      groups,
+      missing,
+      totals: {
+        candidateCountBeforeLimit: Math.max(
+          groups.length + missing.length,
+          Number(totals.candidateCountBeforeLimit) || 0,
+        ),
+        candidateCountReturned: Math.max(
+          groups.length + missing.length,
+          Number(totals.candidateCountReturned) || 0,
+        ),
+        matchedCandidateCount: Math.max(groups.length, Number(totals.matchedCandidateCount) || 0),
+        matchedEntryCountBeforeLimit: Math.max(
+          groups.reduce((sum, group) => sum + group.entries.length, 0),
+          Number(totals.matchedEntryCountBeforeLimit) || 0,
+        ),
+        matchedEntryCountReturned: groups.reduce(
+          (sum, group) => sum + group.entries.length,
+          0,
+        ),
+      },
+      truncated: {
+        candidates: result.truncated?.candidates === true,
+        entries: result.truncated?.entries === true,
+      },
+    };
+  }
+
+  function clampInlineCoordinate(value, minimum, maximum) {
+    return Math.min(Math.max(value, minimum), Math.max(minimum, maximum));
+  }
+
+  function inlinePopoverPosition(anchorRectValue, surfaceSizeValue, viewportValue) {
+    const anchorRect = anchorRectValue || {};
+    const surfaceSize = surfaceSizeValue || {};
+    const viewport = viewportValue || {};
+    const viewportWidth = Math.max(0, Number(viewport.width) || 0);
+    const viewportHeight = Math.max(0, Number(viewport.height) || 0);
+    const preferredWidth = Math.max(0, Number(surfaceSize.width) || 360);
+    const width = Math.max(0, Math.min(preferredWidth, viewportWidth - (INLINE_VIEWPORT_MARGIN * 2)));
+    const maxHeight = Math.max(0, Math.min(420, viewportHeight * 0.6));
+    const height = Math.max(0, Math.min(Number(surfaceSize.height) || 0, maxHeight));
+    const left = clampInlineCoordinate(
+      Number(anchorRect.left) || 0,
+      INLINE_VIEWPORT_MARGIN,
+      viewportWidth - INLINE_VIEWPORT_MARGIN - width,
+    );
+    const below = (Number(anchorRect.bottom) || 0) + INLINE_ANCHOR_GAP;
+    const above = (Number(anchorRect.top) || 0) - INLINE_ANCHOR_GAP - height;
+    let top;
+    let placement;
+    if (below + height <= viewportHeight - INLINE_VIEWPORT_MARGIN) {
+      top = below;
+      placement = "below";
+    } else if (above >= INLINE_VIEWPORT_MARGIN) {
+      top = above;
+      placement = "above";
+    } else {
+      top = clampInlineCoordinate(
+        below,
+        INLINE_VIEWPORT_MARGIN,
+        viewportHeight - INLINE_VIEWPORT_MARGIN - height,
+      );
+      placement = "clamped";
+    }
+    return Object.freeze({ left, top, width, maxHeight, placement });
+  }
+
   function nextFocusableIndex(currentIndex, count, backwards) {
     if (!Number.isInteger(count) || count <= 0) return -1;
     if (!Number.isInteger(currentIndex) || currentIndex < 0 || currentIndex >= count) {
@@ -55,58 +188,74 @@
 
   function replacementCommandForTerm(term) {
     const candidate = term?.replacementCandidate;
-    if (term?.status !== "duplicate" || candidate?.status !== "single"
+    const proposed = candidate?.proposed || {
+      translation: term?.translation,
+      definition: term?.definition,
+    };
+    if (term?.status !== "replacementAvailable"
       || typeof candidate.targetSenseId !== "string" || !candidate.targetSenseId
-      || typeof candidate.newSenseId !== "string" || !candidate.newSenseId
-      || !Number.isFinite(candidate.expectedUpdatedAt)) return null;
+      || !Number.isFinite(candidate.expectedUpdatedAt)
+      || typeof proposed.translation !== "string" || !proposed.translation.trim()
+      || typeof proposed.definition !== "string" || !proposed.definition.trim()) return null;
     return Object.freeze({
-      entryId: candidate.targetSenseId,
-      sourceSenseId: candidate.newSenseId,
+      senseId: candidate.targetSenseId,
       expectedUpdatedAt: candidate.expectedUpdatedAt,
+      replacement: Object.freeze({
+        translation: proposed.translation,
+        definition: proposed.definition,
+      }),
     });
   }
 
-  function comparableReplacementText(value) {
-    return String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
+  function normalizedReplacementContent(value) {
+    const translation = workspaceContract?.normalizeMeaning?.(value?.translation, 200);
+    const definition = workspaceContract?.normalizeMeaning?.(value?.definition, 500);
+    if (!translation || !definition) return null;
+    return {
+      translation: translation.toLocaleLowerCase("ru-RU"),
+      definition: definition.toLocaleLowerCase("ru-RU"),
+    };
   }
 
   function refreshReplacementCandidate(term, current) {
-    const candidate = term?.replacementCandidate;
-    const sourceSenseId = candidate?.newSenseId;
-    const targetSenseId = current?.senseId || current?.id;
-    const currentTranslation = comparableReplacementText(current?.translation);
-    const sourceTranslation = comparableReplacementText(term?.translation);
-    const currentDefinition = comparableReplacementText(current?.definition);
-    const sourceDefinition = comparableReplacementText(term?.definition);
-    const compatibleConcept = !term?.conceptId || !current?.conceptId || term.conceptId === current.conceptId;
-    const valid = candidate?.status === "single"
-      && typeof sourceSenseId === "string" && Boolean(sourceSenseId)
-      && typeof targetSenseId === "string" && Boolean(targetSenseId)
-      && targetSenseId !== sourceSenseId
-      && Number.isFinite(current?.updatedAt)
-      && compatibleConcept
-      && Boolean(currentTranslation) && currentTranslation === sourceTranslation
-      && Boolean(currentDefinition) && currentDefinition !== sourceDefinition;
-
     if (current && typeof current === "object") term.savedEntry = current;
-    if (!valid) {
-      term.replacementCandidate = {
-        status: "invalid",
-        ...(typeof sourceSenseId === "string" && sourceSenseId ? { newSenseId: sourceSenseId } : {}),
-      };
-      return false;
+    const candidate = term?.replacementCandidate;
+    const proposed = candidate?.proposed || {
+      translation: term?.translation,
+      definition: term?.definition,
+    };
+    const currentSenseId = typeof current?.senseId === "string" && current.senseId
+      ? current.senseId
+      : current?.id;
+    const currentContent = normalizedReplacementContent(current);
+    const proposedContent = normalizedReplacementContent(proposed);
+    if (typeof currentSenseId !== "string" || !currentSenseId
+      || !Number.isFinite(current?.updatedAt)
+      || !currentContent || !proposedContent) {
+      term.status = "conflict";
+      return "conflict";
     }
+    if (currentContent.translation === proposedContent.translation
+      && currentContent.definition === proposedContent.definition) {
+      term.status = "alreadySaved";
+      term.replacementCandidate = null;
+      return "alreadySaved";
+    }
+    term.status = "replacementAvailable";
     term.replacementCandidate = {
-      status: "single",
-      targetSenseId,
-      newSenseId: sourceSenseId,
+      ...candidate,
+      targetSenseId: currentSenseId,
       expectedUpdatedAt: current.updatedAt,
       current: {
         translation: current.translation,
         definition: current.definition,
       },
+      proposed: {
+        translation: proposed.translation,
+        definition: proposed.definition,
+      },
     };
-    return true;
+    return "replacementAvailable";
   }
 
   async function runReplacementAction(term, onReplace) {
@@ -119,10 +268,7 @@
       return { status: "replaced", response };
     }
     if (response?.error?.code === "GLOSSARY_ENTRY_CHANGED") {
-      return {
-        status: refreshReplacementCandidate(term, response.current) ? "stale" : "invalid",
-        response,
-      };
+      return { status: refreshReplacementCandidate(term, response.current), response };
     }
     return { status: "error", response };
   }
@@ -154,6 +300,38 @@
       ".glossary-preview { padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }",
       ".glossary-preview.size-compact { font-size: 12px; }",
       ".glossary-preview.size-large { font-size: 15px; }",
+      ".inline-glossary-root { position: fixed; inset: 0; z-index: 10; color: var(--text); pointer-events: none; }",
+      ".inline-glossary-live { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }",
+      ".inline-glossary-trigger { position: fixed; display: inline-grid; width: 36px; height: 36px; min-height: 36px; padding: 0; place-items: center; border: 1px solid var(--border); border-radius: 50%; background: var(--surface); color: var(--text); box-shadow: var(--shadow); cursor: pointer; font: inherit; line-height: 0; pointer-events: auto; }",
+      ".inline-glossary-trigger:hover { border-color: var(--accent); background: var(--surface-hover); }",
+      ".inline-glossary-trigger:focus-visible, .inline-glossary-close:focus-visible, .inline-glossary-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }",
+      ".inline-glossary-trigger svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }",
+      ".inline-glossary-popover { position: fixed; display: grid; width: min(360px, calc(100vw - 16px)); max-height: min(420px, 60vh); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); pointer-events: auto; }",
+      ".inline-glossary-header { display: flex; padding: 9px 10px; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); }",
+      ".inline-glossary-title { min-width: 0; overflow-wrap: anywhere; }",
+      ".inline-glossary-close { display: inline-grid; width: 28px; height: 28px; flex: 0 0 28px; padding: 0; place-items: center; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 18px; }",
+      ".inline-glossary-close:hover { background: var(--surface-hover); color: var(--text); }",
+      ".inline-glossary-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 10px; scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track); }",
+      ".inline-glossary-status, .inline-glossary-message, .inline-glossary-truncation { margin: 0; overflow-wrap: anywhere; }",
+      ".inline-glossary-status, .inline-glossary-truncation { color: var(--muted); font-size: 12px; }",
+      ".inline-glossary-list { display: grid; gap: 8px; }",
+      ".inline-glossary-popover.is-many { width: min(420px, calc(100vw - 16px)); }",
+      ".inline-glossary-group { display: grid; gap: 7px; padding: 9px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in srgb, var(--surface) 92%, transparent); }",
+      ".inline-glossary-group-header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }",
+      ".inline-glossary-group-label { min-width: 0; overflow-wrap: anywhere; }",
+      ".inline-glossary-match { flex: 0 0 auto; color: var(--muted); font-size: 11px; }",
+      ".inline-glossary-section-title { display: block; color: var(--muted); font-size: 11px; }",
+      ".inline-glossary-exact-missing { margin: 0; color: var(--muted); font-size: 12px; }",
+      ".inline-glossary-missing-section { display: grid; gap: 7px; }",
+      ".inline-glossary-missing { display: flex; padding: 8px 9px; align-items: center; justify-content: space-between; gap: 8px; border: 1px dashed var(--border); border-radius: 9px; }",
+      ".inline-glossary-missing-label { min-width: 0; overflow-wrap: anywhere; }",
+      ".inline-glossary-sense { padding: 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); overflow-wrap: anywhere; }",
+      ".inline-glossary-sense p { margin: 5px 0 0; }",
+      ".inline-glossary-scope { display: inline-block; margin-top: 7px; color: var(--muted); font-size: 11px; font-weight: 650; }",
+      ".inline-glossary-truncation { margin-top: 9px; }",
+      ".inline-glossary-actions { display: flex; margin-top: 10px; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }",
+      ".inline-glossary-action { min-height: 32px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; font: inherit; font-size: 12px; }",
+      ".inline-glossary-action.primary { border-color: var(--accent); background: var(--accent); color: var(--accent-contrast); }",
       ".analysis-transient { position: fixed; top: 18px; left: 50%; z-index: 12; max-width: calc(100vw - 32px); transform: translateX(-50%); pointer-events: auto; }",
       ".analysis-loading, .analysis-toast { padding: 9px 13px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); font-weight: 650; }",
       ".analysis-loading::before { content: ''; display: inline-block; width: 9px; height: 9px; margin-right: 8px; border: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: analysis-spin .8s linear infinite; }",
@@ -287,9 +465,387 @@
     let toastTimer = null;
     let dialogCleanup = null;
     let dialogResizing = false;
+    let inlineRoot = null;
+    let inlineTrigger = null;
+    let inlinePopover = null;
+    let inlineBody = null;
+    let inlineTitle = null;
+    let inlineClose = null;
+    let inlineLive = null;
+    let inlineSnapshot = null;
+    let inlineHandlers = {};
+    let inlinePhase = "closed";
 
     function shell() {
       return options.getShell();
+    }
+
+    function focusWithoutScroll(element) {
+      if (!element?.isConnected || typeof element.focus !== "function") return;
+      try {
+        element.focus({ preventScroll: true });
+      } catch (_) {
+        element.focus();
+      }
+    }
+
+    function ensureInlineRoot(snapshot, handlers) {
+      inlineSnapshot = snapshot;
+      inlineHandlers = handlers || {};
+      if (inlineRoot?.isConnected) return inlineRoot;
+      inlineRoot = document.createElement("div");
+      inlineRoot.className = "inline-glossary-root";
+      inlineRoot.setAttribute("data-inline-glossary-root", "");
+      inlineTrigger = document.createElement("button");
+      inlineTrigger.type = "button";
+      inlineTrigger.className = "inline-glossary-trigger";
+      inlineTrigger.setAttribute("aria-label", "Открыть словарь по выделению");
+      inlineTrigger.setAttribute("title", "Словарь");
+      inlineTrigger.setAttribute("aria-expanded", "false");
+      inlineTrigger.setAttribute("aria-controls", INLINE_POPOVER_ID);
+      const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      icon.setAttribute("viewBox", "0 0 24 24");
+      icon.setAttribute("width", "18");
+      icon.setAttribute("height", "18");
+      icon.setAttribute("fill", "none");
+      icon.setAttribute("stroke", "currentColor");
+      icon.setAttribute("stroke-width", "1.8");
+      icon.setAttribute("stroke-linecap", "round");
+      icon.setAttribute("stroke-linejoin", "round");
+      icon.setAttribute("aria-hidden", "true");
+      icon.setAttribute("focusable", "false");
+      const leftPage = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      leftPage.setAttribute("d", "M3.5 5.5c3-1.1 5.8-.5 8.5 1.4v11c-2.7-1.9-5.5-2.5-8.5-1.4v-11Z");
+      const rightPage = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      rightPage.setAttribute("d", "M20.5 5.5c-3-1.1-5.8-.5-8.5 1.4v11c2.7-1.9 5.5-2.5 8.5-1.4v-11Z");
+      icon.append(leftPage, rightPage);
+      inlineTrigger.appendChild(icon);
+      inlineTrigger.addEventListener("pointerdown", (event) => {
+        if (event.button === 0) event.preventDefault();
+      });
+      inlineTrigger.addEventListener("click", () => {
+        if (inlinePhase === "offering") inlineHandlers.onActivate?.();
+      });
+      inlineLive = document.createElement("span");
+      inlineLive.className = "inline-glossary-live";
+      inlineLive.setAttribute("role", "status");
+      inlineLive.setAttribute("aria-live", "polite");
+      inlineLive.setAttribute("aria-atomic", "true");
+      inlineRoot.append(inlineTrigger, inlineLive);
+      shell()?.appendChild(inlineRoot);
+      return inlineRoot;
+    }
+
+    function ensureInlinePopover() {
+      if (inlinePopover?.isConnected) return inlinePopover;
+      inlinePopover = document.createElement("section");
+      inlinePopover.id = INLINE_POPOVER_ID;
+      inlinePopover.className = "inline-glossary-popover";
+      inlinePopover.setAttribute("role", "region");
+      inlinePopover.setAttribute("aria-label", "Словарь");
+      const header = document.createElement("header");
+      header.className = "inline-glossary-header";
+      inlineTitle = document.createElement("strong");
+      inlineTitle.className = "inline-glossary-title";
+      inlineClose = document.createElement("button");
+      inlineClose.type = "button";
+      inlineClose.className = "inline-glossary-close";
+      inlineClose.setAttribute("aria-label", "Закрыть словарь");
+      inlineClose.textContent = "×";
+      inlineClose.addEventListener("click", () => inlineHandlers.onClose?.());
+      inlineBody = document.createElement("div");
+      inlineBody.className = "inline-glossary-body";
+      header.append(inlineTitle, inlineClose);
+      inlinePopover.append(header, inlineBody);
+      inlineRoot?.appendChild(inlinePopover);
+      return inlinePopover;
+    }
+
+    function positionInline() {
+      if (!inlineSnapshot?.anchorNode?.isConnected || !inlineSnapshot.anchorRect || !inlineTrigger) return false;
+      const viewport = { width: window.innerWidth, height: window.innerHeight };
+      const triggerRect = inlineTrigger.getBoundingClientRect?.() || { width: 36, height: 36 };
+      const triggerVerticalPosition = inlinePopoverPosition(
+        inlineSnapshot.anchorRect,
+        { height: triggerRect.height || 36 },
+        viewport,
+      );
+      const triggerPosition = {
+        ...triggerVerticalPosition,
+        left: clampInlineCoordinate(
+          Number(inlineSnapshot.anchorRect.left) || 0,
+          INLINE_VIEWPORT_MARGIN,
+          viewport.width - INLINE_VIEWPORT_MARGIN - (triggerRect.width || 0),
+        ),
+      };
+      inlineTrigger.style.left = `${triggerPosition.left}px`;
+      inlineTrigger.style.top = `${triggerPosition.top}px`;
+      if (inlinePopover && !inlinePopover.hidden) {
+        const popoverRect = inlinePopover.getBoundingClientRect?.() || { height: 0 };
+        const triggerAnchor = {
+          top: triggerPosition.top,
+          bottom: triggerPosition.top + (triggerRect.height || 36),
+          left: triggerPosition.left,
+        };
+        const popoverPosition = inlinePopoverPosition(
+          triggerAnchor,
+          {
+            height: popoverRect.height,
+            width: inlinePopover.className.includes("is-many") ? 420 : 360,
+          },
+          viewport,
+        );
+        inlinePopover.style.left = `${popoverPosition.left}px`;
+        inlinePopover.style.top = `${popoverPosition.top}px`;
+        inlinePopover.style.width = `${popoverPosition.width}px`;
+        inlinePopover.style.maxHeight = `${popoverPosition.maxHeight}px`;
+        inlinePopover.dataset.placement = popoverPosition.placement;
+      }
+      return true;
+    }
+
+    function closeInline() {
+      const consumed = inlinePhase !== "closed" || Boolean(inlineRoot);
+      inlineRoot?.remove();
+      inlineRoot = null;
+      inlineTrigger = null;
+      inlinePopover = null;
+      inlineBody = null;
+      inlineTitle = null;
+      inlineClose = null;
+      inlineLive = null;
+      inlineSnapshot = null;
+      inlineHandlers = {};
+      inlinePhase = "closed";
+      return consumed;
+    }
+
+    function showInlineOffer(snapshot, handlers) {
+      ensureInlineRoot(snapshot, handlers);
+      inlinePhase = "offering";
+      inlineRoot.dataset.phase = inlinePhase;
+      inlineTrigger.setAttribute("aria-expanded", "false");
+      if (inlinePopover) inlinePopover.hidden = true;
+      return positionInline();
+    }
+
+    function prepareInlineExpanded(snapshot, phase, handlers) {
+      ensureInlineRoot(snapshot, handlers);
+      ensureInlinePopover();
+      inlinePhase = phase;
+      inlineRoot.dataset.phase = phase;
+      inlineTrigger.setAttribute("aria-expanded", "true");
+      inlinePopover.className = "inline-glossary-popover";
+      inlinePopover.hidden = false;
+      inlineTitle.textContent = "Словарь по выделению";
+      inlineBody.replaceChildren();
+      return {
+        finish() {
+          return positionInline();
+        },
+      };
+    }
+
+    function appendInlineAction(container, text, className, action) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `inline-glossary-action${className ? ` ${className}` : ""}`;
+      button.textContent = text;
+      button.addEventListener("click", action);
+      container.appendChild(button);
+      return button;
+    }
+
+    function showInlineLoading(snapshot, handlers) {
+      const render = prepareInlineExpanded(snapshot, "loading", handlers);
+      const status = document.createElement("p");
+      status.className = "inline-glossary-status";
+      status.setAttribute("role", "status");
+      status.textContent = "Ищем в словаре…";
+      inlineBody.appendChild(status);
+      if (inlineLive) inlineLive.textContent = status.textContent;
+      return render.finish();
+    }
+
+    function inlineSenseCard(entry) {
+      const card = document.createElement("article");
+      card.className = "inline-glossary-sense";
+      const line = document.createElement("div");
+      const term = document.createElement("strong");
+      term.className = "glossary-term";
+      term.textContent = entry.term;
+      const translation = document.createElement("em");
+      translation.className = "glossary-translation";
+      translation.textContent = ` «${entry.translation}»`;
+      line.append(term, translation);
+      const definition = document.createElement("p");
+      definition.textContent = entry.definition;
+      const scope = document.createElement("span");
+      scope.className = "inline-glossary-scope";
+      scope.textContent = entry.attached ? "В этом чате" : "Общий словарь";
+      card.append(line, definition, scope);
+      return card;
+    }
+
+    function appendCandidateAction(container, candidate) {
+      const button = appendInlineAction(
+        container,
+        "Разобрать",
+        "primary",
+        () => inlineHandlers.onAnalyze?.(candidate),
+      );
+      button.setAttribute("aria-label", `Разобрать ${candidate.displayTerm}`);
+      return button;
+    }
+
+    function showInlineResult(snapshot, resultValue, handlers) {
+      const render = prepareInlineExpanded(snapshot, "showing", handlers);
+      const result = normalizeInlineGlossaryResult(resultValue);
+      const candidateCount = result.groups.length + result.missing.length;
+      inlinePopover.className = `inline-glossary-popover${candidateCount > 6 ? " is-many" : ""}`;
+      const list = document.createElement("div");
+      list.className = "inline-glossary-list";
+      result.groups.forEach((group) => {
+        const section = document.createElement("section");
+        section.className = "inline-glossary-group";
+        const header = document.createElement("div");
+        header.className = "inline-glossary-group-header";
+        const label = document.createElement("strong");
+        label.className = "inline-glossary-group-label";
+        label.textContent = group.candidate.displayTerm;
+        const match = document.createElement("span");
+        match.className = "inline-glossary-match";
+        match.textContent = group.exactMissing ? "Связанное совпадение" : "Точное совпадение";
+        header.append(label, match);
+        const exactEntries = group.entries.filter((entry) => entry.matchClass === "exact");
+        const relatedEntries = group.entries.filter((entry) => entry.matchClass !== "exact");
+        const appendEntrySection = (titleText, entries) => {
+          if (!entries.length) return;
+          const title = document.createElement("strong");
+          title.className = "inline-glossary-section-title";
+          title.textContent = titleText;
+          const senses = document.createElement("div");
+          senses.className = "inline-glossary-list";
+          entries.forEach((entry) => senses.appendChild(inlineSenseCard(entry)));
+          section.append(title, senses);
+        };
+        const actions = group.candidate.visibility === "primary" && exactEntries.length === 0
+          ? document.createElement("div")
+          : null;
+        if (actions) {
+          actions.className = "inline-glossary-actions";
+          appendCandidateAction(actions, group.candidate);
+        }
+        section.appendChild(header);
+        appendEntrySection("Точное значение", exactEntries);
+        appendEntrySection("Связанные записи", relatedEntries);
+        if (group.exactMissing) {
+          const missingExact = document.createElement("p");
+          missingExact.className = "inline-glossary-exact-missing";
+          missingExact.textContent = `Точного значения «${group.candidate.displayTerm}» нет.`;
+          section.appendChild(missingExact);
+        }
+        if (actions) section.appendChild(actions);
+        list.appendChild(section);
+      });
+      if (result.missing.length) {
+        const missingSection = document.createElement("section");
+        missingSection.className = "inline-glossary-missing-section";
+        const missingTitle = document.createElement("strong");
+        missingTitle.className = "inline-glossary-section-title";
+        missingTitle.textContent = "Не найдено";
+        missingSection.appendChild(missingTitle);
+        result.missing.forEach((candidate) => {
+          const row = document.createElement("div");
+          row.className = "inline-glossary-missing";
+          const label = document.createElement("span");
+          label.className = "inline-glossary-missing-label";
+          label.textContent = candidate.displayTerm;
+          row.appendChild(label);
+          if (candidate.visibility === "primary") {
+            const actions = document.createElement("div");
+            actions.className = "inline-glossary-actions";
+            appendCandidateAction(actions, candidate);
+            row.appendChild(actions);
+          }
+          missingSection.appendChild(row);
+        });
+        list.appendChild(missingSection);
+      }
+      if (!candidateCount) {
+        const message = document.createElement("p");
+        message.className = "inline-glossary-message";
+        message.textContent = "В выделении не найдено английских технических терминов.";
+        list.appendChild(message);
+      }
+      inlineBody.appendChild(list);
+      if (result.truncated.candidates) {
+        const truncation = document.createElement("p");
+        truncation.className = "inline-glossary-truncation";
+        truncation.textContent = `Показано ${result.totals.candidateCountReturned} из ${result.totals.candidateCountBeforeLimit} кандидатов.`;
+        inlineBody.appendChild(truncation);
+      }
+      if (result.truncated.entries) {
+        const truncation = document.createElement("p");
+        truncation.className = "inline-glossary-truncation";
+        truncation.textContent = `Показано ${result.totals.matchedEntryCountReturned} из ${result.totals.matchedEntryCountBeforeLimit} совпадений.`;
+        inlineBody.appendChild(truncation);
+      }
+      if (inlineLive) {
+        inlineLive.textContent = candidateCount
+          ? `Словарь готов: ${result.groups.length} совпадений, ${result.missing.length} без совпадений.`
+          : "Словарь готов: технические термины не найдены.";
+      }
+      return render.finish();
+    }
+
+    function showInlineError(snapshot, error, handlers) {
+      const render = prepareInlineExpanded(snapshot, "error", handlers);
+      const message = document.createElement("p");
+      message.className = "inline-glossary-message";
+      message.textContent = "Не удалось открыть словарь.";
+      inlineBody.appendChild(message);
+      if (typeof error?.message === "string" && error.message.trim()) {
+        const detail = document.createElement("p");
+        detail.className = "inline-glossary-status";
+        detail.textContent = error.message;
+        inlineBody.appendChild(detail);
+      }
+      const actions = document.createElement("div");
+      actions.className = "inline-glossary-actions";
+      appendInlineAction(actions, "Повторить", "", () => inlineHandlers.onRetry?.());
+      inlineBody.appendChild(actions);
+      if (inlineLive) inlineLive.textContent = "Не удалось открыть словарь.";
+      return render.finish();
+    }
+
+    function handleInlineEscape() {
+      if (inlinePhase === "closed") return false;
+      inlineHandlers.onClose?.();
+      return true;
+    }
+
+    function inlineSurfaceContains(surface, value) {
+      if (!surface || !value) return false;
+      if (surface === value) return true;
+      if (typeof value.nodeType !== "number") return false;
+      return surface.contains?.(value) === true;
+    }
+
+    function inlineContainsPath(pathValue) {
+      const path = Array.isArray(pathValue) ? pathValue : [];
+      return [inlineTrigger, inlinePopover].some((surface) => (
+        surface
+        && path.some((value) => inlineSurfaceContains(surface, value))
+      ));
+    }
+
+    function inlineOwnsFocus() {
+      const rootNode = shell()?.getRootNode?.();
+      const activeElement = rootNode?.activeElement || document.activeElement || null;
+      return Boolean(activeElement && [inlineTrigger, inlinePopover].some(
+        (surface) => surface?.contains?.(activeElement),
+      ));
     }
 
     function removeToast() {
@@ -347,6 +903,7 @@
     }
 
     function showLoading() {
+      closeInline();
       closeDialog();
       removeToast();
       hideLoading();
@@ -461,6 +1018,7 @@
     }
 
     function dialogFrame(title) {
+      closeInline();
       const focusOrigin = backdrop ? previouslyFocused : currentFocusedElement();
       closeDialog(false);
       previouslyFocused = focusOrigin;
@@ -565,10 +1123,15 @@
       appendTermText(card, term);
       const status = document.createElement("span");
       status.className = "analysis-result-status";
-      const labels = { new: "Добавлено", alreadySaved: "Уже сохранено", duplicate: "Есть другая версия", unsaved: "Не сохранено", replaced: "Заменено" };
-      status.textContent = term.replacementCandidate?.status === "multiple"
-        ? "Добавлено отдельно: найдено несколько вариантов"
-        : (labels[term.status] || "");
+      const labels = {
+        new: "Добавлено",
+        alreadySaved: "Уже сохранено",
+        replacementAvailable: "Есть другая версия",
+        unsaved: "Не сохранено",
+        replaced: "Заменено",
+        conflict: "Сохранённая версия изменилась. Проверьте её перед новой попыткой.",
+      };
+      status.textContent = labels[term.status] || "";
       card.appendChild(status);
 
       if (replacementCommandForTerm(term) && term.savedEntry) {
@@ -614,13 +1177,17 @@
             tooltip.remove();
             openTooltip = null;
             options.onGlossaryEntries?.(response.glossaryEntries);
-          } else if (outcome.status === "stale") {
-            updateTooltip(tooltip, response.current);
-            status.textContent = response.error.message;
+          } else if (outcome.status === "replacementAvailable") {
+            status.textContent = labels.replacementAvailable;
+            updateTooltip(tooltip, term.savedEntry);
             replace.disabled = false;
-            showTooltip();
-          } else if (outcome.status === "invalid") {
-            status.textContent = "Сохранённая версия изменилась. Быстрая замена больше недоступна.";
+          } else if (outcome.status === "alreadySaved") {
+            status.textContent = labels.alreadySaved;
+            replace.remove();
+            tooltip.remove();
+            if (openTooltip === tooltip) openTooltip = null;
+          } else if (outcome.status === "conflict" || outcome.status === "invalid") {
+            status.textContent = labels.conflict;
             replace.remove();
             tooltip.remove();
             if (openTooltip === tooltip) openTooltip = null;
@@ -672,15 +1239,36 @@
       }
     }
 
-    return Object.freeze({ showLoading, hideLoading, showHint, showResult, showError, closeDialog, handleEscape });
+    return Object.freeze({
+      showLoading,
+      hideLoading,
+      showHint,
+      showResult,
+      showError,
+      closeDialog,
+      handleEscape,
+      showInlineOffer,
+      showInlineLoading,
+      showInlineResult,
+      showInlineError,
+      closeInline,
+      handleInlineEscape,
+      inlineContainsPath,
+      inlineOwnsFocus,
+      positionInline,
+    });
   }
 
   root.ChatGPTHelperAnalysisUi = Object.freeze({
     DIALOG_HEADING_ID,
+    INLINE_POPOVER_ID,
     styles,
     analysisMarkup,
     settingsMarkup,
     normalizeGlossaryEntries,
+    normalizeInlineGlossaryEntries,
+    normalizeInlineGlossaryResult,
+    inlinePopoverPosition,
     glossaryTextSizeClass,
     nextFocusableIndex,
     replacementCommandForTerm,

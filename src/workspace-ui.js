@@ -455,14 +455,23 @@
     }
 
     function replaceGlossary(command) {
+      const translation = contract.normalizeMeaning(
+        command?.replacement?.translation ?? command?.proposed?.translation,
+        200,
+      );
+      const definition = contract.normalizeMeaning(
+        command?.replacement?.definition ?? command?.proposed?.definition,
+        500,
+      );
       const normalized = {
         senseId: command?.senseId || command?.entryId,
-        sourceSenseId: command?.sourceSenseId || command?.newSenseId,
         expectedUpdatedAt: command?.expectedUpdatedAt,
+        replacement: { translation, definition },
       };
       if (!contract.validEntityId(normalized.senseId)
-        || !contract.validEntityId(normalized.sourceSenseId)
-        || !Number.isFinite(normalized.expectedUpdatedAt)) {
+        || !Number.isFinite(normalized.expectedUpdatedAt)
+        || !translation
+        || !definition) {
         return Promise.resolve({
           ok: false,
           error: { code: "REQUEST_CONTRACT_ERROR", message: "Запрос замены устарел или повреждён." },
@@ -473,6 +482,10 @@
 
     return Object.freeze({
       queryGlossary: (mode, query) => send(contract.MESSAGE_TYPES.QUERY_GLOSSARY, { mode, query, limit: contract.MAX_QUERY_RESULTS }),
+      lookupGlossarySelection: (text) => send(
+        contract.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
+        { text },
+      ),
       attachGlossary: (senseId) => send(contract.MESSAGE_TYPES.ATTACH_GLOSSARY_SENSE, { senseId }),
       moveGlossary: (senseId, beforeSenseId) => send(contract.MESSAGE_TYPES.MOVE_GLOSSARY_LINK, { senseId, beforeSenseId }),
       unlinkGlossary: (senseId) => send(contract.MESSAGE_TYPES.UNLINK_GLOSSARY, { senseId }),

@@ -88,6 +88,26 @@
     analysisBusy: false,
     analysisController: null,
     analysisUi: null,
+    inlineGesture: {
+      generation: 0,
+      pointerId: null,
+      pointerType: null,
+      keyboardActive: false,
+      shiftHeld: false,
+      selectionKeys: [],
+      startSignature: "",
+      changed: false,
+      pendingFrame: null,
+      pendingTask: null,
+    },
+    inlineGlossary: {
+      phase: "closed",
+      selectionToken: 0,
+      requestToken: 0,
+      snapshot: null,
+      result: null,
+      error: null,
+    },
     host: null,
     shadow: null,
     shell: null,
@@ -1316,7 +1336,422 @@
     updateSavedEntries(response.entries);
   }
 
+  function inlineSelectionSignature() {
+    const selection = window.getSelection?.();
+    if (!selection) return "";
+    return JSON.stringify([
+      String(selection.toString?.() || ""),
+      selection.isCollapsed === true,
+      Number(selection.anchorOffset) || 0,
+      Number(selection.focusOffset) || 0,
+    ]);
+  }
+
+  function inlineSnapshotCurrent(snapshot) {
+    return Boolean(snapshot
+      && snapshot.pageUrl === location.href
+      && workspaceContract.isScopeKey(snapshot.conversationScope)
+      && state.workspaceContext?.scopeKey === snapshot.conversationScope
+      && state.workspaceStatus.status === "ready"
+      && snapshot.anchorNode?.isConnected === true);
+  }
+
+  function cancelInlineGestureSettle() {
+    const gesture = state.inlineGesture;
+    if (gesture.pendingFrame !== null) {
+      if (typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(gesture.pendingFrame);
+      } else {
+        clearTimeout(gesture.pendingFrame);
+      }
+    }
+    if (gesture.pendingTask !== null) clearTimeout(gesture.pendingTask);
+    gesture.pendingFrame = null;
+    gesture.pendingTask = null;
+  }
+
+  function invalidateInlineGesture() {
+    cancelInlineGestureSettle();
+    state.inlineGesture = {
+      generation: state.inlineGesture.generation + 1,
+      pointerId: null,
+      pointerType: null,
+      keyboardActive: false,
+      shiftHeld: false,
+      selectionKeys: [],
+      startSignature: "",
+      changed: false,
+      pendingFrame: null,
+      pendingTask: null,
+    };
+  }
+
+  function closeInlineGlossary() {
+    const current = state.inlineGlossary;
+    const consumed = current.phase !== "closed";
+    invalidateInlineGesture();
+    state.inlineGlossary = {
+      phase: "closed",
+      selectionToken: current.selectionToken + 1,
+      requestToken: current.requestToken + 1,
+      snapshot: null,
+      result: null,
+      error: null,
+    };
+    state.analysisUi?.closeInline();
+    return consumed;
+  }
+
+  function inlineUiHandlers() {
+    return {
+      onActivate() { void activateInlineGlossary(); },
+      onClose() { closeInlineGlossary(); },
+      onRetry() { void retryInlineGlossary(); },
+      onAnalyze(candidate) { void analyzeInlineGlossaryCandidate(candidate); },
+    };
+  }
+
+  function showInlineOffer(snapshot) {
+    const current = state.inlineGlossary;
+    state.inlineGlossary = {
+      phase: "offering",
+      selectionToken: current.selectionToken + 1,
+      requestToken: current.requestToken + 1,
+      snapshot,
+      result: null,
+      error: null,
+    };
+    if (!state.analysisUi?.showInlineOffer(snapshot, inlineUiHandlers())) {
+      closeInlineGlossary();
+      return false;
+    }
+    return true;
+  }
+
+  function inlineLookupOwns(requestToken, selectionToken, snapshot) {
+    const current = state.inlineGlossary;
+    return current.phase === "loading"
+      && current.requestToken === requestToken
+      && current.selectionToken === selectionToken
+      && current.snapshot === snapshot
+      && current.snapshot?.text === snapshot.text
+      && current.snapshot?.pageUrl === snapshot.pageUrl
+      && current.snapshot?.conversationScope === snapshot.conversationScope
+      && inlineSnapshotCurrent(snapshot);
+  }
+
+  async function performInlineGlossaryLookup(snapshot, selectionToken) {
+    if (!inlineSnapshotCurrent(snapshot)) {
+      closeInlineGlossary();
+      return { ok: false, ignored: true };
+    }
+    const current = state.inlineGlossary;
+    const requestToken = current.requestToken + 1;
+    state.inlineGlossary = {
+      ...current,
+      phase: "loading",
+      requestToken,
+      snapshot,
+      result: null,
+      error: null,
+    };
+    if (!state.analysisUi?.showInlineLoading(snapshot, inlineUiHandlers())) {
+      closeInlineGlossary();
+      return { ok: false, ignored: true };
+    }
+
+    let response;
+    try {
+      response = await state.workspaceClient.lookupGlossarySelection(snapshot.text);
+    } catch (error) {
+      response = { ok: false, error: { message: error?.message || "Не удалось открыть словарь." } };
+    }
+    if (!inlineLookupOwns(requestToken, selectionToken, snapshot)) {
+      return { ok: false, ignored: true };
+    }
+    if (!response?.ok) {
+      const error = {
+        code: typeof response?.error?.code === "string" ? response.error.code : "WORKSPACE_OPERATION_FAILED",
+        message: typeof response?.error?.message === "string" ? response.error.message : "Не удалось открыть словарь.",
+      };
+      state.inlineGlossary = { ...state.inlineGlossary, phase: "error", error };
+      if (!state.analysisUi?.showInlineError(snapshot, error, inlineUiHandlers())) {
+        closeInlineGlossary();
+        return { ok: false, ignored: true };
+      }
+      return response || { ok: false, error };
+    }
+
+    state.inlineGlossary = {
+      ...state.inlineGlossary,
+      phase: "showing",
+      result: response,
+      error: null,
+    };
+    if (!state.analysisUi?.showInlineResult(snapshot, response, inlineUiHandlers())) {
+      closeInlineGlossary();
+      return { ok: false, ignored: true };
+    }
+    return response;
+  }
+
+  function activateInlineGlossary() {
+    const current = state.inlineGlossary;
+    const offer = current.snapshot;
+    const scope = state.workspaceContext?.scopeKey;
+    if (current.phase !== "offering" || !offer) {
+      closeInlineGlossary();
+      return Promise.resolve({ ok: false, ignored: true });
+    }
+    const snapshot = Object.freeze({
+      text: offer.text,
+      anchorRect: offer.anchorRect,
+      anchorNode: offer.anchorNode,
+      pageUrl: offer.pageUrl,
+      conversationScope: scope,
+    });
+    state.inlineGlossary = { ...current, snapshot };
+    return performInlineGlossaryLookup(snapshot, current.selectionToken);
+  }
+
+  function retryInlineGlossary() {
+    const current = state.inlineGlossary;
+    if (current.phase !== "error" || !current.snapshot) {
+      return Promise.resolve({ ok: false, ignored: true });
+    }
+    return performInlineGlossaryLookup(current.snapshot, current.selectionToken);
+  }
+
+  function inlineResultContainsCandidate(result, candidate) {
+    if (!result || !candidate || typeof candidate.normalizedKey !== "string") return false;
+    const candidates = [
+      ...(Array.isArray(result.groups) ? result.groups.map((group) => group?.candidate) : []),
+      ...(Array.isArray(result.missing) ? result.missing : []),
+    ];
+    return candidates.some((item) => (
+      item?.normalizedKey === candidate.normalizedKey
+      && item?.displayTerm === candidate.displayTerm
+    ));
+  }
+
+  async function analyzeInlineGlossaryCandidate(candidate) {
+    const current = state.inlineGlossary;
+    if (current.phase !== "showing" || !current.snapshot
+      || !inlineResultContainsCandidate(current.result, candidate)) {
+      return { ok: false, ignored: true };
+    }
+    const snapshot = current.snapshot;
+    if (!inlineSnapshotCurrent(snapshot)) {
+      closeInlineGlossary();
+      return { ok: false, ignored: true };
+    }
+    const displayTerm = candidate.displayTerm;
+    const pageUrl = snapshot.pageUrl;
+    closeInlineGlossary();
+    return runAnalysis("inline-assistant", displayTerm, pageUrl);
+  }
+
+  function captureInlineGlossarySelection(generation) {
+    if (state.inlineGesture.generation !== generation) return false;
+    if (state.analysisBusy
+      || state.workspaceStatus.status !== "ready"
+      || !state.workspaceContext
+      || !conversationContextModule.isSupportedPage(location.href)) {
+      closeInlineGlossary();
+      return false;
+    }
+    if (typeof chatGptDom.captureInlineGlossarySelection !== "function") {
+      closeInlineGlossary();
+      return false;
+    }
+    const captured = chatGptDom.captureInlineGlossarySelection({
+      pageUrl: location.href,
+      extensionRoot: state.host,
+    });
+    if (!captured?.ok) {
+      closeInlineGlossary();
+      return false;
+    }
+    return showInlineOffer(captured);
+  }
+
+  function beginInlineGesture(kind, value) {
+    closeInlineGlossary();
+    const generation = state.inlineGesture.generation + 1;
+    state.inlineGesture = {
+      generation,
+      pointerId: kind === "pointer" ? value.pointerId : null,
+      pointerType: kind === "pointer" ? String(value.pointerType || "") : null,
+      keyboardActive: kind === "keyboard",
+      shiftHeld: kind === "keyboard" && value.shiftKey === true,
+      selectionKeys: kind === "keyboard" ? [value.key] : [],
+      startSignature: inlineSelectionSignature(),
+      changed: false,
+      pendingFrame: null,
+      pendingTask: null,
+    };
+    return generation;
+  }
+
+  function markInlineGestureSelectionChanged() {
+    if (state.inlineGesture.pointerId === null && !state.inlineGesture.keyboardActive) return;
+    state.inlineGesture.changed = true;
+  }
+
+  function scheduleInlineGestureSettle(generation) {
+    if (state.inlineGesture.generation !== generation) return;
+    cancelInlineGestureSettle();
+    const frame = typeof window.requestAnimationFrame === "function"
+      ? window.requestAnimationFrame.bind(window)
+      : (callback) => setTimeout(callback, 0);
+    state.inlineGesture.pendingFrame = frame(() => {
+      if (state.inlineGesture.generation !== generation) return;
+      state.inlineGesture.pendingFrame = null;
+      state.inlineGesture.pendingTask = setTimeout(() => {
+        if (state.inlineGesture.generation !== generation
+          || state.inlineGesture.pointerId !== null
+          || state.inlineGesture.keyboardActive) return;
+        state.inlineGesture.pendingTask = null;
+        const changed = state.inlineGesture.changed
+          || state.inlineGesture.startSignature !== inlineSelectionSignature();
+        state.inlineGesture.changed = false;
+        if (changed) captureInlineGlossarySelection(generation);
+      }, 0);
+    });
+  }
+
+  function finishInlineKeyboardGestureIfReady() {
+    const gesture = state.inlineGesture;
+    if (!gesture.keyboardActive
+      || gesture.shiftHeld
+      || gesture.selectionKeys.length !== 0) return false;
+    const generation = gesture.generation;
+    gesture.keyboardActive = false;
+    scheduleInlineGestureSettle(generation);
+    return true;
+  }
+
+  function inlineEventPath(event) {
+    return typeof event?.composedPath === "function" ? event.composedPath() : [];
+  }
+
+  function inlineInternalEvent(event) {
+    return state.analysisUi?.inlineContainsPath(inlineEventPath(event)) === true;
+  }
+
+  function supportedInlineSelectionKey(event) {
+    if (!event?.shiftKey || event.altKey) return false;
+    if ((event.ctrlKey || event.metaKey)
+      && !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+      return false;
+    }
+    return ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]
+      .includes(event.key);
+  }
+
+  function inlineCopyShortcut(event) {
+    return (event?.ctrlKey || event?.metaKey)
+      && !event.altKey
+      && String(event.key || "").toLowerCase() === "c";
+  }
+
+  function handleInlinePointerDown(event, path) {
+    if (state.analysisUi?.inlineContainsPath(path)) return;
+    closeInlineGlossary();
+    if (event?.button !== 0 || event?.isPrimary === false || path.includes(state.host)) return;
+    beginInlineGesture("pointer", event);
+  }
+
+  function handleInlinePointerUp(event) {
+    const gesture = state.inlineGesture;
+    if (gesture.pointerId === null || gesture.pointerId !== event?.pointerId) return;
+    const generation = gesture.generation;
+    gesture.pointerId = null;
+    gesture.pointerType = null;
+    scheduleInlineGestureSettle(generation);
+  }
+
+  function cancelInlinePointerGesture(event) {
+    if (state.inlineGesture.pointerId === null
+      || (Number.isFinite(event?.pointerId)
+        && event.pointerId !== state.inlineGesture.pointerId)) return;
+    closeInlineGlossary();
+  }
+
+  function handleInlineKeyDown(event) {
+    if (inlineInternalEvent(event)) return;
+    if (event?.key === "Escape" && state.inlineGlossary.phase !== "closed") return;
+    if (event?.key === "Shift") {
+      if (state.inlineGesture.keyboardActive) state.inlineGesture.shiftHeld = true;
+      else closeInlineGlossary();
+      return;
+    }
+    if (inlineCopyShortcut(event)) {
+      scheduleInlineGlossaryCloseAfterEvent();
+      return;
+    }
+    if (!supportedInlineSelectionKey(event)) {
+      closeInlineGlossary();
+      return;
+    }
+    if (state.inlineGesture.keyboardActive) {
+      state.inlineGesture.shiftHeld = true;
+      if (!state.inlineGesture.selectionKeys.includes(event.key)) {
+        state.inlineGesture.selectionKeys.push(event.key);
+      }
+      return;
+    }
+    beginInlineGesture("keyboard", event);
+  }
+
+  function handleInlineKeyUp(event) {
+    const gesture = state.inlineGesture;
+    if (!gesture.keyboardActive) return;
+    if (event?.key === "Shift") {
+      gesture.shiftHeld = false;
+      finishInlineKeyboardGestureIfReady();
+      return;
+    }
+    if (!gesture.selectionKeys.includes(event?.key)) return;
+    gesture.selectionKeys = gesture.selectionKeys.filter((key) => key !== event.key);
+    gesture.shiftHeld = event?.shiftKey === true;
+    finishInlineKeyboardGestureIfReady();
+  }
+
+  function closeInlineGlossaryOutsidePath(pathValue) {
+    const path = Array.isArray(pathValue) ? pathValue : [];
+    if (state.analysisUi?.inlineContainsPath(path)) return false;
+    return closeInlineGlossary();
+  }
+
+  function handleInlineFocusIn(event) {
+    return closeInlineGlossaryOutsidePath(inlineEventPath(event));
+  }
+
+  function scheduleInlineGlossaryCloseAfterEvent() {
+    const generation = state.inlineGesture.generation;
+    setTimeout(() => {
+      if (state.inlineGesture.generation !== generation) return;
+      closeInlineGlossary();
+    }, 0);
+  }
+
+  function handleInlineCopy() {
+    scheduleInlineGlossaryCloseAfterEvent();
+  }
+
+  function handleInlineExternalAction() {
+    return closeInlineGlossary();
+  }
+
+  function closeInlineGlossaryForInvalidation(entityFamily) {
+    if (![workspaceContract.ENTITY_FAMILIES.ALL, workspaceContract.ENTITY_FAMILIES.GLOSSARY]
+      .includes(entityFamily)) return false;
+    return closeInlineGlossary();
+  }
+
   function handleWorkspaceContextChange(context) {
+    closeInlineGlossary();
     closeWorkspaceDelete();
     state.workspaceContext = context;
     state.glossaryRequestedMode = "local";
@@ -1333,6 +1768,7 @@
     const previous = state.workspaceStatus;
     state.workspaceStatus = status;
     if (status.status === "unavailable") {
+      closeInlineGlossary();
       closeWorkspaceDelete();
       state.workspaceContext = null;
       state.glossaryEntries = [];
@@ -1438,6 +1874,7 @@
   }
 
   async function runAnalysis(trigger, selectionText, pageUrl) {
+    closeInlineGlossary();
     const snapshot = typeof selectionText === "string" ? selectionText : String(window.getSelection?.().toString() || "");
     const response = await state.analysisController?.start(snapshot, trigger, pageUrl || location.href);
     if (response?.mutationBusy) state.analysisUi?.showHint("Импорт выполняется. Повторите сохранение терминов позже.");
@@ -1995,6 +2432,7 @@
 
   function mount() {
     state.shellTransitionController?.cancel();
+    closeInlineGlossary();
     closeTemplatePreview();
     closeRecentPopup();
     closeWorkspaceDelete();
@@ -2082,6 +2520,10 @@
   }
 
   function ensureMounted() {
+    if (state.inlineGlossary.phase !== "closed"
+      && !state.inlineGlossary.snapshot?.anchorNode?.isConnected) {
+      closeInlineGlossary();
+    }
     if (!state.host?.isConnected) mount();
   }
 
@@ -2103,6 +2545,11 @@
   document.addEventListener("keydown", function handleEscape(event) {
     if (event.key !== "Escape") return;
     if (state.analysisUi?.handleEscape()) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (state.analysisUi?.handleInlineEscape()) {
       event.preventDefault();
       event.stopPropagation();
       return;
@@ -2139,8 +2586,9 @@
   });
 
   document.addEventListener("pointerdown", function handleOutsidePointer(event) {
-    if (state.sidebarResizing) return;
     const path = event.composedPath();
+    handleInlinePointerDown(event, path);
+    if (state.sidebarResizing) return;
     if (workspaceUiModule.workspaceDeleteMenuOpen(state.workspaceDelete)) {
       const insideActiveCard = workspaceUiModule.workspaceDeletePointerInside(state.workspaceDelete, path);
       if (!insideActiveCard && closeWorkspaceDelete()) {
@@ -2153,23 +2601,44 @@
       if (state.open && state.settings.closePanelOnOutsideClick) closePanel();
       else closeRecentPopup();
     }
-  });
+  }, { capture: true });
+  document.addEventListener("focusin", handleInlineFocusIn, { capture: true });
+  document.addEventListener("copy", handleInlineCopy, { capture: true });
+  document.addEventListener("cut", handleInlineExternalAction, { capture: true });
+  document.addEventListener("paste", handleInlineExternalAction, { capture: true });
+  document.addEventListener("beforeinput", handleInlineExternalAction, { capture: true });
+  document.addEventListener("selectionchange", markInlineGestureSelectionChanged);
+  document.addEventListener("pointerup", handleInlinePointerUp, { capture: true });
+  document.addEventListener("pointercancel", cancelInlinePointerGesture, { capture: true });
+  document.addEventListener("lostpointercapture", cancelInlinePointerGesture, { capture: true });
+  document.addEventListener("keydown", handleInlineKeyDown, { capture: true });
+  document.addEventListener("keyup", handleInlineKeyUp, { capture: true });
+  document.addEventListener("scroll", function handlePageScroll(event) {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    closeInlineGlossaryOutsidePath(path);
+  }, { capture: true, passive: true });
 
   window.addEventListener("focus", function handleWindowFocus() {
     void refreshKeyStatus();
     if (state.workspaceStatus.status === "unavailable") void state.contextClient?.retry();
   });
+  window.addEventListener("blur", function handleWindowBlur() {
+    closeInlineGlossary();
+  });
   document.addEventListener("visibilitychange", function handleVisibilityChange() {
     refreshKeyStatusWhenVisible();
     retryWorkspaceWhenVisible();
+    if (document.visibilityState !== "visible") closeInlineGlossary();
   });
   window.addEventListener("resize", function handleWindowResize() {
+    closeInlineGlossary();
     closeTemplatePreview();
     applyShellState();
   });
 
   chrome.runtime.onMessage.addListener(function handleRuntimeMessage(message, _sender, sendResponse) {
     if (message?.type === TOGGLE_MESSAGE) {
+      closeInlineGlossary();
       ensureMounted();
       togglePanel();
       sendResponse({ ok: true, open: state.shellPhase === "opening" || state.shellPhase === "open" });
@@ -2226,6 +2695,7 @@
         conversationScope: message.conversationScope,
         revision: message.revision,
       })) return false;
+      closeInlineGlossaryForInvalidation(message.entityFamily);
       const deletionClosed = closeWorkspaceDelete();
       if (message.entityFamily === workspaceContract.ENTITY_FAMILIES.ALL) {
         state.glossaryEntries = [];

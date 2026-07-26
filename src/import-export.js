@@ -320,6 +320,17 @@
     }));
     const ids = Object.fromEntries(DATA_ARRAYS.map((family) => [family, new Set(payload[family].map((item) => item.id))]));
     payload.glossarySenses.forEach((item) => { if (!ids.glossaryConcepts.has(item.conceptId)) errors.push({ code: "BROKEN_REFERENCE", path: `sense:${item.id}` }); });
+    const senseCounts = new Map();
+    payload.glossarySenses.forEach((item) => {
+      const count = (senseCounts.get(item.conceptId) || 0) + 1;
+      senseCounts.set(item.conceptId, count);
+      if (count > 1) {
+        errors.push({
+          code: "GLOSSARY_INVARIANT_VIOLATION",
+          path: `concept:${item.conceptId}`,
+        });
+      }
+    });
     payload.glossaryLinks.forEach((item) => {
       if (!ids.glossarySenses.has(item.senseId) || !ids.conversations.has(item.conversationId)) errors.push({ code: "BROKEN_REFERENCE", path: `glossaryLink:${item.id}` });
     });
@@ -327,6 +338,35 @@
       if (!ids.savedItems.has(item.itemId) || !ids.conversations.has(item.conversationId)) errors.push({ code: "BROKEN_REFERENCE", path: `savedItemLink:${item.id}` });
     });
     return { ok: errors.length === 0, errors, warnings, payload };
+  }
+
+  function assertOneSensePerConcept(value) {
+    const concepts = Array.isArray(value?.glossaryConcepts) ? value.glossaryConcepts : [];
+    const senses = Array.isArray(value?.glossarySenses) ? value.glossarySenses : [];
+    const conceptIds = new Set();
+    const normalizedTerms = new Set();
+    concepts.forEach((concept) => {
+      const normalizedKey = concept?.normalizedKey
+        || contract.canonicalizeTerm(concept?.displayTerm || "")?.normalizedKey;
+      if (!contract.validEntityId(concept?.id) || !normalizedKey
+        || conceptIds.has(concept.id) || normalizedTerms.has(normalizedKey)) {
+        throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      }
+      conceptIds.add(concept.id);
+      normalizedTerms.add(normalizedKey);
+    });
+    const counts = new Map();
+    const senseIds = new Set();
+    senses.forEach((sense) => {
+      const count = (counts.get(sense?.conceptId) || 0) + 1;
+      if (!contract.validEntityId(sense?.id) || senseIds.has(sense.id)
+        || !conceptIds.has(sense?.conceptId) || count > 1) {
+        throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      }
+      senseIds.add(sense.id);
+      counts.set(sense.conceptId, count);
+    });
+    return true;
   }
 
   function canonicalChoice(left, right) {
@@ -371,6 +411,12 @@
     source.conversations = groupFamily("conversations", (item) => item.kind === "stable" ? `stable:${item.host}:${item.remoteConversationId}` : `temporary:${item.id}`);
     source.glossaryConcepts = groupFamily("glossaryConcepts", (item) => contract.canonicalizeTerm(item.displayTerm).normalizedKey);
     source.glossarySenses.forEach((item) => { item.conceptId = remaps.glossaryConcepts.get(item.conceptId) || item.conceptId; });
+    const canonicalSenseCounts = new Map();
+    source.glossarySenses.forEach((item) => {
+      const count = (canonicalSenseCounts.get(item.conceptId) || 0) + 1;
+      if (count > 1) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      canonicalSenseCounts.set(item.conceptId, count);
+    });
     source.glossarySenses = groupFamily("glossarySenses", (item) => contract.createSenseNaturalKey(item.conceptId, item.translation, item.definition));
     source.savedItems = groupFamily("savedItems", (item) => contract.normalizeSavedTextKey(item.text));
     source.glossaryLinks.forEach((item) => {
@@ -421,7 +467,19 @@
     if (!sanitized.ok) return sanitized;
     const validated = validatePortableRecords(sanitized.payload, sanitized.warnings);
     if (!validated.ok) return validated;
-    const canonical = canonicalizeDataPayload(validated.payload);
+    let canonical;
+    try {
+      assertOneSensePerConcept(validated.payload);
+      canonical = canonicalizeDataPayload(validated.payload);
+      assertOneSensePerConcept(canonical.payload);
+    } catch (error) {
+      if (error?.message !== "GLOSSARY_INVARIANT_VIOLATION") throw error;
+      return {
+        ok: false,
+        errors: [{ code: "GLOSSARY_INVARIANT_VIOLATION", path: "payload.glossarySenses" }],
+        warnings: validated.warnings,
+      };
+    }
     if (canonical.skipped) validated.warnings.push({ code: "CONCEPT_WITHOUT_SENSE_SKIPPED", count: canonical.skipped });
     const canonicalValidation = validatePortableRecords(canonical.payload, validated.warnings);
     if (!canonicalValidation.ok) return canonicalValidation;
@@ -475,6 +533,8 @@
     const mode = modeValue === "replace" ? "replace" : "merge";
     const datasetId = validatedValue.envelope.datasetId;
     const source = await hydratePortable(validatedValue.envelope.payload, datasetId, cryptoValue);
+    assertOneSensePerConcept(source);
+    assertOneSensePerConcept(currentValue);
     if (mode === "replace") {
       normalizeLinkOrders(source.glossaryLinks);
       normalizeLinkOrders(source.savedItemLinks);
@@ -549,26 +609,45 @@
       const existing = conceptIdentity.get(item.normalizedKey);
       if (existing) {
         maps.glossaryConcepts.set(item.id, existing.id);
-        existing.createdAt = Math.min(existing.createdAt, item.createdAt);
-        existing.updatedAt = Math.max(existing.updatedAt, item.updatedAt);
         continue;
       }
       const id = await allocate("glossaryConcepts", item.id);
       const added = { ...item, id }; target.glossaryConcepts.push(added); conceptIdentity.set(item.normalizedKey, added); maps.glossaryConcepts.set(item.id, id);
     }
-    const senseIdentity = new Map(target.glossarySenses.map((item) => [contract.createSenseNaturalKey(item.conceptId, item.translation, item.definition), item]));
+    const senseByConcept = new Map(target.glossarySenses.map((item) => [item.conceptId, item]));
     for (const original of source.glossarySenses) {
       const conceptId = maps.glossaryConcepts.get(original.conceptId) || original.conceptId;
       const key = contract.createSenseNaturalKey(conceptId, original.translation, original.definition);
-      const existing = senseIdentity.get(key);
+      const existing = senseByConcept.get(conceptId);
       if (existing) {
+        const normalizedTranslation = contract.normalizeMeaning(
+          original.translation,
+          200,
+        ).toLocaleLowerCase("ru-RU");
+        const normalizedDefinition = contract.normalizeMeaning(
+          original.definition,
+          500,
+        ).toLocaleLowerCase("ru-RU");
+        const existingTranslation = contract.normalizeMeaning(
+          existing.translation,
+          200,
+        )?.toLocaleLowerCase("ru-RU");
+        const existingDefinition = contract.normalizeMeaning(
+          existing.definition,
+          500,
+        )?.toLocaleLowerCase("ru-RU");
+        if (existingTranslation !== normalizedTranslation
+          || existingDefinition !== normalizedDefinition) {
+          throw new Error("GLOSSARY_IMPORT_CONFLICT");
+        }
         maps.glossarySenses.set(original.id, existing.id);
-        existing.createdAt = Math.min(existing.createdAt, original.createdAt);
-        existing.updatedAt = Math.max(existing.updatedAt, original.updatedAt);
         continue;
       }
       const id = await allocate("glossarySenses", original.id);
-      const added = { ...original, id, conceptId, naturalKey: key }; target.glossarySenses.push(added); senseIdentity.set(key, added); maps.glossarySenses.set(original.id, id);
+      const added = { ...original, id, conceptId, naturalKey: key };
+      target.glossarySenses.push(added);
+      senseByConcept.set(conceptId, added);
+      maps.glossarySenses.set(original.id, id);
     }
     const savedIdentity = new Map(target.savedItems.map((item) => [contract.normalizeSavedTextKey(item.text), item]));
     for (const item of source.savedItems) {
@@ -607,6 +686,7 @@
     }
     await mergeLinks("glossaryLinks", "senseId", maps.glossarySenses);
     await mergeLinks("savedItemLinks", "itemId", maps.savedItems);
+    assertOneSensePerConcept(target);
     const preview = dataPreview(currentValue, target, mode, validatedValue.canonical, remapCount.value);
     return { mode, state: target, preview, expectedCanonical: clone(target) };
   }

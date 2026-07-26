@@ -75,7 +75,7 @@ button:disabled { cursor: wait; opacity: .6; }
 .backup-section { display: grid; min-width: 0; gap: 12px; }
 .backup-section + .backup-section { padding-top: 22px; border-top: 1px solid var(--separator-muted); }
 .backup-section h3 { margin: 0; font-size: 17px; }
-.file-button { display: inline-flex; min-height: 38px; padding: 8px 12px; align-items: center; border: 1px solid var(--border); border-radius: 9px; color: var(--text); cursor: pointer; }
+.file-button { display: inline-flex; min-height: 38px; padding: 8px 12px; align-items: center; border: 1px solid var(--border); border-radius: 9px; color: var(--text); font-weight: inherit; cursor: pointer; }
 .file-button:hover { border-color: var(--accent); }
 .file-button:has(input:disabled) { cursor: wait; opacity: .6; }
 .file-button input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }

@@ -19,6 +19,30 @@
     return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
   }
 
+  function compareText(leftValue, rightValue) {
+    const left = String(leftValue ?? "");
+    const right = String(rightValue ?? "");
+    return left < right ? -1 : (left > right ? 1 : 0);
+  }
+
+  function stableValue(value) {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, stableValue(value[key])]),
+    );
+  }
+
+  function sameUserData(leftValue, rightValue) {
+    const comparable = (value) => Object.fromEntries(USER_STORE_NAMES.map((name) => [
+      name,
+      (Array.isArray(value?.[name]) ? value[name] : [])
+        .map(stableValue)
+        .sort((left, right) => compareText(left.id, right.id)),
+    ]));
+    return JSON.stringify(comparable(leftValue)) === JSON.stringify(comparable(rightValue));
+  }
+
   function nowValue(value) {
     return Number.isFinite(value) ? value : Date.now();
   }
@@ -161,10 +185,7 @@
     const key = linkKey(entityId, conversationId);
     const existing = links.find((item) => item.linkKey === key);
     const now = nowValue(timestamp);
-    if (existing) {
-      existing.lastSeenAt = Math.max(validTimestamp(existing.lastSeenAt, now), now);
-      return { link: existing, created: false };
-    }
+    if (existing) return { link: existing, created: false };
     const item = {
       id: idFactory("link"),
       [entityField]: entityId,
@@ -178,71 +199,239 @@
     return { link: item, created: true };
   }
 
-  function migrateLegacyInState(state, entriesValue, timestamp, idFactory) {
-    const existingMarker = getMeta(state, "v1GlossaryMigrationState")?.value;
-    if (existingMarker?.status === "complete") return { migrated: false, marker: clone(existingMarker) };
-    const now = nowValue(timestamp);
-    let migratedCount = 0;
-    let skippedCount = 0;
-    const entries = Array.isArray(entriesValue) ? entriesValue : [];
+  function normalizedGlossaryContent(value) {
+    const translation = contract.normalizeMeaning(value?.translation, 200);
+    const definition = contract.normalizeMeaning(value?.definition, 500);
+    if (!translation || !definition) return null;
+    return {
+      translation,
+      definition,
+      normalizedTranslation: translation.toLocaleLowerCase("ru-RU"),
+      normalizedDefinition: definition.toLocaleLowerCase("ru-RU"),
+    };
+  }
 
-    entries.forEach((entry) => {
+  function sameGlossaryContent(left, right) {
+    return Boolean(left && right
+      && left.normalizedTranslation === right.normalizedTranslation
+      && left.normalizedDefinition === right.normalizedDefinition);
+  }
+
+  function validGlossaryReplacementCommand(command) {
+    if (!command || typeof command !== "object") return false;
+    const commandKeys = Object.keys(command).sort();
+    const replacementKeys = command.replacement && typeof command.replacement === "object"
+      ? Object.keys(command.replacement).sort()
+      : [];
+    return JSON.stringify(commandKeys) === JSON.stringify([
+      "expectedUpdatedAt",
+      "replacement",
+      "senseId",
+    ])
+      && JSON.stringify(replacementKeys) === JSON.stringify(["definition", "translation"])
+      && contract.validEntityId(command.senseId)
+      && Number.isFinite(command.expectedUpdatedAt)
+      && Boolean(normalizedGlossaryContent(command.replacement));
+  }
+
+  function assertGlossaryInvariant(stateValue) {
+    const state = stateValue && typeof stateValue === "object" ? stateValue : {};
+    const concepts = Array.isArray(state.glossaryConcepts) ? state.glossaryConcepts : [];
+    const senses = Array.isArray(state.glossarySenses) ? state.glossarySenses : [];
+    const conceptIds = new Set();
+    const normalizedTerms = new Set();
+    concepts.forEach((concept) => {
+      const canonical = contract.canonicalizeTerm(concept?.displayTerm || "");
+      if (!contract.validEntityId(concept?.id) || !canonical
+        || concept.canonicalTerm !== canonical.canonicalTerm
+        || concept.normalizedKey !== canonical.normalizedKey
+        || !Number.isFinite(concept.createdAt) || concept.createdAt < 0
+        || !Number.isFinite(concept.updatedAt) || concept.updatedAt < concept.createdAt
+        || conceptIds.has(concept.id) || normalizedTerms.has(canonical.normalizedKey)) {
+        throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      }
+      conceptIds.add(concept.id);
+      normalizedTerms.add(canonical.normalizedKey);
+    });
+    const counts = new Map();
+    const senseIds = new Set();
+    senses.forEach((sense) => {
+      const content = normalizedGlossaryContent(sense);
+      if (!contract.validEntityId(sense?.id) || senseIds.has(sense.id)
+        || !conceptIds.has(sense?.conceptId) || !content
+        || sense.normalizedTranslation !== content.normalizedTranslation
+        || sense.normalizedDefinition !== content.normalizedDefinition
+        || sense.naturalKey !== contract.createSenseNaturalKey(
+          sense.conceptId,
+          content.translation,
+          content.definition,
+        )
+        || !Number.isFinite(sense.createdAt) || sense.createdAt < 0
+        || !Number.isFinite(sense.updatedAt) || sense.updatedAt < sense.createdAt) {
+        throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      }
+      senseIds.add(sense.id);
+      const count = (counts.get(sense.conceptId) || 0) + 1;
+      if (count > 1) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      counts.set(sense.conceptId, count);
+    });
+    return true;
+  }
+
+  function assertGlossaryMergeCompatible(currentValue, incomingValue) {
+    assertGlossaryInvariant(currentValue);
+    assertGlossaryInvariant(incomingValue);
+    const currentConcepts = Array.isArray(currentValue?.glossaryConcepts)
+      ? currentValue.glossaryConcepts
+      : [];
+    const currentSenses = Array.isArray(currentValue?.glossarySenses)
+      ? currentValue.glossarySenses
+      : [];
+    const incomingConcepts = Array.isArray(incomingValue?.glossaryConcepts)
+      ? incomingValue.glossaryConcepts
+      : [];
+    const incomingSenses = Array.isArray(incomingValue?.glossarySenses)
+      ? incomingValue.glossarySenses
+      : [];
+    const currentConceptById = new Map(currentConcepts.map((concept) => [concept.id, concept]));
+    const currentConceptByTerm = new Map(
+      currentConcepts.map((concept) => [concept.normalizedKey, concept]),
+    );
+    const currentSenseById = new Map(currentSenses.map((sense) => [sense.id, sense]));
+    const currentSenseByConcept = new Map(
+      currentSenses.map((sense) => [sense.conceptId, sense]),
+    );
+    const incomingSenseByConcept = new Map(
+      incomingSenses.map((sense) => [sense.conceptId, sense]),
+    );
+    incomingConcepts.forEach((concept) => {
+      const sameId = currentConceptById.get(concept.id);
+      const sameTerm = currentConceptByTerm.get(concept.normalizedKey);
+      if ((sameId && sameId.normalizedKey !== concept.normalizedKey)
+        || (sameTerm && sameTerm.id !== concept.id)) {
+        throw new Error("GLOSSARY_IMPORT_CONFLICT");
+      }
+      if (!sameId) return;
+      const currentSense = currentSenseByConcept.get(sameId.id);
+      const incomingSense = incomingSenseByConcept.get(concept.id);
+      if (currentSense && incomingSense && !sameGlossaryContent(currentSense, incomingSense)) {
+        throw new Error("GLOSSARY_IMPORT_CONFLICT");
+      }
+    });
+    incomingSenses.forEach((sense) => {
+      const sameId = currentSenseById.get(sense.id);
+      if (sameId && (sameId.conceptId !== sense.conceptId
+        || !sameGlossaryContent(sameId, sense))) {
+        throw new Error("GLOSSARY_IMPORT_CONFLICT");
+      }
+    });
+    return true;
+  }
+
+  function prepareLegacyGlossary(entriesValue, timestamp) {
+    const source = Array.isArray(entriesValue) ? entriesValue : [];
+    const byTerm = new Map();
+    let skippedCount = 0;
+    let validCount = 0;
+    source.forEach((entry) => {
       const term = contract.canonicalizeTerm(entry?.term || entry?.normalizedTerm || "");
-      const translation = contract.normalizeMeaning(entry?.translation, 200);
-      const definition = contract.normalizeMeaning(entry?.definition, 500);
-      if (!term || !translation || !definition) {
+      const content = normalizedGlossaryContent(entry);
+      if (!term || !content) {
         skippedCount += 1;
         return;
       }
-      const createdAt = validTimestamp(entry.createdAt, now);
+      validCount += 1;
+      const createdAt = validTimestamp(entry.createdAt, timestamp);
       const updatedAt = Math.max(createdAt, validTimestamp(entry.updatedAt, createdAt));
-      let concept = state.glossaryConcepts.find((item) => item.normalizedKey === term.normalizedKey);
+      const existing = byTerm.get(term.normalizedKey);
+      if (existing) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      byTerm.set(term.normalizedKey, {
+        term,
+        ...content,
+        createdAt,
+        updatedAt,
+      });
+    });
+    return {
+      sourceCount: source.length,
+      validCount,
+      skippedCount,
+      entries: [...byTerm.values()],
+    };
+  }
+
+  function assertLegacyMigrationCompatible(state, plan) {
+    assertGlossaryInvariant(state);
+    plan.entries.forEach((item) => {
+      const concept = state.glossaryConcepts.find((value) => (
+        value.normalizedKey === item.term.normalizedKey
+      ));
+      if (!concept) return;
+      const senses = state.glossarySenses.filter((sense) => sense.conceptId === concept.id);
+      if (senses.length > 1 || (senses.length === 1 && !sameGlossaryContent(senses[0], item))) {
+        throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      }
+    });
+    return true;
+  }
+
+  function migrateLegacyInState(state, entriesValue, timestamp, idFactory) {
+    assertGlossaryInvariant(state);
+    const existingMarker = getMeta(state, "v1GlossaryMigrationState")?.value;
+    if (existingMarker?.status === "complete") return { migrated: false, marker: clone(existingMarker) };
+    const now = nowValue(timestamp);
+    const plan = prepareLegacyGlossary(entriesValue, now);
+    assertLegacyMigrationCompatible(state, plan);
+
+    plan.entries.forEach((item) => {
+      let concept = state.glossaryConcepts.find((value) => (
+        value.normalizedKey === item.term.normalizedKey
+      ));
       if (!concept) {
         concept = {
           id: idFactory("concept"),
-          displayTerm: term.displayTerm,
-          canonicalTerm: term.canonicalTerm,
-          normalizedKey: term.normalizedKey,
-          createdAt,
-          updatedAt,
+          displayTerm: item.term.displayTerm,
+          canonicalTerm: item.term.canonicalTerm,
+          normalizedKey: item.term.normalizedKey,
+          createdAt: item.createdAt,
+          updatedAt: item.updatedAt,
         };
         state.glossaryConcepts.push(concept);
       } else {
-        concept.createdAt = Math.min(validTimestamp(concept.createdAt, createdAt), createdAt);
-        concept.updatedAt = Math.max(validTimestamp(concept.updatedAt, updatedAt), updatedAt);
+        concept.createdAt = Math.min(validTimestamp(concept.createdAt, item.createdAt), item.createdAt);
+        concept.updatedAt = Math.max(validTimestamp(concept.updatedAt, item.updatedAt), item.updatedAt);
       }
-      const naturalKey = contract.createSenseNaturalKey(concept.id, translation, definition);
-      let sense = state.glossarySenses.find((item) => item.naturalKey === naturalKey);
+      const naturalKey = contract.createSenseNaturalKey(concept.id, item.translation, item.definition);
+      let sense = state.glossarySenses.find((value) => value.conceptId === concept.id);
       if (!sense) {
         sense = {
           id: idFactory("sense"),
           conceptId: concept.id,
-          translation,
-          definition,
-          normalizedTranslation: contract.normalizeMeaning(translation, 200).toLocaleLowerCase("ru-RU"),
-          normalizedDefinition: contract.normalizeMeaning(definition, 500).toLocaleLowerCase("ru-RU"),
+          translation: item.translation,
+          definition: item.definition,
+          normalizedTranslation: item.normalizedTranslation,
+          normalizedDefinition: item.normalizedDefinition,
           naturalKey,
-          createdAt,
-          updatedAt,
+          createdAt: item.createdAt,
+          updatedAt: item.updatedAt,
         };
         state.glossarySenses.push(sense);
       } else {
-        sense.createdAt = Math.min(validTimestamp(sense.createdAt, createdAt), createdAt);
-        sense.updatedAt = Math.max(validTimestamp(sense.updatedAt, updatedAt), updatedAt);
+        sense.createdAt = Math.min(validTimestamp(sense.createdAt, item.createdAt), item.createdAt);
+        sense.updatedAt = Math.max(validTimestamp(sense.updatedAt, item.updatedAt), item.updatedAt);
       }
-      migratedCount += 1;
     });
 
     const marker = {
       status: "complete",
       sourceSchemaVersion: 1,
-      sourceCount: entries.length,
-      migratedCount,
-      skippedCount,
+      sourceCount: plan.sourceCount,
+      migratedCount: plan.validCount,
+      skippedCount: plan.skippedCount,
     };
     setMeta(state, "v1GlossaryMigrationState", marker, now);
     setMeta(state, "lastMigrationAt", now, now);
-    if (migratedCount) bumpRevision(state, contract.ENTITY_FAMILIES.GLOSSARY, now);
+    if (plan.validCount) bumpRevision(state, contract.ENTITY_FAMILIES.GLOSSARY, now);
     return { migrated: true, marker: clone(marker) };
   }
 
@@ -284,46 +473,6 @@
     return { orphaned: true, context: clone(conversation) };
   }
 
-  function conceptAndSense(state, value, timestamp, idFactory) {
-    const term = contract.canonicalizeTerm(value?.term || value?.displayTerm || "");
-    const translation = contract.normalizeMeaning(value?.translation, 200);
-    const definition = contract.normalizeMeaning(value?.definition, 500);
-    if (!term || !translation || !definition) return null;
-    const now = nowValue(timestamp);
-    let concept = state.glossaryConcepts.find((item) => item.normalizedKey === term.normalizedKey);
-    const conceptCreated = !concept;
-    if (!concept) {
-      concept = {
-        id: idFactory("concept"),
-        displayTerm: term.displayTerm,
-        canonicalTerm: term.canonicalTerm,
-        normalizedKey: term.normalizedKey,
-        createdAt: now,
-        updatedAt: now,
-      };
-      state.glossaryConcepts.push(concept);
-    }
-    const naturalKey = contract.createSenseNaturalKey(concept.id, translation, definition);
-    let sense = state.glossarySenses.find((item) => item.naturalKey === naturalKey);
-    const senseCreated = !sense;
-    if (!sense) {
-      sense = {
-        id: idFactory("sense"),
-        conceptId: concept.id,
-        translation,
-        definition,
-        normalizedTranslation: translation.toLocaleLowerCase("ru-RU"),
-        normalizedDefinition: definition.toLocaleLowerCase("ru-RU"),
-        naturalKey,
-        createdAt: now,
-        updatedAt: now,
-      };
-      state.glossarySenses.push(sense);
-      concept.updatedAt = Math.max(validTimestamp(concept.updatedAt, now), now);
-    }
-    return { concept, sense, conceptCreated, senseCreated };
-  }
-
   function publicSense(state, sense, link) {
     const concept = state.glossaryConcepts.find((item) => item.id === sense.conceptId);
     if (!concept) return null;
@@ -343,44 +492,266 @@
     };
   }
 
+  function inlinePublicSense(entry) {
+    if (!entry) return null;
+    return {
+      id: entry.id,
+      senseId: entry.senseId,
+      conceptId: entry.conceptId,
+      term: entry.term,
+      canonicalTerm: entry.canonicalTerm,
+      normalizedTerm: entry.normalizedTerm,
+      translation: entry.translation,
+      definition: entry.definition,
+      attached: entry.attached === true,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+    };
+  }
+
+  function compareInlineGlossaryEntries(left, right) {
+    if (left.attached !== right.attached) return left.attached ? -1 : 1;
+    const updatedDifference = (Number(right.updatedAt) || 0) - (Number(left.updatedAt) || 0);
+    if (updatedDifference) return updatedDifference;
+    const leftId = String(left.id || "");
+    const rightId = String(right.id || "");
+    return leftId < rightId ? -1 : (leftId > rightId ? 1 : 0);
+  }
+
+  const INLINE_MATCH_RANK = Object.freeze({
+    exact: 0,
+    contiguous: 1,
+    "full-token": 2,
+  });
+
+  function inlineMatchClass(candidate, concept) {
+    const storedTokens = contract.tokenizeGlossaryTerm(
+      concept?.displayTerm || concept?.canonicalTerm || "",
+    );
+    const candidateTokens = Array.isArray(candidate?.tokens) ? candidate.tokens : [];
+    if (!storedTokens.length || !candidateTokens.length) return null;
+    if (candidate.normalizedKey === concept.normalizedKey) return "exact";
+    const maximumStart = storedTokens.length - candidateTokens.length;
+    for (let start = 0; start <= maximumStart; start += 1) {
+      if (candidateTokens.every((token, index) => storedTokens[start + index] === token)) {
+        return "contiguous";
+      }
+    }
+    const storedSet = new Set(storedTokens);
+    return candidateTokens.every((token) => storedSet.has(token)) ? "full-token" : null;
+  }
+
+  function compareInlineAssignments(left, right) {
+    return INLINE_MATCH_RANK[left.matchClass] - INLINE_MATCH_RANK[right.matchClass]
+      || right.candidate.tokenCount - left.candidate.tokenCount
+      || left.candidate.firstIndex - right.candidate.firstIndex
+      || compareText(left.candidate.normalizedKey, right.candidate.normalizedKey)
+      || compareText(
+        String(left.entry.senseId || left.entry.id || ""),
+        String(right.entry.senseId || right.entry.id || ""),
+      );
+  }
+
+  function compareInlineGroupEntries(left, right) {
+    return INLINE_MATCH_RANK[left.matchClass] - INLINE_MATCH_RANK[right.matchClass]
+      || compareInlineGlossaryEntries(left, right);
+  }
+
+  function compareInlineCandidatesBySource(left, right) {
+    return left.firstIndex - right.firstIndex
+      || right.tokenCount - left.tokenCount
+      || compareText(left.normalizedKey, right.normalizedKey);
+  }
+
+  function lookupGlossarySelectionInState(state, requestValue) {
+    const request = requestValue || {};
+    const extracted = contract.extractInlineGlossaryCandidates(request.text);
+    if (!contract.isScopeKey(request.conversationScope) || !extracted.ok) {
+      throw new Error("INVALID_GLOSSARY_LOOKUP");
+    }
+    const conversation = conversationByScope(state, request.conversationScope);
+    if (!conversation) throw new Error("CONVERSATION_NOT_FOUND");
+    const matchedConcepts = [];
+    const matchedNormalizedTerms = new Set();
+    state.glossaryConcepts.forEach((concept) => {
+      const matches = extracted.candidates.flatMap((candidate) => {
+        const matchClass = inlineMatchClass(candidate, concept);
+        return matchClass ? [{ candidate, matchClass }] : [];
+      });
+      if (!matches.length) return;
+      if (matchedNormalizedTerms.has(concept.normalizedKey)) {
+        throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      }
+      matchedNormalizedTerms.add(concept.normalizedKey);
+      const senses = state.glossarySenses.filter((sense) => sense.conceptId === concept.id);
+      if (senses.length !== 1) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      const sense = senses[0];
+      const entry = inlinePublicSense(publicSense(
+        state,
+        sense,
+        state.glossaryLinks.find((link) => (
+          link.senseId === sense.id && link.conversationId === conversation.id
+        )),
+      ));
+      if (!entry) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      matchedConcepts.push({ matches, entry });
+    });
+
+    const coveredCandidateKeys = new Set();
+    matchedConcepts.forEach(({ matches }) => {
+      matches.forEach((match) => coveredCandidateKeys.add(match.candidate.normalizedKey));
+    });
+    const assignments = matchedConcepts.map(({ matches, entry }) => {
+      const candidates = matches.map((match) => ({
+        ...match,
+        entry: { ...entry, matchClass: match.matchClass },
+      }));
+      candidates.sort(compareInlineAssignments);
+      return candidates[0];
+    });
+
+    const sourceOrderedCandidates = [...extracted.candidates].sort(compareInlineCandidatesBySource);
+    const grouped = new Map();
+    assignments.forEach((assignment) => {
+      const key = assignment.candidate.normalizedKey;
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(assignment.entry);
+    });
+    grouped.forEach((entries) => entries.sort(compareInlineGroupEntries));
+    const matchedEntryCountBeforeLimit = assignments.length;
+    let remaining = contract.MAX_INLINE_RESULT_ENTRIES;
+    const returnedByCandidate = new Map();
+    sourceOrderedCandidates.forEach((candidate) => {
+      const entries = grouped.get(candidate.normalizedKey) || [];
+      if (!entries.length || remaining <= 0) return;
+      returnedByCandidate.set(candidate.normalizedKey, [entries[0]]);
+      remaining -= 1;
+    });
+    sourceOrderedCandidates.forEach((candidate) => {
+      const entries = grouped.get(candidate.normalizedKey) || [];
+      const returned = returnedByCandidate.get(candidate.normalizedKey);
+      if (!returned || remaining <= 0 || entries.length <= 1) return;
+      const additional = entries.slice(1, 1 + remaining);
+      returned.push(...additional);
+      remaining -= additional.length;
+    });
+    const groups = [];
+    sourceOrderedCandidates.forEach((candidate) => {
+      const entries = grouped.get(candidate.normalizedKey) || [];
+      const returnedEntries = returnedByCandidate.get(candidate.normalizedKey) || [];
+      if (!returnedEntries.length) return;
+      groups.push({
+        candidate,
+        matchClass: returnedEntries[0].matchClass,
+        exactMissing: !entries.some((entry) => entry.matchClass === "exact"),
+        entries: returnedEntries,
+      });
+    });
+    const missing = extracted.candidates.filter((candidate) => (
+      candidate.visibility === "primary"
+      && !coveredCandidateKeys.has(candidate.normalizedKey)
+    ));
+    const matchedEntryCountReturned = groups.reduce((total, group) => total + group.entries.length, 0);
+    return {
+      candidates: extracted.candidates,
+      groups,
+      missing,
+      totals: {
+        candidateCountBeforeLimit: extracted.candidateCountBeforeLimit,
+        candidateCountReturned: extracted.candidateCountReturned,
+        matchedCandidateCount: coveredCandidateKeys.size,
+        matchedEntryCountBeforeLimit,
+        matchedEntryCountReturned,
+      },
+      truncated: {
+        candidates: extracted.candidateTruncated,
+        entries: matchedEntryCountReturned < matchedEntryCountBeforeLimit,
+      },
+    };
+  }
+
   function addGlossaryTermsInState(state, termsValue, conversationScope, timestamp, idFactory) {
     const conversation = conversationByScope(state, conversationScope);
     if (!conversation) throw new Error("CONVERSATION_NOT_FOUND");
+    assertGlossaryInvariant(state);
     const results = [];
     let changed = false;
     (Array.isArray(termsValue) ? termsValue : []).forEach((termValue) => {
-      const resolved = conceptAndSense(state, termValue, timestamp, idFactory);
-      if (!resolved) return;
-      const linked = ensureLink(state.glossaryLinks, "senseId", resolved.sense.id, conversation.id, timestamp, idFactory);
-      changed = changed || resolved.conceptCreated || resolved.senseCreated || linked.created;
-      const candidates = resolved.senseCreated
-        ? state.glossarySenses.filter((item) => item.id !== resolved.sense.id
-          && item.conceptId === resolved.concept.id
-          && item.normalizedTranslation === resolved.sense.normalizedTranslation
-          && item.normalizedDefinition !== resolved.sense.normalizedDefinition)
-        : [];
-      const candidate = candidates.length === 1 ? candidates[0] : null;
-      const result = {
-        ...publicSense(state, resolved.sense, linked.link),
-        status: candidate ? "duplicate" : (resolved.senseCreated ? "new" : "alreadySaved"),
-        savedEntry: publicSense(state, resolved.sense, linked.link),
-      };
-      if (candidate) {
-        result.savedEntry = publicSense(state, candidate, null);
-        result.replacementCandidate = {
-          status: "single",
-          targetSenseId: candidate.id,
-          expectedUpdatedAt: candidate.updatedAt,
-          newSenseId: resolved.sense.id,
-          current: {
-            translation: candidate.translation,
-            definition: candidate.definition,
-          },
+      const term = contract.canonicalizeTerm(termValue?.term || termValue?.displayTerm || "");
+      const content = normalizedGlossaryContent(termValue);
+      if (!term || !content) return;
+      const now = nowValue(timestamp);
+      let concept = state.glossaryConcepts.find((item) => item.normalizedKey === term.normalizedKey);
+      let conceptCreated = false;
+      if (!concept) {
+        conceptCreated = true;
+        concept = {
+          id: idFactory("concept"),
+          displayTerm: term.displayTerm,
+          canonicalTerm: term.canonicalTerm,
+          normalizedKey: term.normalizedKey,
+          createdAt: now,
+          updatedAt: now,
         };
-      } else if (candidates.length > 1) {
-        result.replacementCandidate = { status: "multiple", count: candidates.length };
+        state.glossaryConcepts.push(concept);
       }
-      results.push(result);
+      const senses = state.glossarySenses.filter((sense) => sense.conceptId === concept.id);
+      if (senses.length > 1) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+      let sense = senses[0] || null;
+      const senseCreated = !sense;
+      if (!sense) {
+        sense = {
+          id: idFactory("sense"),
+          conceptId: concept.id,
+          ...content,
+          naturalKey: contract.createSenseNaturalKey(concept.id, content.translation, content.definition),
+          createdAt: now,
+          updatedAt: now,
+        };
+        state.glossarySenses.push(sense);
+        concept.updatedAt = Math.max(validTimestamp(concept.updatedAt, now), now);
+      }
+      const linked = ensureLink(
+        state.glossaryLinks,
+        "senseId",
+        sense.id,
+        conversation.id,
+        now,
+        idFactory,
+      );
+      changed = changed || conceptCreated || senseCreated || linked.created;
+      const storedEntry = publicSense(state, sense, linked.link);
+      if (senseCreated || sameGlossaryContent(sense, content)) {
+        results.push({
+          ...storedEntry,
+          status: senseCreated ? "new" : "alreadySaved",
+          savedEntry: storedEntry,
+        });
+      } else {
+        const proposed = {
+          translation: content.translation,
+          definition: content.definition,
+        };
+        results.push({
+          ...storedEntry,
+          term: term.displayTerm,
+          canonicalTerm: term.canonicalTerm,
+          normalizedTerm: term.normalizedKey,
+          translation: proposed.translation,
+          definition: proposed.definition,
+          status: "replacementAvailable",
+          savedEntry: storedEntry,
+          replacementCandidate: {
+            targetSenseId: sense.id,
+            expectedUpdatedAt: sense.updatedAt,
+            current: {
+              translation: sense.translation,
+              definition: sense.definition,
+            },
+            proposed,
+          },
+        });
+      }
     });
     const revision = changed ? bumpRevision(state, contract.ENTITY_FAMILIES.GLOSSARY, timestamp) : Number(getMeta(state, `revision:${contract.ENTITY_FAMILIES.GLOSSARY}`)?.value || 0);
     return { results, changed, revision };
@@ -462,49 +833,53 @@
     return { changed: true, revision: bumpRevision(state, contract.ENTITY_FAMILIES.GLOSSARY, timestamp) };
   }
 
-  function replaceGlossarySenseInState(state, command, timestamp) {
-    const sense = state.glossarySenses.find((item) => item.id === command?.senseId);
-    if (!sense) throw new Error("GLOSSARY_NOT_FOUND");
-    const current = publicSense(state, sense, null);
-    if (!Number.isFinite(command?.expectedUpdatedAt)) throw new Error("INVALID_GLOSSARY_REPLACEMENT");
-    if (command.expectedUpdatedAt !== sense.updatedAt) {
-      return { ok: false, stale: true, current };
-    }
-    const source = state.glossarySenses.find((item) => item.id === command?.sourceSenseId);
-    const concept = state.glossaryConcepts.find((item) => item.id === sense.conceptId);
-    if (!concept || !source || source.id === sense.id || source.conceptId !== sense.conceptId
-      || source.normalizedTranslation !== sense.normalizedTranslation
-      || source.normalizedDefinition === sense.normalizedDefinition) {
+  function replaceGlossarySenseInState(state, command, conversationScope, timestamp) {
+    assertGlossaryInvariant(state);
+    if (!validGlossaryReplacementCommand(command)) {
       throw new Error("INVALID_GLOSSARY_REPLACEMENT");
     }
-    const naturalKey = contract.createSenseNaturalKey(concept.id, source.translation, source.definition);
-    if (state.glossarySenses.some((item) => item.id !== sense.id && item.naturalKey === naturalKey)) {
-      if (source.naturalKey !== naturalKey) throw new Error("GLOSSARY_SENSE_CONFLICT");
+    const conversation = conversationByScope(state, conversationScope);
+    if (!conversation) throw new Error("CONVERSATION_NOT_FOUND");
+    const sense = state.glossarySenses.find((item) => item.id === command?.senseId);
+    if (!sense) throw new Error("GLOSSARY_NOT_FOUND");
+    const concept = state.glossaryConcepts.find((item) => item.id === sense.conceptId);
+    const conceptSenses = state.glossarySenses.filter((item) => item.conceptId === sense.conceptId);
+    const link = state.glossaryLinks.find((item) => (
+      item.senseId === sense.id && item.conversationId === conversation.id
+    ));
+    if (!concept || conceptSenses.length !== 1 || !link) {
+      throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+    }
+    const current = publicSense(state, sense, link);
+    if (command.expectedUpdatedAt !== sense.updatedAt) {
+      return { ok: false, stale: true, changed: false, current };
+    }
+    const replacement = normalizedGlossaryContent(command?.replacement);
+    if (!replacement) throw new Error("INVALID_GLOSSARY_REPLACEMENT");
+    const revision = Number(
+      getMeta(state, `revision:${contract.ENTITY_FAMILIES.GLOSSARY}`)?.value || 0,
+    );
+    if (sameGlossaryContent(sense, replacement)) {
+      return { ok: true, changed: false, entry: current, revision };
     }
     const now = Math.max(nowValue(timestamp), Number(sense.updatedAt) + 1);
-    const sourceLinks = state.glossaryLinks.filter((item) => item.senseId === source.id);
-    sourceLinks.forEach((sourceLink) => {
-      const targetKey = linkKey(sense.id, sourceLink.conversationId);
-      const targetLink = state.glossaryLinks.find((item) => item.linkKey === targetKey);
-      if (targetLink) {
-        targetLink.localOrder = Math.min(Number(targetLink.localOrder) || 0, Number(sourceLink.localOrder) || 0);
-        targetLink.firstSeenAt = Math.min(validTimestamp(targetLink.firstSeenAt, sourceLink.firstSeenAt), validTimestamp(sourceLink.firstSeenAt, targetLink.firstSeenAt));
-        targetLink.lastSeenAt = Math.max(validTimestamp(targetLink.lastSeenAt, sourceLink.lastSeenAt), validTimestamp(sourceLink.lastSeenAt, targetLink.lastSeenAt));
-        state.glossaryLinks.splice(state.glossaryLinks.indexOf(sourceLink), 1);
-      } else {
-        sourceLink.senseId = sense.id;
-        sourceLink.linkKey = targetKey;
-      }
-    });
-    state.glossarySenses.splice(state.glossarySenses.indexOf(source), 1);
-    sense.translation = source.translation;
-    sense.definition = source.definition;
-    sense.normalizedTranslation = source.normalizedTranslation;
-    sense.normalizedDefinition = source.normalizedDefinition;
-    sense.naturalKey = naturalKey;
+    sense.translation = replacement.translation;
+    sense.definition = replacement.definition;
+    sense.normalizedTranslation = replacement.normalizedTranslation;
+    sense.normalizedDefinition = replacement.normalizedDefinition;
+    sense.naturalKey = contract.createSenseNaturalKey(
+      concept.id,
+      replacement.translation,
+      replacement.definition,
+    );
     sense.updatedAt = now;
     concept.updatedAt = Math.max(Number(concept.updatedAt) || 0, now);
-    return { ok: true, entry: publicSense(state, sense, null), revision: bumpRevision(state, contract.ENTITY_FAMILIES.GLOSSARY, now) };
+    return {
+      ok: true,
+      changed: true,
+      entry: publicSense(state, sense, link),
+      revision: bumpRevision(state, contract.ENTITY_FAMILIES.GLOSSARY, now),
+    };
   }
 
   function publicSavedItem(item, link) {
@@ -651,6 +1026,12 @@
       ));
     }
 
+    lookupGlossarySelection(request) {
+      return this._read(["conversations", "glossaryConcepts", "glossarySenses", "glossaryLinks"], (state) => (
+        lookupGlossarySelectionInState(state, request)
+      ));
+    }
+
     attachGlossarySense(senseId, conversationScope) {
       return this._write(["meta", "conversations", "glossaryConcepts", "glossarySenses", "glossaryLinks"], (state) => (
         attachGlossaryInState(state, senseId, conversationScope, this.now(), this.idFactory)
@@ -675,9 +1056,9 @@
       ));
     }
 
-    replaceGlossarySense(command) {
-      return this._write(["meta", "glossaryConcepts", "glossarySenses"], (state) => (
-        replaceGlossarySenseInState(state, command, this.now())
+    replaceGlossarySense(command, conversationScope) {
+      return this._write(["meta", "conversations", "glossaryConcepts", "glossarySenses", "glossaryLinks"], (state) => (
+        replaceGlossarySenseInState(state, command, conversationScope, this.now())
       ));
     }
 
@@ -747,6 +1128,11 @@
 
     replaceUserData(nextValue) {
       return this._write(["meta", ...USER_STORE_NAMES], (state) => {
+        assertGlossaryInvariant(nextValue);
+        const revisionRecord = state.meta.find((item) => item.key === "revision:all");
+        if (sameUserData(state, nextValue)) {
+          return { changed: false, revision: Number(revisionRecord?.value || 0) };
+        }
         USER_STORE_NAMES.forEach((name) => { state[name] = clone(Array.isArray(nextValue?.[name]) ? nextValue[name] : []); });
         return { changed: true, revision: bumpRevision(state, contract.ENTITY_FAMILIES.ALL, this.now()) };
       });
@@ -754,6 +1140,23 @@
 
     mergeUserData(nextValue) {
       return this._write(["meta", ...USER_STORE_NAMES], (state) => {
+        assertGlossaryMergeCompatible(state, nextValue);
+        const merged = clone(state);
+        USER_STORE_NAMES.forEach((name) => {
+          const byId = new Map(merged[name].map((item) => [item.id, item]));
+          (Array.isArray(nextValue?.[name]) ? nextValue[name] : []).forEach((item) => {
+            if (!byId.has(item.id)) {
+              const added = clone(item);
+              merged[name].push(added);
+              byId.set(item.id, added);
+            } else {
+              const index = merged[name].findIndex((record) => record.id === item.id);
+              merged[name][index] = clone(item);
+              byId.set(item.id, merged[name][index]);
+            }
+          });
+        });
+        assertGlossaryInvariant(merged);
         let changed = false;
         USER_STORE_NAMES.forEach((name) => {
           const byId = new Map(state[name].map((item) => [item.id, item]));
@@ -764,6 +1167,8 @@
               state[name].push(added);
               byId.set(item.id, added);
               changed = true;
+            } else if (["glossaryConcepts", "glossarySenses"].includes(name)) {
+              return;
             } else if (JSON.stringify(existing) !== JSON.stringify(item)) {
               const index = state[name].findIndex((record) => record.id === item.id);
               state[name][index] = clone(item);
@@ -967,14 +1372,7 @@
       const store = transaction.objectStore(linkStoreName);
       const key = linkKey(entityId, conversationId);
       const existing = await requestValue(store.index("linkKey").get(key));
-      if (existing) {
-        const nextLastSeenAt = Math.max(validTimestamp(existing.lastSeenAt, timestamp), timestamp);
-        if (nextLastSeenAt !== existing.lastSeenAt) {
-          existing.lastSeenAt = nextLastSeenAt;
-          await requestValue(store.put(existing));
-        }
-        return { link: existing, created: false };
-      }
+      if (existing) return { link: existing, created: false };
       const link = {
         id: this.idFactory("link"),
         [entityField]: entityId,
@@ -1013,6 +1411,23 @@
       };
     }
 
+    async _assertGlossaryInvariant(transaction) {
+      const [glossaryConcepts, glossarySenses] = await Promise.all([
+        cursorValues(
+          transaction.objectStore(contract.STORE_NAMES.GLOSSARY_CONCEPTS),
+          null,
+          "next",
+        ),
+        cursorValues(
+          transaction.objectStore(contract.STORE_NAMES.GLOSSARY_SENSES),
+          null,
+          "next",
+        ),
+      ]);
+      assertGlossaryInvariant({ glossaryConcepts, glossarySenses });
+      return { glossaryConcepts, glossarySenses };
+    }
+
     initialize() {
       const required = createEmptyState(this.now()).meta;
       return this._readTransaction([contract.STORE_NAMES.META], async (transaction) => {
@@ -1036,32 +1451,23 @@
     }
 
     async migrateLegacyGlossary(entriesValue) {
-      const marker = await this._readTransaction([contract.STORE_NAMES.META], (transaction) => (
-        requestValue(transaction.objectStore(contract.STORE_NAMES.META).get("v1GlossaryMigrationState"))
-      ));
+      const marker = await this._readTransaction([
+        contract.STORE_NAMES.META,
+        contract.STORE_NAMES.GLOSSARY_CONCEPTS,
+        contract.STORE_NAMES.GLOSSARY_SENSES,
+      ], async (transaction) => {
+        const current = await requestValue(
+          transaction.objectStore(contract.STORE_NAMES.META).get("v1GlossaryMigrationState"),
+        );
+        if (current?.value?.status === "complete") {
+          await this._assertGlossaryInvariant(transaction);
+        }
+        return current;
+      });
       if (marker?.value?.status === "complete") return { migrated: false, marker: clone(marker.value) };
 
       const timestamp = this.now();
-      const source = Array.isArray(entriesValue) ? entriesValue : [];
-      const plan = [];
-      let skippedCount = 0;
-      source.forEach((entry) => {
-        const term = contract.canonicalizeTerm(entry?.term || entry?.normalizedTerm || "");
-        const translation = contract.normalizeMeaning(entry?.translation, 200);
-        const definition = contract.normalizeMeaning(entry?.definition, 500);
-        if (!term || !translation || !definition) {
-          skippedCount += 1;
-          return;
-        }
-        const createdAt = validTimestamp(entry.createdAt, timestamp);
-        plan.push({
-          term,
-          translation,
-          definition,
-          createdAt,
-          updatedAt: Math.max(createdAt, validTimestamp(entry.updatedAt, createdAt)),
-        });
-      });
+      const plan = prepareLegacyGlossary(entriesValue, timestamp);
 
       return this._writeTransaction([
         contract.STORE_NAMES.META,
@@ -1071,13 +1477,16 @@
         const meta = transaction.objectStore(contract.STORE_NAMES.META);
         const currentMarker = await requestValue(meta.get("v1GlossaryMigrationState"));
         if (currentMarker?.value?.status === "complete") {
+          await this._assertGlossaryInvariant(transaction);
           return { migrated: false, marker: clone(currentMarker.value) };
         }
+        const currentGlossary = await this._assertGlossaryInvariant(transaction);
+        assertLegacyMigrationCompatible(currentGlossary, plan);
         const concepts = transaction.objectStore(contract.STORE_NAMES.GLOSSARY_CONCEPTS);
         const senses = transaction.objectStore(contract.STORE_NAMES.GLOSSARY_SENSES);
         const conceptCache = new Map();
         const senseCache = new Map();
-        for (const item of plan) {
+        for (const item of plan.entries) {
           let concept = conceptCache.get(item.term.normalizedKey);
           if (!concept) {
             concept = await requestValue(concepts.index("normalizedKey").get(item.term.normalizedKey));
@@ -1102,24 +1511,26 @@
             await requestValue(concepts.put(concept));
           }
           const naturalKey = contract.createSenseNaturalKey(concept.id, item.translation, item.definition);
-          let sense = senseCache.get(naturalKey);
+          let sense = senseCache.get(concept.id);
           if (!sense) {
-            sense = await requestValue(senses.index("naturalKey").get(naturalKey));
+            const existingSenses = await cursorValues(senses.index("conceptId"), concept.id, "next");
+            if (existingSenses.length > 1) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+            sense = existingSenses[0] || null;
             if (!sense) {
               sense = {
                 id: this.idFactory("sense"),
                 conceptId: concept.id,
                 translation: item.translation,
                 definition: item.definition,
-                normalizedTranslation: item.translation.toLocaleLowerCase("ru-RU"),
-                normalizedDefinition: item.definition.toLocaleLowerCase("ru-RU"),
+                normalizedTranslation: item.normalizedTranslation,
+                normalizedDefinition: item.normalizedDefinition,
                 naturalKey,
                 createdAt: item.createdAt,
                 updatedAt: item.updatedAt,
               };
               await requestValue(senses.add(sense));
             }
-            senseCache.set(naturalKey, sense);
+            senseCache.set(concept.id, sense);
           }
           const nextSenseCreatedAt = Math.min(validTimestamp(sense.createdAt, item.createdAt), item.createdAt);
           const nextSenseUpdatedAt = Math.max(validTimestamp(sense.updatedAt, item.updatedAt), item.updatedAt);
@@ -1132,13 +1543,13 @@
         const completed = {
           status: "complete",
           sourceSchemaVersion: 1,
-          sourceCount: source.length,
-          migratedCount: plan.length,
-          skippedCount,
+          sourceCount: plan.sourceCount,
+          migratedCount: plan.validCount,
+          skippedCount: plan.skippedCount,
         };
         await requestValue(meta.put(metaRecord("v1GlossaryMigrationState", completed, timestamp)));
         await requestValue(meta.put(metaRecord("lastMigrationAt", timestamp, timestamp)));
-        if (plan.length) await this._bumpRevision(transaction, contract.ENTITY_FAMILIES.GLOSSARY, timestamp);
+        if (plan.validCount) await this._bumpRevision(transaction, contract.ENTITY_FAMILIES.GLOSSARY, timestamp);
         return { migrated: true, marker: completed };
       });
     }
@@ -1268,6 +1679,7 @@
       ], async (transaction) => {
         const conversation = await this._conversationByScope(transaction, conversationScope);
         if (!conversation) throw new Error("CONVERSATION_NOT_FOUND");
+        await this._assertGlossaryInvariant(transaction);
         const concepts = transaction.objectStore(contract.STORE_NAMES.GLOSSARY_CONCEPTS);
         const senses = transaction.objectStore(contract.STORE_NAMES.GLOSSARY_SENSES);
         const now = this.now();
@@ -1275,9 +1687,8 @@
         let changed = false;
         for (const termValue of Array.isArray(termsValue) ? termsValue : []) {
           const term = contract.canonicalizeTerm(termValue?.term || termValue?.displayTerm || "");
-          const translation = contract.normalizeMeaning(termValue?.translation, 200);
-          const definition = contract.normalizeMeaning(termValue?.definition, 500);
-          if (!term || !translation || !definition) continue;
+          const content = normalizedGlossaryContent(termValue);
+          if (!term || !content) continue;
           let concept = await requestValue(concepts.index("normalizedKey").get(term.normalizedKey));
           const conceptCreated = !concept;
           if (!concept) {
@@ -1291,22 +1702,20 @@
             };
             await requestValue(concepts.add(concept));
           }
-          const naturalKey = contract.createSenseNaturalKey(concept.id, translation, definition);
-          let sense = await requestValue(senses.index("naturalKey").get(naturalKey));
+          const existingSenses = await cursorValues(senses.index("conceptId"), concept.id, "next");
+          if (existingSenses.length > 1) throw new Error("GLOSSARY_INVARIANT_VIOLATION");
+          let sense = existingSenses[0] || null;
           const senseCreated = !sense;
-          let candidates = [];
           if (!sense) {
-            candidates = (await cursorValues(senses.index("conceptId"), concept.id, "next"))
-              .filter((item) => item.normalizedTranslation === translation.toLocaleLowerCase("ru-RU")
-                && item.normalizedDefinition !== definition.toLocaleLowerCase("ru-RU"));
             sense = {
               id: this.idFactory("sense"),
               conceptId: concept.id,
-              translation,
-              definition,
-              normalizedTranslation: translation.toLocaleLowerCase("ru-RU"),
-              normalizedDefinition: definition.toLocaleLowerCase("ru-RU"),
-              naturalKey,
+              ...content,
+              naturalKey: contract.createSenseNaturalKey(
+                concept.id,
+                content.translation,
+                content.definition,
+              ),
               createdAt: now,
               updatedAt: now,
             };
@@ -1327,22 +1736,29 @@
           changed = changed || conceptCreated || senseCreated || linked.created;
           const result = {
             ...await this._publicSense(transaction, sense, linked.link),
-            status: senseCreated ? "new" : "alreadySaved",
+            status: senseCreated || sameGlossaryContent(sense, content)
+              ? (senseCreated ? "new" : "alreadySaved")
+              : "replacementAvailable",
             savedEntry: await this._publicSense(transaction, sense, linked.link),
           };
-          if (senseCreated && candidates.length === 1) {
-            const candidate = candidates[0];
-            result.status = "duplicate";
-            result.savedEntry = await this._publicSense(transaction, candidate, null);
+          if (!senseCreated && !sameGlossaryContent(sense, content)) {
+            result.term = term.displayTerm;
+            result.canonicalTerm = term.canonicalTerm;
+            result.normalizedTerm = term.normalizedKey;
+            result.translation = content.translation;
+            result.definition = content.definition;
             result.replacementCandidate = {
-              status: "single",
-              targetSenseId: candidate.id,
-              expectedUpdatedAt: candidate.updatedAt,
-              newSenseId: sense.id,
-              current: { translation: candidate.translation, definition: candidate.definition },
+              targetSenseId: sense.id,
+              expectedUpdatedAt: sense.updatedAt,
+              current: {
+                translation: sense.translation,
+                definition: sense.definition,
+              },
+              proposed: {
+                translation: content.translation,
+                definition: content.definition,
+              },
             };
-          } else if (senseCreated && candidates.length > 1) {
-            result.replacementCandidate = { status: "multiple", count: candidates.length };
           }
           results.push(result);
         }
@@ -1407,6 +1823,28 @@
         contract.STORE_NAMES.GLOSSARY_SENSES,
         contract.STORE_NAMES.GLOSSARY_LINKS,
       ], (transaction) => this._queryGlossaryInTransaction(transaction, request));
+    }
+
+    async lookupGlossarySelection(requestValue_) {
+      return this._readTransaction([
+        contract.STORE_NAMES.CONVERSATIONS,
+        contract.STORE_NAMES.GLOSSARY_CONCEPTS,
+        contract.STORE_NAMES.GLOSSARY_SENSES,
+        contract.STORE_NAMES.GLOSSARY_LINKS,
+      ], async (transaction) => {
+        const names = [
+          contract.STORE_NAMES.CONVERSATIONS,
+          contract.STORE_NAMES.GLOSSARY_CONCEPTS,
+          contract.STORE_NAMES.GLOSSARY_SENSES,
+          contract.STORE_NAMES.GLOSSARY_LINKS,
+        ];
+        const values = await Promise.all(names.map((name) => (
+          cursorValues(transaction.objectStore(name), null, "next")
+        )));
+        return lookupGlossarySelectionInState(Object.fromEntries(
+          names.map((name, index) => [name, values[index]]),
+        ), requestValue_);
+      });
     }
 
     attachGlossarySense(senseId, conversationScope) {
@@ -1502,48 +1940,55 @@
       });
     }
 
-    replaceGlossarySense(command) {
+    replaceGlossarySense(command, conversationScope) {
       return this._writeTransaction([
         contract.STORE_NAMES.META,
+        contract.STORE_NAMES.CONVERSATIONS,
         contract.STORE_NAMES.GLOSSARY_CONCEPTS,
         contract.STORE_NAMES.GLOSSARY_SENSES,
         contract.STORE_NAMES.GLOSSARY_LINKS,
       ], async (transaction) => {
-        if (!Number.isFinite(command?.expectedUpdatedAt)) throw new Error("INVALID_GLOSSARY_REPLACEMENT");
+        if (!validGlossaryReplacementCommand(command)) {
+          throw new Error("INVALID_GLOSSARY_REPLACEMENT");
+        }
+        await this._assertGlossaryInvariant(transaction);
+        const conversation = await this._conversationByScope(transaction, conversationScope);
+        if (!conversation) throw new Error("CONVERSATION_NOT_FOUND");
         const senses = transaction.objectStore(contract.STORE_NAMES.GLOSSARY_SENSES);
         const target = await requestValue(senses.get(command.senseId));
         if (!target) throw new Error("GLOSSARY_NOT_FOUND");
-        const current = await this._publicSense(transaction, target, null);
-        if (command.expectedUpdatedAt !== target.updatedAt) return { ok: false, stale: true, current };
-        const source = await requestValue(senses.get(command.sourceSenseId));
-        if (!source || source.id === target.id || source.conceptId !== target.conceptId
-          || source.normalizedTranslation !== target.normalizedTranslation
-          || source.normalizedDefinition === target.normalizedDefinition) {
-          throw new Error("INVALID_GLOSSARY_REPLACEMENT");
-        }
         const links = transaction.objectStore(contract.STORE_NAMES.GLOSSARY_LINKS);
-        for (const sourceLink of await cursorValues(links.index("senseId"), source.id, "next")) {
-          const targetKey = linkKey(target.id, sourceLink.conversationId);
-          const targetLink = await requestValue(links.index("linkKey").get(targetKey));
-          if (targetLink) {
-            targetLink.localOrder = Math.min(Number(targetLink.localOrder) || 0, Number(sourceLink.localOrder) || 0);
-            targetLink.firstSeenAt = Math.min(validTimestamp(targetLink.firstSeenAt, sourceLink.firstSeenAt), validTimestamp(sourceLink.firstSeenAt, targetLink.firstSeenAt));
-            targetLink.lastSeenAt = Math.max(validTimestamp(targetLink.lastSeenAt, sourceLink.lastSeenAt), validTimestamp(sourceLink.lastSeenAt, targetLink.lastSeenAt));
-            await requestValue(links.put(targetLink));
-            await requestValue(links.delete(sourceLink.id));
-          } else {
-            sourceLink.senseId = target.id;
-            sourceLink.linkKey = targetKey;
-            await requestValue(links.put(sourceLink));
-          }
+        const link = await requestValue(
+          links.index("linkKey").get(linkKey(target.id, conversation.id)),
+        );
+        const conceptSenses = await cursorValues(senses.index("conceptId"), target.conceptId, "next");
+        if (!link || conceptSenses.length !== 1) {
+          throw new Error("GLOSSARY_INVARIANT_VIOLATION");
         }
-        await requestValue(senses.delete(source.id));
+        const current = await this._publicSense(transaction, target, link);
+        if (command.expectedUpdatedAt !== target.updatedAt) {
+          return { ok: false, stale: true, changed: false, current };
+        }
+        const replacement = normalizedGlossaryContent(command?.replacement);
+        if (!replacement) throw new Error("INVALID_GLOSSARY_REPLACEMENT");
+        if (sameGlossaryContent(target, replacement)) {
+          return {
+            ok: true,
+            changed: false,
+            entry: current,
+            revision: await this._revision(transaction, contract.ENTITY_FAMILIES.GLOSSARY),
+          };
+        }
         const now = Math.max(this.now(), Number(target.updatedAt) + 1);
-        target.translation = source.translation;
-        target.definition = source.definition;
-        target.normalizedTranslation = source.normalizedTranslation;
-        target.normalizedDefinition = source.normalizedDefinition;
-        target.naturalKey = source.naturalKey;
+        target.translation = replacement.translation;
+        target.definition = replacement.definition;
+        target.normalizedTranslation = replacement.normalizedTranslation;
+        target.normalizedDefinition = replacement.normalizedDefinition;
+        target.naturalKey = contract.createSenseNaturalKey(
+          target.conceptId,
+          replacement.translation,
+          replacement.definition,
+        );
         target.updatedAt = now;
         await requestValue(senses.put(target));
         const concepts = transaction.objectStore(contract.STORE_NAMES.GLOSSARY_CONCEPTS);
@@ -1552,7 +1997,8 @@
         await requestValue(concepts.put(concept));
         return {
           ok: true,
-          entry: await this._publicSense(transaction, target, null),
+          changed: true,
+          entry: await this._publicSense(transaction, target, link),
           revision: await this._bumpRevision(transaction, contract.ENTITY_FAMILIES.GLOSSARY, now),
         };
       });
@@ -1717,7 +2163,18 @@
     }
 
     replaceUserData(nextValue) {
+      assertGlossaryInvariant(nextValue);
       return this._writeTransaction([contract.STORE_NAMES.META, ...USER_STORE_NAMES], async (transaction) => {
+        const currentState = {};
+        for (const name of USER_STORE_NAMES) {
+          currentState[name] = await cursorValues(transaction.objectStore(name), null, "next");
+        }
+        if (sameUserData(currentState, nextValue)) {
+          return {
+            changed: false,
+            revision: await this._revision(transaction, contract.ENTITY_FAMILIES.ALL),
+          };
+        }
         for (const name of USER_STORE_NAMES) {
           const store = transaction.objectStore(name);
           await requestValue(store.clear());
@@ -1731,6 +2188,19 @@
 
     mergeUserData(nextValue) {
       return this._writeTransaction([contract.STORE_NAMES.META, ...USER_STORE_NAMES], async (transaction) => {
+        const currentState = {};
+        const merged = {};
+        for (const name of USER_STORE_NAMES) {
+          const current = await cursorValues(transaction.objectStore(name), null, "next");
+          currentState[name] = current;
+          const byId = new Map(current.map((item) => [item.id, item]));
+          for (const item of Array.isArray(nextValue?.[name]) ? nextValue[name] : []) {
+            byId.set(item.id, clone(item));
+          }
+          merged[name] = [...byId.values()];
+        }
+        assertGlossaryMergeCompatible(currentState, nextValue);
+        assertGlossaryInvariant(merged);
         let changed = false;
         for (const name of USER_STORE_NAMES) {
           const store = transaction.objectStore(name);
@@ -1739,6 +2209,8 @@
             if (!existing) {
               await requestValue(store.add(clone(item)));
               changed = true;
+            } else if (["glossaryConcepts", "glossarySenses"].includes(name)) {
+              continue;
             } else if (JSON.stringify(existing) !== JSON.stringify(item)) {
               await requestValue(store.put(clone(item)));
               changed = true;
@@ -1761,6 +2233,10 @@
     migrateLegacyInState,
     rebindInState,
     queryGlossaryInState,
+    inlineMatchClass,
+    lookupGlossarySelectionInState,
+    extractInlineGlossaryCandidates: contract.extractInlineGlossaryCandidates,
+    assertGlossaryInvariant,
     querySavedInState,
     USER_STORE_NAMES,
     MemoryWorkspaceStore,

@@ -85,6 +85,10 @@
   const SELECTION_LINE_BLOCK_TAGS = new Set([
     "ADDRESS", "ARTICLE", "ASIDE", "DIV", "FOOTER", "HEADER", "MAIN", "NAV", "SECTION",
   ]);
+  const SELECTION_TABLE_CONTAINER_TAGS = new Set([
+    "TABLE", "TBODY", "TFOOT", "THEAD", "TR",
+  ]);
+  const SELECTION_TABLE_CELL_TAGS = new Set(["TD", "TH"]);
 
   function selectionTag(node) {
     return node?.nodeType === 1 ? String(node.tagName || "").toUpperCase() : "";
@@ -217,6 +221,18 @@
         ensureNewlines(2);
         return;
       }
+      if (SELECTION_TABLE_CELL_TAGS.has(tag)) {
+        ensureNewlines(output ? 1 : 0);
+        walkChildren(node);
+        ensureNewlines(1);
+        return;
+      }
+      if (SELECTION_TABLE_CONTAINER_TAGS.has(tag)) {
+        ensureNewlines(output ? 1 : 0);
+        walkChildren(node);
+        ensureNewlines(1);
+        return;
+      }
       if (SELECTION_PARAGRAPH_TAGS.has(tag)) {
         ensureNewlines(output ? 2 : 0);
         if (selectionIsPlaceholderBlock(node)) ensureNewlines(2);
@@ -249,12 +265,12 @@
       .trim();
   }
 
-  function readSelectionText(fallbackValue) {
+  function readSelectionText(fallbackValue, selectionValue) {
     const fallback = workspaceContract?.normalizeSelectedPlainText
       ? workspaceContract.normalizeSelectedPlainText(fallbackValue)
       : adaptLineEndings(fallbackValue);
     try {
-      const selection = window.getSelection?.();
+      const selection = selectionValue || window.getSelection?.();
       if (!selection?.rangeCount) return fallback;
       const parts = [];
       for (let index = 0; index < selection.rangeCount; index += 1) {
@@ -272,6 +288,124 @@
     } catch (_) {
       return fallback;
     }
+  }
+
+  function inlineSelectionFailure(reason) {
+    return Object.freeze({ ok: false, reason });
+  }
+
+  function inlineElement(node) {
+    if (node?.nodeType === 1) return node;
+    return node?.parentElement || node?.parentNode || null;
+  }
+
+  function inlineParentElement(node) {
+    if (!node) return null;
+    if (node.parentElement) return node.parentElement;
+    const rootNode = node.getRootNode?.();
+    return rootNode?.host || null;
+  }
+
+  function inlineEditableElement(node) {
+    let current = inlineElement(node);
+    while (current) {
+      const tagName = String(current.tagName || "").toUpperCase();
+      const contentEditable = current.getAttribute?.("contenteditable");
+      const normalizedContentEditable = typeof contentEditable === "string"
+        ? contentEditable.toLocaleLowerCase("en-US")
+        : null;
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(tagName)
+        || current.isContentEditable === true
+        || normalizedContentEditable === "" || normalizedContentEditable === "true"
+        || normalizedContentEditable === "plaintext-only"
+        || current.getAttribute?.("role") === "textbox") return current;
+      current = inlineParentElement(current);
+    }
+    return null;
+  }
+
+  function inlineExtensionElement(node, extensionRoot) {
+    if (extensionRoot?.contains?.(node)) return extensionRoot;
+    let current = inlineElement(node);
+    while (current) {
+      if (current === extensionRoot
+        || current.id === "chatgpt-helper-overlay-root"
+        || current.getAttribute?.("data-chatgpt-templates-overlay") !== null) return current;
+      current = inlineParentElement(current);
+    }
+    return null;
+  }
+
+  function inlineSupportedPage(pageUrl) {
+    try {
+      return workspaceContract?.isSupportedHost?.(new URL(pageUrl, window.location?.href).hostname) === true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function inlineVisibleRect(rect, viewportWidth, viewportHeight) {
+    if (!rect) return false;
+    const values = [rect.top, rect.right, rect.bottom, rect.left, rect.width, rect.height];
+    if (!values.every(Number.isFinite) || rect.width <= 0 || rect.height <= 0) return false;
+    return rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
+  }
+
+  function captureInlineGlossarySelection(options) {
+    const pageUrl = String(options?.pageUrl || window.location?.href || "");
+    if (!inlineSupportedPage(pageUrl)) return inlineSelectionFailure("empty");
+    const selection = options?.selection || window.getSelection?.();
+    if (!selection || selection.rangeCount === 0) return inlineSelectionFailure("empty");
+    if (selection.rangeCount !== 1) return inlineSelectionFailure("multiple-ranges");
+    const range = selection.getRangeAt?.(0);
+    if (!range || selection.isCollapsed === true || range.collapsed === true) {
+      return inlineSelectionFailure("empty");
+    }
+
+    const anchorNode = inlineElement(range.commonAncestorContainer);
+    if (!anchorNode?.isConnected) return inlineSelectionFailure("disconnected");
+    if (inlineEditableElement(anchorNode)
+      || inlineEditableElement(range.startContainer)
+      || inlineEditableElement(range.endContainer)) return inlineSelectionFailure("editable");
+    if (inlineExtensionElement(anchorNode, options?.extensionRoot)
+      || inlineExtensionElement(range.startContainer, options?.extensionRoot)
+      || inlineExtensionElement(range.endContainer, options?.extensionRoot)) {
+      return inlineSelectionFailure("extension-ui");
+    }
+
+    const rawText = String(selection.toString?.() || range.toString?.() || "");
+    const sourceText = readSelectionText(rawText, selection);
+    const validated = workspaceContract?.validateInlineSelectionText?.(sourceText);
+    if (!validated?.ok) {
+      return inlineSelectionFailure(validated?.error || "empty");
+    }
+    if (!/[A-Za-z]/.test(validated.text)) return inlineSelectionFailure("no-latin");
+
+    const viewportWidth = Number.isFinite(options?.viewportWidth)
+      ? options.viewportWidth
+      : Number(window.innerWidth);
+    const viewportHeight = Number.isFinite(options?.viewportHeight)
+      ? options.viewportHeight
+      : Number(window.innerHeight);
+    const visibleRects = Array.from(range.getClientRects?.() || [])
+      .filter((rect) => inlineVisibleRect(rect, viewportWidth, viewportHeight));
+    const rect = visibleRects.at(-1);
+    if (!rect) return inlineSelectionFailure("no-geometry");
+
+    return Object.freeze({
+      ok: true,
+      text: sourceText,
+      anchorRect: Object.freeze({
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        left: rect.left,
+        width: rect.width,
+        height: rect.height,
+      }),
+      anchorNode,
+      pageUrl,
+    });
   }
 
   function normalizeComposerPlainText(value) {
@@ -659,6 +793,7 @@
     version: 6,
     readComposer,
     readSelectionText,
+    captureInlineGlossarySelection,
     normalizeComposerPlainText,
     normalizeComposerText,
     normalizeComposer,

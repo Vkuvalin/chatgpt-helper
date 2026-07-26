@@ -182,20 +182,30 @@ function getWorkspace() {
 
 async function migrateWorkspace() {
   const workspace = getWorkspace();
-  await workspace.initialize();
+  await recoverPendingImports(workspace);
   const legacy = await chrome.storage.local.get(["glossarySchemaVersion", "glossaryEntries"]);
   if (Number.isInteger(legacy.glossarySchemaVersion) && legacy.glossarySchemaVersion > glossaryStore.SCHEMA_VERSION) {
     throw new Error("Unsupported future glossary schema.");
   }
-  const migration = await workspace.migrateLegacyGlossary(Array.isArray(legacy.glossaryEntries) ? legacy.glossaryEntries : []);
-  await recoverPendingImports(workspace);
+  let migration;
+  try {
+    migration = await workspace.migrateLegacyGlossary(
+      Array.isArray(legacy.glossaryEntries) ? legacy.glossaryEntries : [],
+    );
+  } catch (error) {
+    if (error?.message === "GLOSSARY_INVARIANT_VIOLATION") {
+      workspaceRecoveryRequired = true;
+    }
+    throw error;
+  }
+  await workspace.initialize();
   return migration;
 }
 
 function ensureMigrated() {
   if (!migrationPromise) {
-    migrationPromise = migrateStorage()
-      .then(() => migrateWorkspace())
+    migrationPromise = migrateWorkspace()
+      .then(() => migrateStorage())
       .catch((error) => {
         migrationPromise = null;
         throw error;
@@ -338,6 +348,22 @@ async function broadcastWorkspaceChange(entityFamily, conversationScope, revisio
 
 function importError(code, message) {
   return { code, message: message || "Не удалось выполнить операцию резервного копирования." };
+}
+
+function stableWorkspaceError(error, fallbackCode, fallbackMessage) {
+  const code = error?.message;
+  if (code === "GLOSSARY_INVARIANT_VIOLATION" || code === "GLOSSARY_IMPORT_CONFLICT") {
+    return workspaceError(code);
+  }
+  return workspaceError(fallbackCode || "WORKSPACE_OPERATION_FAILED", fallbackMessage);
+}
+
+function stableImportError(error, fallbackCode, fallbackMessage) {
+  const code = error?.message;
+  if (code === "GLOSSARY_INVARIANT_VIOLATION" || code === "GLOSSARY_IMPORT_CONFLICT") {
+    return importError(code);
+  }
+  return importError(fallbackCode, fallbackMessage || code);
 }
 
 function mutationBusyError() {
@@ -557,10 +583,88 @@ async function rollbackSettingsBackup() {
   return true;
 }
 
+function assertDataBackupValid(backup) {
+  const payload = backup?.payload;
+  const workspace = payload?.workspace;
+  if (!payload || !workspace || !Array.isArray(payload.templates)
+    || !Array.isArray(payload.recentTemplateIds)
+    || workspaceStoreModule.USER_STORE_NAMES.some((name) => !Array.isArray(workspace[name]))) {
+    throw new Error("DATA_BACKUP_MISSING");
+  }
+  workspaceStoreModule.assertGlossaryInvariant(workspace);
+  if (!storageValuesEqual(payload.templates, normalizeTemplates(payload.templates))
+    || !storageValuesEqual(
+      payload.recentTemplateIds,
+      normalizeRecentTemplateIds(payload.recentTemplateIds),
+    )) {
+    throw new Error("DATA_BACKUP_INVALID");
+  }
+  try {
+    const portable = importExport.createDataExport(
+      { templates: payload.templates, ...workspace },
+      {
+        datasetId: "00000000-0000-4000-8000-000000000000",
+        exportedAt: "2000-01-01T00:00:00.000Z",
+      },
+    );
+    const validated = importExport.validateDataText(portable.text);
+    if (!validated.ok) throw new Error(validated.errors[0]?.code || "DATA_BACKUP_INVALID");
+  } catch (_) {
+    throw new Error("DATA_BACKUP_INVALID");
+  }
+
+  const conversationIds = new Set();
+  const conversationScopes = new Set();
+  workspace.conversations.forEach((conversation) => {
+    const descriptor = conversation?.kind === "stable"
+      ? workspaceStoreModule.stableDescriptor(conversation)
+      : workspaceStoreModule.temporaryDescriptor(
+        conversation?.scopeKey,
+        conversation?.host,
+      );
+    if (!descriptor || descriptor.scopeKey !== conversation.scopeKey
+      || descriptor.canonicalUrl !== conversation.canonicalUrl
+      || conversationIds.has(conversation.id)
+      || conversationScopes.has(conversation.scopeKey)) {
+      throw new Error("DATA_BACKUP_INVALID");
+    }
+    conversationIds.add(conversation.id);
+    conversationScopes.add(conversation.scopeKey);
+  });
+
+  const savedKeys = new Set();
+  workspace.savedItems.forEach((item) => {
+    const normalizedKey = workspaceContract.normalizeSavedTextKey(item?.text);
+    if (!normalizedKey || item.normalizedTextKey !== normalizedKey
+      || savedKeys.has(normalizedKey)) {
+      throw new Error("DATA_BACKUP_INVALID");
+    }
+    savedKeys.add(normalizedKey);
+  });
+
+  [
+    ["glossaryLinks", "senseId"],
+    ["savedItemLinks", "itemId"],
+  ].forEach(([family, entityField]) => {
+    const identities = new Set();
+    const orders = new Set();
+    workspace[family].forEach((link) => {
+      const identity = `${link?.[entityField]}\u001f${link?.conversationId}`;
+      const order = `${link?.conversationId}\u001f${link?.localOrder}`;
+      if (link?.linkKey !== identity || identities.has(identity) || orders.has(order)) {
+        throw new Error("DATA_BACKUP_INVALID");
+      }
+      identities.add(identity);
+      orders.add(order);
+    });
+  });
+  return true;
+}
+
 async function rollbackDataBackup(shouldBroadcast) {
   const workspace = getWorkspace();
   const backup = await workspace.getImportBackup("data");
-  if (!backup?.payload?.workspace || !Array.isArray(backup.payload.templates)) throw new Error("DATA_BACKUP_MISSING");
+  assertDataBackupValid(backup);
   const restored = await workspace.replaceUserData(backup.payload.workspace);
   await chrome.storage.local.set({
     templates: normalizeTemplates(backup.payload.templates),
@@ -568,10 +672,22 @@ async function rollbackDataBackup(shouldBroadcast) {
   });
   const readBack = await currentDataState();
   const expected = { templates: normalizeTemplates(backup.payload.templates), ...backup.payload.workspace };
-  if (!importExport.canonicalDataEqual(expected, readBack)) throw new Error("DATA_ROLLBACK_VERIFICATION_FAILED");
+  if (!importExport.canonicalDataEqual(expected, readBack)
+    || !storageValuesEqual(
+      normalizeRecentTemplateIds(backup.payload.recentTemplateIds),
+      readBack.recentTemplateIds,
+    )) {
+    throw new Error("DATA_ROLLBACK_VERIFICATION_FAILED");
+  }
   await workspace.deleteMetaValue(IMPORT_MARKERS.data);
   workspaceRecoveryRequired = false;
-  if (shouldBroadcast) await broadcastWorkspaceChange(workspaceContract.ENTITY_FAMILIES.ALL, null, restored.revision || 1);
+  if (shouldBroadcast && restored.changed) {
+    await broadcastWorkspaceChange(
+      workspaceContract.ENTITY_FAMILIES.ALL,
+      null,
+      restored.revision,
+    );
+  }
   return true;
 }
 
@@ -683,7 +799,17 @@ async function previewDataImport(message) {
   if (workspaceRecoveryRequired) return { ok: false, recoveryRequired: true, error: importError("RECOVERY_REQUIRED") };
   const validated = importExport.validateDataText(message.text);
   if (!validated.ok) return { ok: false, error: importError(validated.errors[0]?.code, "Файл данных не прошёл проверку."), details: validated.errors };
-  const plan = await importExport.buildDataPlan(await currentDataState(), validated, message.mode, crypto);
+  let plan;
+  try {
+    plan = await importExport.buildDataPlan(
+      await currentDataState(),
+      validated,
+      message.mode,
+      crypto,
+    );
+  } catch (error) {
+    return { ok: false, error: stableImportError(error, "DATA_IMPORT_FAILED") };
+  }
   return {
     ok: true,
     preview: {
@@ -717,17 +843,34 @@ async function applyDataImport(message) {
     await getWorkspace().setMetaValue(IMPORT_MARKERS.data, { ...marker, phase: "workspace-applied" });
     const localUpdate = { templates: normalizeTemplates(plan.state.templates) };
     if (plan.mode === "replace") localUpdate.recentTemplateIds = [];
+    const localChanged = !storageValuesEqual(current.templates, localUpdate.templates)
+      || (Object.prototype.hasOwnProperty.call(localUpdate, "recentTemplateIds")
+        && !storageValuesEqual(current.recentTemplateIds, localUpdate.recentTemplateIds));
     await chrome.storage.local.set(localUpdate);
     await getWorkspace().setMetaValue(IMPORT_MARKERS.data, { ...marker, phase: "templates-applied" });
     const readBack = await currentDataState();
-    if (!importExport.canonicalDataEqual(plan.expectedCanonical, readBack)) throw new Error("DATA_IMPORT_VERIFICATION_FAILED");
+    const expectedRecentTemplateIds = plan.mode === "replace"
+      ? []
+      : current.recentTemplateIds;
+    if (!importExport.canonicalDataEqual(plan.expectedCanonical, readBack)
+      || !storageValuesEqual(expectedRecentTemplateIds, readBack.recentTemplateIds)) {
+      throw new Error("DATA_IMPORT_VERIFICATION_FAILED");
+    }
     await getWorkspace().setMetaValue("lastImportAt", Date.now());
     await getWorkspace().deleteMetaValue(IMPORT_MARKERS.data);
     workspaceRecoveryRequired = false;
-    await broadcastWorkspaceChange(workspaceContract.ENTITY_FAMILIES.ALL, null, workspaceResult.revision || 1);
+    if (workspaceResult.changed || localChanged) {
+      await broadcastWorkspaceChange(
+        workspaceContract.ENTITY_FAMILIES.ALL,
+        null,
+        Math.max(1, Number(workspaceResult.revision || 0)),
+      );
+    }
     return { ok: true, preview: plan.preview };
   } catch (error) {
-    if (!markerCreated) return { ok: false, error: importError("DATA_IMPORT_FAILED", error?.message) };
+    if (!markerCreated) {
+      return { ok: false, error: stableImportError(error, "DATA_IMPORT_FAILED") };
+    }
     try {
       await rollbackDataBackup(true);
       return { ok: false, rolledBack: true, error: importError("DATA_IMPORT_FAILED", "Импорт данных отменён; исходные данные восстановлены.") };
@@ -830,7 +973,8 @@ async function mergeAnalysisTerms(terms, conversationScope) {
       };
     }
     return guarded.value;
-  } catch (_) {
+  } catch (error) {
+    if (error?.message === "GLOSSARY_INVARIANT_VIOLATION") throw error;
     return {
       results: terms.map((term) => ({ ...term, status: "unsaved" })),
       storageWarning: true,
@@ -844,7 +988,7 @@ async function handleAnalysis(message, sender, workspaceAvailable) {
   const snapshot = message?.snapshot;
   const senderUrl = sender?.tab?.url || sender?.url || "";
   if (!snapshot || !validRequestId(snapshot.requestId)
-    || !["browser-command", "context-menu"].includes(snapshot.trigger)
+    || !["browser-command", "context-menu", "inline-assistant"].includes(snapshot.trigger)
     || typeof snapshot.createdAt !== "number"
     || !isSupportedAnalysisPageTransition(snapshot.pageUrl, senderUrl)) {
     return contract.errorEnvelope(snapshot?.requestId, "UNSUPPORTED_PAGE");
@@ -890,7 +1034,14 @@ async function handleAnalysis(message, sender, workspaceAvailable) {
       workspaceUnavailable: workspaceUnavailable || glossary.storageWarning,
       mutationBusy: mutationBusy || glossary.mutationBusy === true,
     };
-  } catch (_) {
+  } catch (error) {
+    if (error?.message === "GLOSSARY_INVARIANT_VIOLATION") {
+      return {
+        ok: false,
+        requestId: snapshot.requestId,
+        error: workspaceError("GLOSSARY_INVARIANT_VIOLATION"),
+      };
+    }
     return contract.errorEnvelope(snapshot.requestId, "PROVIDER_ERROR");
   } finally {
     await releaseAnalysisLock(tabId, snapshot.requestId);
@@ -948,6 +1099,17 @@ async function handleWorkspaceMessage(message, sender) {
       limit: workspaceContract.boundedLimit(message.limit),
     }) };
   }
+  if (message.type === WORKSPACE_MESSAGES.LOOKUP_GLOSSARY_SELECTION) {
+    const selection = workspaceContract.validateInlineSelectionText(message.text);
+    if (!selection.ok) {
+      return { ok: false, error: workspaceError(selection.error || "INVALID_GLOSSARY_SELECTION") };
+    }
+    const result = await workspace.lookupGlossarySelection({
+      conversationScope: scope,
+      text: selection.text,
+    });
+    return { ok: true, ...result };
+  }
   if (message.type === WORKSPACE_MESSAGES.ATTACH_GLOSSARY_SENSE && workspaceContract.validEntityId(message.senseId)) {
     return mutateAndBroadcast(
       () => workspace.attachGlossarySense(message.senseId, scope),
@@ -979,16 +1141,36 @@ async function handleWorkspaceMessage(message, sender) {
     );
   }
   if (message.type === WORKSPACE_MESSAGES.REPLACE_GLOSSARY_SENSE) {
-    if (!workspaceContract.validEntityId(message.command?.senseId)
-      || !workspaceContract.validEntityId(message.command?.sourceSenseId)
-      || !Number.isFinite(message.command?.expectedUpdatedAt)) {
+    const commandKeys = message.command && typeof message.command === "object"
+      ? Object.keys(message.command).sort()
+      : [];
+    const replacementKeys = message.command?.replacement
+      && typeof message.command.replacement === "object"
+      ? Object.keys(message.command.replacement).sort()
+      : [];
+    if (JSON.stringify(commandKeys) !== JSON.stringify([
+      "expectedUpdatedAt",
+      "replacement",
+      "senseId",
+    ])
+      || JSON.stringify(replacementKeys) !== JSON.stringify(["definition", "translation"])
+      || !workspaceContract.validEntityId(message.command?.senseId)
+      || !Number.isFinite(message.command?.expectedUpdatedAt)
+      || !workspaceContract.normalizeMeaning(message.command?.replacement?.translation, 200)
+      || !workspaceContract.normalizeMeaning(message.command?.replacement?.definition, 500)) {
       return { ok: false, error: contract.makeError("REQUEST_CONTRACT_ERROR") };
     }
-    const result = await workspace.replaceGlossarySense(message.command);
+    const result = await workspace.replaceGlossarySense(message.command, scope);
     if (!result.ok && result.stale) {
       return { ok: false, error: contract.makeError("GLOSSARY_ENTRY_CHANGED"), current: result.current };
     }
-    if (result.ok) await broadcastWorkspaceChange(workspaceContract.ENTITY_FAMILIES.GLOSSARY, null, result.revision);
+    if (result.ok && result.changed) {
+      await broadcastWorkspaceChange(
+        workspaceContract.ENTITY_FAMILIES.GLOSSARY,
+        scope,
+        result.revision,
+      );
+    }
     return result;
   }
   if (message.type === WORKSPACE_MESSAGES.SAVE_SELECTION) {
@@ -1109,10 +1291,17 @@ async function handleMessage(message, sender) {
   let workspaceAvailable = true;
   try {
     await ensureMigrated();
-  } catch (_) {
+  } catch (error) {
     workspaceAvailable = false;
     if (message.type !== MESSAGES.ANALYZE_SELECTED_TERMS) {
-      return { ok: false, error: workspaceError("WORKSPACE_MIGRATION_FAILED", "Не удалось подготовить рабочее пространство. Данные словаря V1 не изменены.") };
+      return {
+        ok: false,
+        error: stableWorkspaceError(
+          error,
+          "WORKSPACE_MIGRATION_FAILED",
+          "Не удалось подготовить рабочее пространство. Данные словаря V1 не изменены.",
+        ),
+      };
     }
   }
   if (message.type === MESSAGES.ANALYZE_SELECTED_TERMS) return handleAnalysis(message, sender, workspaceAvailable);
@@ -1125,8 +1314,8 @@ async function handleMessage(message, sender) {
         return guarded.acquired ? guarded.value : { ok: false, error: guarded.error };
       }
       return await handleWorkspaceMessage(message, sender);
-    } catch (_) {
-      return { ok: false, error: workspaceError("WORKSPACE_OPERATION_FAILED") };
+    } catch (error) {
+      return { ok: false, error: stableWorkspaceError(error) };
     }
   }
   return { ok: false, error: contract.makeError("REQUEST_FORBIDDEN") };

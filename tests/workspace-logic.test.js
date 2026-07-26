@@ -12,6 +12,7 @@ const workspaceStore = require("../src/workspace-store.js");
 const workspaceUi = require("../src/workspace-ui.js");
 const importExport = require("../src/import-export.js");
 const asyncBoundaryTests = [];
+const serviceWorkerSource = fs.readFileSync(path.join(__dirname, "../src/service-worker.js"), "utf8");
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -20,6 +21,16 @@ function clone(value) {
 assert.equal(workspace.DB_NAME, "chatgpt-helper-workspace");
 assert.equal(workspace.DB_VERSION, 1);
 assert.equal(workspace.WORKSPACE_SCHEMA_VERSION, 2);
+assert.equal(workspace.MAX_INLINE_SELECTION_LENGTH, 2000);
+assert.equal(workspace.MAX_INLINE_SELECTION_LINES, 40);
+assert.equal(workspace.MAX_INLINE_CANDIDATES, 64);
+assert.equal(workspace.MAX_INLINE_CANDIDATE_LENGTH, 80);
+assert.equal(workspace.MAX_INLINE_NGRAM_TOKENS, 4);
+assert.equal(workspace.MAX_INLINE_RESULT_ENTRIES, 100);
+assert.equal(
+  workspace.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
+  "chatgpt-helper:workspace-lookup-glossary-selection",
+);
 assert.deepEqual(Object.keys(workspace.STORE_DEFINITIONS), [
   "meta",
   "conversations",
@@ -47,6 +58,196 @@ for (const technicalTerm of ["C++", "C#", ".NET", "GPT-4.1", "API/SDK", "client-
   assert.equal(workspace.canonicalizeTerm(technicalTerm).canonicalTerm, technicalTerm);
 }
 assert.equal(workspace.canonicalizeTerm(" **‘Workflow–Runner’** ").normalizedKey, "workflow-runner");
+assert.deepEqual(workspace.validateInlineSelectionText(" OpenAPI\r\nGraphRAG "), {
+  ok: true,
+  text: "OpenAPI\nGraphRAG",
+  lineCount: 2,
+});
+assert.equal(workspace.validateInlineSelectionText("x".repeat(2001)).error, "GLOSSARY_SELECTION_TOO_LARGE");
+assert.equal(
+  workspace.validateInlineSelectionText(Array.from({ length: 41 }, () => "API").join("\n")).error,
+  "GLOSSARY_SELECTION_TOO_MANY_LINES",
+);
+const extractedInline = workspace.extractInlineGlossaryCandidates(
+  "1. OpenAPI client / RAG pipeline\nРусский текст GraphRAG",
+);
+assert.equal(extractedInline.ok, true);
+assert.ok(extractedInline.candidates.some((item) => item.displayTerm === "OpenAPI client"));
+assert.ok(extractedInline.candidates.some((item) => item.displayTerm === "RAG pipeline"));
+assert.ok(extractedInline.candidates.some((item) => item.displayTerm === "GraphRAG"));
+assert.ok(extractedInline.candidates.every((item) => item.tokenCount <= workspace.MAX_INLINE_NGRAM_TOKENS));
+assert.ok(extractedInline.candidates.length <= workspace.MAX_INLINE_CANDIDATES);
+assert.ok(
+  extractedInline.candidates
+    .filter((item) => item.source === "token")
+    .every((item) => item.visibility === "primary"),
+);
+assert.ok(
+  extractedInline.candidates
+    .filter((item) => item.source === "ngram")
+    .every((item) => item.visibility === "lookup-only"),
+);
+assert.deepEqual(workspace.tokenizeGlossaryTerm("OpenAPI response"), ["openapi", "response"]);
+const termModeInline = workspace.extractInlineGlossaryCandidates("OpenAPI client");
+assert.deepEqual(
+  termModeInline.candidates
+    .filter((item) => item.visibility === "primary")
+    .map((item) => [item.displayTerm, item.source]),
+  [["OpenAPI client", "selected-whole"]],
+);
+assert.deepEqual(
+  termModeInline.candidates
+    .filter((item) => item.visibility === "lookup-only")
+    .map((item) => item.displayTerm),
+  ["OpenAPI", "client"],
+);
+const fragmentModeInline = workspace.extractInlineGlossaryCandidates("route handler короткий");
+assert.deepEqual(
+  fragmentModeInline.candidates
+    .filter((item) => item.visibility === "primary")
+    .map((item) => item.displayTerm),
+  ["route", "handler"],
+);
+assert.deepEqual(
+  fragmentModeInline.candidates
+    .filter((item) => item.visibility === "lookup-only")
+    .map((item) => item.displayTerm),
+  ["route handler"],
+);
+for (const listItem of [
+  "• route handler",
+  "* route handler",
+  "- route handler",
+  "+ route handler",
+  "1. route handler",
+  "1) route handler",
+]) {
+  assert.deepEqual(
+    workspace.extractInlineGlossaryCandidates(listItem).candidates
+      .map((item) => [item.displayTerm, item.source, item.visibility]),
+    [
+      ["route", "token", "primary"],
+      ["handler", "token", "primary"],
+      ["route handler", "ngram", "lookup-only"],
+    ],
+    `a leading list marker forces fragment mode without entering a candidate: ${listItem}`,
+  );
+}
+for (const technicalTerm of ["C++", "GPT-5", "Pydantic.v2"]) {
+  assert.deepEqual(
+    workspace.extractInlineGlossaryCandidates(technicalTerm).candidates
+      .filter((item) => item.visibility === "primary")
+      .map((item) => [item.displayTerm, item.source]),
+    [[technicalTerm, "selected-whole"]],
+    `technical punctuation does not create a list-item boundary: ${technicalTerm}`,
+  );
+}
+for (const [input, expectedPrimary] of [
+  ["OpenAPIпример", ["OpenAPI"]],
+  ["примерOpenAPI", ["OpenAPI"]],
+  ["RAGрусскийGraphRAG", ["RAG", "GraphRAG"]],
+]) {
+  const adjacentMixed = workspace.extractInlineGlossaryCandidates(input);
+  assert.deepEqual(
+    adjacentMixed.candidates
+      .filter((item) => item.visibility === "primary")
+      .map((item) => item.displayTerm),
+    expectedPrimary,
+    `adjacent Cyrillic is a hard boundary: ${input}`,
+  );
+  assert.equal(
+    adjacentMixed.candidates.some((item) => /[А-Яа-яЁё]/u.test(item.displayTerm)),
+    false,
+  );
+  assert.equal(
+    adjacentMixed.candidates.some((item) => item.displayTerm === "RAG GraphRAG"),
+    false,
+  );
+}
+const normalizedInline = workspace.extractInlineGlossaryCandidates(
+  "  ＯpenAPI\u00a0client\u200B  ",
+);
+assert.equal(normalizedInline.text, "OpenAPI client");
+assert.deepEqual(
+  normalizedInline.candidates.find((item) => item.normalizedKey === "open api").tokens,
+  ["openapi"],
+);
+const punctuationInline = workspace.extractInlineGlossaryCandidates(
+  "Pydantic.v2 C++ C# snake_case long-running",
+);
+for (const term of ["Pydantic.v2", "C++", "C#", "snake_case", "long-running"]) {
+  const candidate = punctuationInline.candidates.find((item) => item.displayTerm === term);
+  assert.ok(candidate, `technical token is extracted: ${term}`);
+  assert.equal(candidate.tokenCount, 1);
+}
+const ngramInline = workspace.extractInlineGlossaryCandidates("Alpha Beta Gamma Delta Epsilon");
+for (const [term, tokenCount] of [
+  ["Alpha Beta", 2],
+  ["Alpha Beta Gamma", 3],
+  ["Alpha Beta Gamma Delta", 4],
+]) {
+  const candidate = ngramInline.candidates.find((item) => item.displayTerm === term);
+  assert.ok(candidate, `contiguous ${tokenCount}-gram is extracted`);
+  assert.equal(candidate.tokenCount, tokenCount);
+}
+assert.equal(
+  ngramInline.candidates.some((item) => item.displayTerm === "Alpha Beta Gamma Delta Epsilon"),
+  false,
+);
+const boundaryInline = workspace.extractInlineGlossaryCandidates(
+  "API client. SDK server\n- DTO mapper\nRAG русский GraphRAG\nrequest/response",
+);
+for (const forbiddenPhrase of [
+  "client SDK",
+  "server DTO",
+  "RAG GraphRAG",
+  "request response",
+]) {
+  assert.equal(
+    boundaryInline.candidates.some((item) => item.displayTerm === forbiddenPhrase),
+    false,
+    `phrase does not cross a hard boundary: ${forbiddenPhrase}`,
+  );
+}
+for (const expectedTerm of ["API client", "SDK server", "DTO mapper", "request", "response"]) {
+  assert.ok(
+    boundaryInline.candidates.some((item) => item.displayTerm === expectedTerm),
+    `candidate survives its local boundary: ${expectedTerm}`,
+  );
+}
+const repeatedInline = workspace.extractInlineGlossaryCandidates("OpenAPI OpenAPI");
+const repeatedOpenApi = repeatedInline.candidates.find((item) => item.normalizedKey === "open api");
+assert.equal(repeatedOpenApi.displayTerm, "OpenAPI");
+assert.equal(repeatedOpenApi.firstIndex, 0);
+assert.equal(repeatedOpenApi.occurrences, 2);
+assert.equal(repeatedOpenApi.tokenCount, 1);
+const candidateLimitedInline = workspace.extractInlineGlossaryCandidates(
+  Array.from({ length: 70 }, (_, index) => `Api${index}`).join(" "),
+);
+assert.equal(candidateLimitedInline.candidateCountBeforeLimit > workspace.MAX_INLINE_CANDIDATES, true);
+assert.equal(candidateLimitedInline.candidateCountReturned, workspace.MAX_INLINE_CANDIDATES);
+assert.equal(candidateLimitedInline.candidateTruncated, true);
+assert.equal(
+  candidateLimitedInline.candidates.every((candidate) => candidate.visibility === "primary"),
+  true,
+  "lookup-only n-grams cannot displace primary candidates from the budget",
+);
+assert.deepEqual(
+  candidateLimitedInline.candidates.map((candidate) => candidate.displayTerm),
+  Array.from({ length: workspace.MAX_INLINE_CANDIDATES }, (_, index) => `Api${index}`),
+);
+const workspaceMutationClassification = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("const WORKSPACE_MUTATION_MESSAGES"),
+  serviceWorkerSource.indexOf("const activeRequests"),
+);
+assert.doesNotMatch(workspaceMutationClassification, /LOOKUP_GLOSSARY_SELECTION/);
+const workerLookupRoute = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("if (message.type === WORKSPACE_MESSAGES.LOOKUP_GLOSSARY_SELECTION)"),
+  serviceWorkerSource.indexOf("if (message.type === WORKSPACE_MESSAGES.ATTACH_GLOSSARY_SENSE"),
+);
+assert.match(workerLookupRoute, /validateInlineSelectionText\(message\.text\)/);
+assert.match(workerLookupRoute, /workspace\.lookupGlossarySelection/);
+assert.doesNotMatch(workerLookupRoute, /runUserMutation|broadcastWorkspaceChange|mutateAndBroadcast|openRouterClient/);
 
 assert.equal(
   workspace.normalizeSavedTextKey("  First  \r\n\r\nSecond\t \rThird  "),
@@ -672,6 +873,12 @@ assert.equal(workspaceQueryMessages[1].mode, "global");
 assert.equal(workspaceQueryMessages[2].mode, "global");
 assert.equal(workspaceQueryMessages[3].mode, "global");
 assert.equal(workspaceQueryMessages[4].text, structuredSavedText);
+void workspaceClient.lookupGlossarySelection("State and OpenAPI");
+assert.deepEqual(workspaceQueryMessages[5], {
+  type: workspace.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
+  conversationScope: "stable:chatgpt.com:armed-global",
+  text: "State and OpenAPI",
+});
 const contentScriptSource = fs.readFileSync(path.join(__dirname, "../src/content-script.js"), "utf8");
 assert.match(contentScriptSource, /await navigator\.clipboard\.writeText\(entry\.text\);/);
 assert.doesNotMatch(contentScriptSource, /navigator\.clipboard\.writeText\([^)]*(?:innerText|textContent)/);
@@ -1787,8 +1994,8 @@ async function runStoreTests() {
     send: async () => { workspaceClientSends += 1; return { ok: true }; },
   });
   assert.equal((await malformedReplacementClient.replaceGlossary({
-    entryId: "target",
-    sourceSenseId: "source",
+    senseId: "target",
+    expectedUpdatedAt: 1,
   })).error.code, "REQUEST_CONTRACT_ERROR");
   assert.equal(workspaceClientSends, 0);
 
@@ -1996,32 +2203,38 @@ async function runStoreTests() {
     payload: duplicateGraph,
   };
   const duplicateValidation = importExport.validateDataText(JSON.stringify(duplicateEnvelope));
-  assert.equal(duplicateValidation.ok, true);
-  const canonicalDuplicate = duplicateValidation.envelope.payload;
-  assert.deepEqual(canonicalDuplicate.templates.map((item) => item.id), ["template-z", "template-a"]);
-  assert.deepEqual(canonicalDuplicate.conversations.map((item) => item.id), ["conversation-c"]);
-  assert.deepEqual(canonicalDuplicate.glossaryConcepts.map((item) => item.id), ["concept-c"]);
-  assert.deepEqual(canonicalDuplicate.glossarySenses.map((item) => [item.id, item.conceptId]), [["sense-c", "concept-c"]]);
-  assert.deepEqual(canonicalDuplicate.savedItems.map((item) => item.id), ["saved-c"]);
-  assert.deepEqual(canonicalDuplicate.glossaryLinks.map((item) => [item.id, item.senseId, item.conversationId]), [
-    ["glossary-link-c", "sense-c", "conversation-c"],
-  ]);
-  assert.deepEqual(canonicalDuplicate.savedItemLinks.map((item) => [item.id, item.itemId, item.conversationId]), [
-    ["saved-link-c", "saved-c", "conversation-c"],
-  ]);
-  for (const family of ["conversations", "glossaryConcepts", "glossarySenses", "savedItems", "glossaryLinks", "savedItemLinks"]) {
-    const retainedIds = new Set(canonicalDuplicate[family].map((item) => item.id));
-    assert.equal([...duplicateValidation.canonical.remaps[family].values()].every((id) => retainedIds.has(id)), true);
-  }
-  assert.deepEqual(duplicateValidation.canonical.deduplicatedByFamily, {
-    templates: 0,
-    conversations: 2,
-    glossaryConcepts: 2,
-    glossarySenses: 2,
-    glossaryLinks: 2,
-    savedItems: 2,
-    savedItemLinks: 2,
-  });
+  assert.equal(duplicateValidation.ok, false);
+  assert.equal(duplicateValidation.errors[0].code, "GLOSSARY_INVARIANT_VIOLATION");
+  const rawWinnerSelectionEnvelope = {
+    ...duplicateEnvelope,
+    payload: {
+      templates: [],
+      conversations: [],
+      glossaryConcepts: [
+        { id: "raw-winner-a", displayTerm: "OpenAPI", createdAt: 1, updatedAt: 2 },
+        { id: "raw-winner-b", displayTerm: "open api", createdAt: 3, updatedAt: 4 },
+      ],
+      glossarySenses: [{
+        id: "raw-winner-sense",
+        conceptId: "raw-winner-a",
+        translation: "спецификация",
+        definition: "Описание API.",
+        createdAt: 1,
+        updatedAt: 2,
+      }],
+      glossaryLinks: [],
+      savedItems: [],
+      savedItemLinks: [],
+    },
+  };
+  const rawWinnerSelectionValidation = importExport.validateDataText(
+    JSON.stringify(rawWinnerSelectionEnvelope),
+  );
+  assert.equal(rawWinnerSelectionValidation.ok, false);
+  assert.equal(
+    rawWinnerSelectionValidation.errors[0].code,
+    "GLOSSARY_INVARIANT_VIOLATION",
+  );
 
   const temporaryPortable = {
     templates: [],
@@ -2029,7 +2242,6 @@ async function runStoreTests() {
     glossaryConcepts: [{ id: "temporary-concept", displayTerm: "Context", createdAt: 10, updatedAt: 20 }],
     glossarySenses: [
       { id: "temporary-sense", conceptId: "temporary-concept", translation: "контекст", definition: "Окружение.", createdAt: 10, updatedAt: 20 },
-      { id: "global-sense", conceptId: "temporary-concept", translation: "связь", definition: "Глобальное значение.", createdAt: 11, updatedAt: 21 },
     ],
     glossaryLinks: [{ id: "temporary-glossary-link", senseId: "temporary-sense", conversationId: "temporary-source", localOrder: 0, firstSeenAt: 10, lastSeenAt: 20 }],
     savedItems: [
@@ -2052,7 +2264,7 @@ async function runStoreTests() {
   assert.equal(temporaryThird.state.conversations.filter((item) => item.kind === "temporary").length, 1);
   assert.equal(temporaryThird.state.glossaryLinks.length, 1);
   assert.equal(temporaryThird.state.savedItemLinks.length, 1);
-  assert.equal(temporaryThird.state.glossarySenses.length, 2);
+  assert.equal(temporaryThird.state.glossarySenses.length, 1);
   assert.equal(temporaryThird.state.savedItems.length, 2);
   assert.match(
     temporaryThird.state.conversations.find((item) => item.kind === "temporary").scopeKey,
@@ -2082,11 +2294,11 @@ async function runStoreTests() {
     ...timestampCurrent.conversations[0], createdAt: 10, lastSeenAt: 20, orphanedAt: null,
   });
   assert.equal(timestampMerge.state.glossaryConcepts.find((item) => item.id === "current-concept").displayTerm, "WORKFLOW");
-  assert.equal(timestampMerge.state.glossaryConcepts.find((item) => item.id === "current-concept").createdAt, 10);
-  assert.equal(timestampMerge.state.glossaryConcepts.find((item) => item.id === "current-concept").updatedAt, 20);
+  assert.equal(timestampMerge.state.glossaryConcepts.find((item) => item.id === "current-concept").createdAt, 15);
+  assert.equal(timestampMerge.state.glossaryConcepts.find((item) => item.id === "current-concept").updatedAt, 18);
   assert.equal(timestampMerge.state.glossarySenses.find((item) => item.id === "current-sense").translation, "Процесс");
-  assert.equal(timestampMerge.state.glossarySenses.find((item) => item.id === "current-sense").createdAt, 10);
-  assert.equal(timestampMerge.state.glossarySenses.find((item) => item.id === "current-sense").updatedAt, 20);
+  assert.equal(timestampMerge.state.glossarySenses.find((item) => item.id === "current-sense").createdAt, 15);
+  assert.equal(timestampMerge.state.glossarySenses.find((item) => item.id === "current-sense").updatedAt, 18);
   assert.equal(timestampMerge.state.savedItems.find((item) => item.id === "current-saved").id, "current-saved");
   assert.equal(timestampMerge.state.savedItems.find((item) => item.id === "current-saved").createdAt, 10);
   assert.equal(timestampMerge.state.savedItems.find((item) => item.id === "current-saved").updatedAt, 20);
@@ -2098,6 +2310,34 @@ async function runStoreTests() {
     timestampMerge.state.savedItemLinks.find((item) => item.id === "current-saved-link"),
     { ...timestampCurrent.savedItemLinks[0], firstSeenAt: 10, lastSeenAt: 20 },
   );
+  const currentWithoutDerivedMeaningFields = clone(timestampCurrent);
+  delete currentWithoutDerivedMeaningFields.glossarySenses[0].normalizedTranslation;
+  delete currentWithoutDerivedMeaningFields.glossarySenses[0].normalizedDefinition;
+  const normalizedContentMerge = await importExport.buildDataPlan(
+    currentWithoutDerivedMeaningFields,
+    validData,
+    "merge",
+    webcrypto,
+  );
+  assert.equal(
+    normalizedContentMerge.state.glossarySenses.find((item) => item.id === "current-sense").id,
+    "current-sense",
+  );
+  assert.equal(
+    normalizedContentMerge.state.glossarySenses.some((item) => item.id === "sense-one"),
+    false,
+  );
+  const conflictingPortableState = clone(portableState);
+  conflictingPortableState.glossarySenses[0].definition = "Другая версия.";
+  const conflictingValidation = importExport.validateDataText(
+    importExport.createDataExport(conflictingPortableState, dataMetadata).text,
+  );
+  const timestampBeforeConflict = clone(timestampCurrent);
+  await assert.rejects(
+    importExport.buildDataPlan(timestampCurrent, conflictingValidation, "merge", webcrypto),
+    /GLOSSARY_IMPORT_CONFLICT/,
+  );
+  assert.deepEqual(timestampCurrent, timestampBeforeConflict);
   const timestampRepeated = await importExport.buildDataPlan(timestampMerge.state, validData, "merge", webcrypto);
   assert.equal(importExport.canonicalDataEqual(timestampMerge.state, timestampRepeated.state), true);
   const timestampReplace = await importExport.buildDataPlan(timestampCurrent, validData, "replace", webcrypto);
@@ -2262,7 +2502,7 @@ async function runStoreTests() {
   assert.equal(await importStore.getMetaValue("pendingDataImport"), null);
 
   const migrationStore = createStore();
-  const migration = await migrationStore.migrateLegacyGlossary([
+  const conflictingLegacy = [
     {
       id: "legacy-1",
       term: "WorkflowOrchestrator",
@@ -2288,23 +2528,35 @@ async function runStoreTests() {
       updatedAt: 25,
     },
     { id: "broken", term: "", translation: "x", definition: "y" },
-  ]);
+  ];
+  await assert.rejects(
+    migrationStore.migrateLegacyGlossary(conflictingLegacy),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+  assert.equal(migrationStore.snapshot().glossaryConcepts.length, 0);
+  assert.equal(
+    migrationStore.snapshot().meta.find((item) => item.key === "v1GlossaryMigrationState").value,
+    null,
+  );
+  const migration = await migrationStore.migrateLegacyGlossary(
+    conflictingLegacy.filter((item) => ["legacy-1", "broken"].includes(item.id)),
+  );
   assert.equal(migration.migrated, true);
   assert.deepEqual(migration.marker, {
     status: "complete",
     sourceSchemaVersion: 1,
-    sourceCount: 4,
-    migratedCount: 3,
+    sourceCount: 2,
+    migratedCount: 1,
     skippedCount: 1,
   });
   const migratedState = migrationStore.snapshot();
   assert.equal(migratedState.glossaryConcepts.length, 1);
-  assert.equal(migratedState.glossaryConcepts[0].createdAt, 5);
-  assert.equal(migratedState.glossaryConcepts[0].updatedAt, 30);
-  assert.equal(migratedState.glossarySenses.length, 2);
+  assert.equal(migratedState.glossaryConcepts[0].createdAt, 10);
+  assert.equal(migratedState.glossaryConcepts[0].updatedAt, 20);
+  assert.equal(migratedState.glossarySenses.length, 1);
   assert.equal(migratedState.glossaryLinks.length, 0);
   assert.equal((await migrationStore.migrateLegacyGlossary([])).migrated, false);
-  assert.equal(migrationStore.snapshot().glossarySenses.length, 2);
+  assert.equal(migrationStore.snapshot().glossarySenses.length, 1);
 
   const rollbackStore = createStore();
   rollbackStore.failNextWrite(new Error("simulated abort"));
@@ -2336,15 +2588,308 @@ async function runStoreTests() {
     { term: "state", translation: "государство", definition: "Политическое образование." },
   ], tempScope);
   assert.equal(firstTerms.results.length, 2);
-  assert.equal(firstTerms.results.every((item) => item.status === "new"), true);
+  assert.deepEqual(firstTerms.results.map((item) => item.status), [
+    "new",
+    "replacementAvailable",
+  ]);
+  assert.equal(store.snapshot().glossarySenses.length, 1);
   const exactAttach = await store.addAnalysisTerms([
     { term: "State", translation: "состояние", definition: "Состояние workflow." },
   ], tempScope);
   assert.equal(exactAttach.results[0].status, "alreadySaved");
-  assert.equal((await store.queryGlossary({ conversationScope: tempScope, mode: "local", query: "" })).length, 2);
+  assert.equal((await store.queryGlossary({ conversationScope: tempScope, mode: "local", query: "" })).length, 1);
   assert.equal((await store.queryGlossary({ conversationScope: tempScope, mode: "global", query: "" })).length, 0);
-  assert.equal((await store.queryGlossary({ conversationScope: tempScope, mode: "global", query: "state" })).length, 2);
+  assert.equal((await store.queryGlossary({ conversationScope: tempScope, mode: "global", query: "state" })).length, 1);
 
+  const exactLookupScope = "stable:chatgpt.com:inline-lookup";
+  const exactLookupState = workspaceStore.createEmptyState(1);
+  exactLookupState.conversations.push({
+    id: "conversation-inline-lookup",
+    scopeKey: exactLookupScope,
+    kind: "stable",
+    host: "chatgpt.com",
+    remoteConversationId: "inline-lookup",
+    canonicalUrl: "https://chatgpt.com/c/inline-lookup",
+    createdAt: 1,
+    lastSeenAt: 1,
+    orphanedAt: null,
+  });
+  function addLookupConcept(state, id, term, translation, definition, updatedAt) {
+    const canonical = workspace.canonicalizeTerm(term);
+    state.glossaryConcepts.push({
+      id: `concept-${id}`,
+      displayTerm: term,
+      canonicalTerm: canonical.canonicalTerm,
+      normalizedKey: canonical.normalizedKey,
+      createdAt: 1,
+      updatedAt,
+    });
+    state.glossarySenses.push({
+      id: `sense-${id}`,
+      conceptId: `concept-${id}`,
+      translation,
+      definition,
+      normalizedTranslation: translation.toLocaleLowerCase("ru-RU"),
+      normalizedDefinition: definition.toLocaleLowerCase("ru-RU"),
+      naturalKey: workspace.createSenseNaturalKey(`concept-${id}`, translation, definition),
+      createdAt: 1,
+      updatedAt,
+    });
+  }
+  addLookupConcept(exactLookupState, "state", "state", "состояние", "Состояние системы.", 10);
+  addLookupConcept(exactLookupState, "state-machine", "state machine", "конечный автомат", "Модель состояний.", 20);
+  addLookupConcept(exactLookupState, "statement", "statement", "утверждение", "Отдельное слово.", 30);
+  exactLookupState.glossaryLinks.push({
+    id: "link-inline-attached",
+    senseId: "sense-state",
+    conversationId: "conversation-inline-lookup",
+    linkKey: "sense-state\u001fconversation-inline-lookup",
+    localOrder: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 1,
+  });
+  const exactLookupStore = createStore(exactLookupState);
+  const exactLookupBefore = exactLookupStore.snapshot();
+  const exactLookup = await exactLookupStore.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "State machine / unknown",
+  });
+  assert.deepEqual(
+    exactLookup.groups.flatMap((group) => group.entries.map((entry) => entry.id)),
+    ["sense-state-machine", "sense-state"],
+  );
+  assert.equal(
+    exactLookup.groups.find((group) => group.candidate.normalizedKey === "state machine")
+      .entries[0].matchClass,
+    "exact",
+  );
+  assert.equal(
+    exactLookup.groups.find((group) => group.candidate.normalizedKey === "state")
+      .entries[0].attached,
+    true,
+  );
+  assert.ok(exactLookup.missing.some((candidate) => candidate.normalizedKey === "unknown"));
+  const termModeMissing = await exactLookupStore.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "route handler",
+  });
+  assert.deepEqual(
+    termModeMissing.missing.map((candidate) => [
+      candidate.displayTerm,
+      candidate.source,
+      candidate.visibility,
+    ]),
+    [["route handler", "selected-whole", "primary"]],
+  );
+  const fragmentModeMissing = await exactLookupStore.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "route handler короткий",
+  });
+  assert.deepEqual(
+    fragmentModeMissing.missing.map((candidate) => candidate.displayTerm),
+    ["route", "handler"],
+  );
+  assert.equal(
+    fragmentModeMissing.missing.some((candidate) => candidate.displayTerm === "route handler"),
+    false,
+    "unmatched lookup-only phrases stay out of the visible missing list",
+  );
+  const phraseCoverageState = clone(exactLookupState);
+  addLookupConcept(
+    phraseCoverageState,
+    "route-handler",
+    "route handler",
+    "обработчик маршрута",
+    "Обрабатывает маршрут.",
+    40,
+  );
+  const phraseCoverageLookup = await createStore(phraseCoverageState)
+    .lookupGlossarySelection({
+      conversationScope: exactLookupScope,
+      text: "route handler короткий",
+    });
+  assert.deepEqual(phraseCoverageLookup.missing, []);
+  assert.equal(phraseCoverageLookup.groups.length, 1);
+  assert.equal(phraseCoverageLookup.groups[0].candidate.displayTerm, "route handler");
+  assert.equal(phraseCoverageLookup.groups[0].candidate.visibility, "lookup-only");
+  assert.equal(phraseCoverageLookup.groups[0].entries[0].matchClass, "exact");
+  assert.equal(phraseCoverageLookup.totals.matchedCandidateCount, 3);
+  const relatedLookup = await exactLookupStore.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "state",
+  });
+  assert.deepEqual(
+    relatedLookup.groups.flatMap((group) => group.entries.map((entry) => [
+      entry.id,
+      entry.matchClass,
+    ])),
+    [["sense-state", "exact"], ["sense-state-machine", "contiguous"]],
+  );
+  assert.equal(
+    relatedLookup.groups.some((group) => (
+      group.entries.some((entry) => entry.id === "sense-statement")
+    )),
+    false,
+    "substring-only matches are excluded",
+  );
+  const exactMissingLookup = await exactLookupStore.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "machine",
+  });
+  assert.equal(exactMissingLookup.groups.length, 1);
+  assert.equal(exactMissingLookup.groups[0].exactMissing, true);
+  assert.equal(exactMissingLookup.groups[0].matchClass, "contiguous");
+  assert.equal(exactMissingLookup.groups[0].entries[0].id, "sense-state-machine");
+  const reorderedCandidate = workspace.extractInlineGlossaryCandidates("response OpenAPI")
+    .candidates.find((candidate) => candidate.normalizedKey === "response open api");
+  const openApiResponse = workspace.canonicalizeTerm("OpenAPI response");
+  assert.equal(workspaceStore.inlineMatchClass(reorderedCandidate, {
+    displayTerm: openApiResponse.displayTerm,
+    canonicalTerm: openApiResponse.canonicalTerm,
+    normalizedKey: openApiResponse.normalizedKey,
+  }), "full-token");
+  await assert.rejects(
+    exactLookupStore.lookupGlossarySelection({ conversationScope: exactLookupScope, text: "" }),
+    /INVALID_GLOSSARY_LOOKUP/,
+  );
+  await assert.rejects(
+    exactLookupStore.lookupGlossarySelection({ conversationScope: "invalid", text: "state" }),
+    /INVALID_GLOSSARY_LOOKUP/,
+  );
+  assert.deepEqual(exactLookupStore.snapshot(), exactLookupBefore, "batch Memory lookup is read-only");
+
+  const truncatedState = clone(exactLookupState);
+  truncatedState.glossaryConcepts = [];
+  truncatedState.glossarySenses = [];
+  truncatedState.glossaryLinks = [];
+  for (let index = 0; index < 101; index += 1) {
+    const term = `API component ${index}`;
+    const canonical = workspace.canonicalizeTerm(term);
+    truncatedState.glossaryConcepts.push({
+      id: `concept-api-${index}`,
+      displayTerm: term,
+      canonicalTerm: canonical.canonicalTerm,
+      normalizedKey: canonical.normalizedKey,
+      createdAt: 1,
+      updatedAt: index,
+    });
+    truncatedState.glossarySenses.push({
+      id: `sense-api-${index}`,
+      conceptId: `concept-api-${index}`,
+      translation: `компонент ${index}`,
+      definition: `Определение ${index}.`,
+      normalizedTranslation: `компонент ${index}`,
+      normalizedDefinition: `определение ${index}.`,
+      naturalKey: workspace.createSenseNaturalKey(
+        `concept-api-${index}`,
+        `компонент ${index}`,
+        `Определение ${index}.`,
+      ),
+      createdAt: 1,
+      updatedAt: index,
+    });
+  }
+  const truncatedLookup = await createStore(truncatedState).lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "API",
+  });
+  assert.equal(truncatedLookup.totals.matchedEntryCountBeforeLimit, 101);
+  assert.equal(truncatedLookup.totals.matchedEntryCountReturned, 100);
+  assert.equal(truncatedLookup.truncated.entries, true);
+  const fairTruncationState = clone(truncatedState);
+  addLookupConcept(
+    fairTruncationState,
+    "dto",
+    "DTO",
+    "объект передачи данных",
+    "Структура передачи данных.",
+    200,
+  );
+  const fairTruncationLookup = await createStore(fairTruncationState)
+    .lookupGlossarySelection({
+      conversationScope: exactLookupScope,
+      text: "API / DTO",
+    });
+  assert.equal(fairTruncationLookup.totals.matchedEntryCountBeforeLimit, 102);
+  assert.equal(fairTruncationLookup.totals.matchedEntryCountReturned, 100);
+  assert.equal(
+    fairTruncationLookup.groups.some((group) => (
+      group.candidate.normalizedKey === "dto"
+      && group.entries.some((entry) => entry.id === "sense-dto")
+    )),
+    true,
+    "entry truncation reserves a visible result for a later matched candidate",
+  );
+
+  const corruptLookupState = clone(exactLookupState);
+  corruptLookupState.glossarySenses.push({
+    ...corruptLookupState.glossarySenses[0],
+    id: "sense-state-corrupt",
+  });
+  await assert.rejects(
+    createStore(corruptLookupState).lookupGlossarySelection({
+      conversationScope: exactLookupScope,
+      text: "state",
+    }),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+  const zeroSenseLookupState = clone(exactLookupState);
+  zeroSenseLookupState.glossarySenses = zeroSenseLookupState.glossarySenses
+    .filter((sense) => sense.conceptId !== "concept-state");
+  await assert.rejects(
+    createStore(zeroSenseLookupState).lookupGlossarySelection({
+      conversationScope: exactLookupScope,
+      text: "state",
+    }),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+  const deterministicLookupState = workspaceStore.createEmptyState(1);
+  deterministicLookupState.conversations.push(clone(exactLookupState.conversations[0]));
+  addLookupConcept(
+    deterministicLookupState,
+    "api-z",
+    "API zeta",
+    "зета",
+    "Глобальная запись.",
+    50,
+  );
+  addLookupConcept(
+    deterministicLookupState,
+    "api-a",
+    "API alpha",
+    "альфа",
+    "Глобальная запись.",
+    50,
+  );
+  addLookupConcept(
+    deterministicLookupState,
+    "api-attached",
+    "API attached",
+    "локальная",
+    "Локальная запись.",
+    10,
+  );
+  deterministicLookupState.glossaryLinks.push({
+    id: "link-api-attached",
+    senseId: "sense-api-attached",
+    conversationId: "conversation-inline-lookup",
+    linkKey: "sense-api-attached\u001fconversation-inline-lookup",
+    localOrder: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 1,
+  });
+  const deterministicLookup = await createStore(deterministicLookupState)
+    .lookupGlossarySelection({ conversationScope: exactLookupScope, text: "API" });
+  assert.equal(deterministicLookup.groups[0].exactMissing, true);
+  assert.deepEqual(
+    deterministicLookup.groups[0].entries.map((entry) => entry.id),
+    ["sense-api-attached", "sense-api-a", "sense-api-z"],
+  );
+  await store.addAnalysisTerms([{
+    term: "workflow",
+    translation: "рабочий процесс",
+    definition: "Последовательность действий.",
+  }], tempScope);
   const localBeforeMove = await store.queryGlossary({ conversationScope: tempScope, mode: "local", query: "" });
   await store.moveGlossaryLink(localBeforeMove[1].id, localBeforeMove[0].id, tempScope);
   const localAfterMove = await store.queryGlossary({ conversationScope: tempScope, mode: "local", query: "" });
@@ -2354,7 +2899,7 @@ async function runStoreTests() {
   assert.equal((await store.queryGlossary({ conversationScope: stableOne.context.scopeKey, mode: "local", query: "" })).length, 1);
   await store.unlinkGlossary(localAfterMove[0].id, stableOne.context.scopeKey);
   assert.equal((await store.queryGlossary({ conversationScope: stableOne.context.scopeKey, mode: "local", query: "" })).length, 0);
-  assert.equal((await store.queryGlossary({ conversationScope: stableOne.context.scopeKey, mode: "global", query: "state" })).length, 2);
+  assert.equal((await store.queryGlossary({ conversationScope: stableOne.context.scopeKey, mode: "global", query: "state" })).length, 1);
 
   const replacementStore = createStore();
   const replacementOne = await replacementStore.ensureConversation(stable("replacement-one"));
@@ -2369,79 +2914,66 @@ async function runStoreTests() {
     translation: "состояние",
     definition: "Исправленное определение.",
   }], replacementTwo.context.scopeKey);
-  assert.equal(candidateReplacement.results[0].status, "duplicate");
-  assert.equal(candidateReplacement.results[0].replacementCandidate.status, "single");
+  assert.equal(candidateReplacement.results[0].status, "replacementAvailable");
   assert.equal(candidateReplacement.results[0].replacementCandidate.targetSenseId, originalReplacement.results[0].id);
-  assert.equal(candidateReplacement.results[0].replacementCandidate.newSenseId, candidateReplacement.results[0].id);
   assert.equal(candidateReplacement.results[0].savedEntry.definition, "Старое определение.");
+  assert.equal(replacementStore.snapshot().glossarySenses.length, 1);
   assert.equal((await replacementStore.addAnalysisTerms([{
     term: "state",
     translation: "состояние",
     definition: "Исправленное определение.",
-  }], replacementOne.context.scopeKey)).results[0].status, "alreadySaved");
+  }], replacementOne.context.scopeKey)).results[0].status, "replacementAvailable");
   await assert.rejects(
     replacementStore.replaceGlossarySense({
       senseId: originalReplacement.results[0].id,
-      sourceSenseId: candidateReplacement.results[0].id,
-    }),
+    }, replacementOne.context.scopeKey),
     /INVALID_GLOSSARY_REPLACEMENT/,
   );
   await assert.rejects(
     replacementStore.replaceGlossarySense({
       senseId: originalReplacement.results[0].id,
-      sourceSenseId: candidateReplacement.results[0].id,
       expectedUpdatedAt: "1000",
-    }),
+      replacement: { translation: "состояние", definition: "Исправленное определение." },
+    }, replacementOne.context.scopeKey),
     /INVALID_GLOSSARY_REPLACEMENT/,
   );
   const stale = await replacementStore.replaceGlossarySense({
     senseId: originalReplacement.results[0].id,
-    sourceSenseId: candidateReplacement.results[0].id,
     expectedUpdatedAt: -1,
-  });
+    replacement: { translation: "состояние", definition: "Исправленное определение." },
+  }, replacementOne.context.scopeKey);
   assert.equal(stale.ok, false);
   assert.equal(stale.stale, true);
-  assert.equal(replacementStore.snapshot().glossaryLinks.length, 3);
+  assert.equal(replacementStore.snapshot().glossaryLinks.length, 2);
+  const beforeReplacement = replacementStore.snapshot();
   const replaced = await replacementStore.replaceGlossarySense({
     senseId: originalReplacement.results[0].id,
-    sourceSenseId: candidateReplacement.results[0].id,
     expectedUpdatedAt: candidateReplacement.results[0].replacementCandidate.expectedUpdatedAt,
-  });
+    replacement: candidateReplacement.results[0].replacementCandidate.proposed,
+  }, replacementOne.context.scopeKey);
   assert.equal(replaced.ok, true);
+  assert.equal(replaced.changed, true);
   assert.equal(replaced.entry.id, originalReplacement.results[0].id);
   assert.equal(replaced.entry.definition, "Исправленное определение.");
   const replacementState = replacementStore.snapshot();
   assert.equal(replacementState.glossarySenses.length, 1);
   assert.equal(replacementState.glossaryLinks.length, 2);
   assert.equal(new Set(replacementState.glossaryLinks.map((link) => link.conversationId)).size, 2);
-  assert.equal(replacementState.glossarySenses.some((sense) => sense.id === candidateReplacement.results[0].id), false);
-
-  const ambiguousStore = createStore();
-  const ambiguousConversation = await ambiguousStore.ensureConversation(stable("ambiguous"));
-  await ambiguousStore.addAnalysisTerms([{
-    term: "route",
-    translation: "маршрут",
-    definition: "Первое определение.",
-  }], ambiguousConversation.context.scopeKey);
-  const secondMeaning = await ambiguousStore.addAnalysisTerms([{
-    term: "route",
-    translation: "маршрут",
-    definition: "Второе определение.",
-  }], ambiguousConversation.context.scopeKey);
-  assert.equal(secondMeaning.results[0].replacementCandidate.status, "single");
-  const multipleCandidates = await ambiguousStore.addAnalysisTerms([{
-    term: "route",
-    translation: "маршрут",
-    definition: "Третье определение.",
-  }], ambiguousConversation.context.scopeKey);
-  assert.equal(multipleCandidates.results[0].status, "new");
-  assert.deepEqual(multipleCandidates.results[0].replacementCandidate, { status: "multiple", count: 2 });
-  const noCandidate = await ambiguousStore.addAnalysisTerms([{
-    term: "route",
-    translation: "направлять",
-    definition: "Другое значение.",
-  }], ambiguousConversation.context.scopeKey);
-  assert.equal(noCandidate.results[0].replacementCandidate, undefined);
+  assert.equal(
+    replacementState.glossarySenses[0].createdAt,
+    beforeReplacement.glossarySenses[0].createdAt,
+  );
+  assert.deepEqual(
+    replacementState.glossaryLinks,
+    beforeReplacement.glossaryLinks,
+    "in-place replacement preserves links and local order",
+  );
+  const idempotentReplacement = await replacementStore.replaceGlossarySense({
+    senseId: originalReplacement.results[0].id,
+    expectedUpdatedAt: replaced.entry.updatedAt,
+    replacement: { translation: "состояние", definition: "Исправленное определение." },
+  }, replacementOne.context.scopeKey);
+  assert.equal(idempotentReplacement.changed, false);
 
   const firstSaved = await store.saveSelection("First line\n\nSecond line", tempScope);
   const duplicateSaved = await store.saveSelection("First line  \r\n\r\nSecond line", tempScope);
@@ -2521,6 +3053,193 @@ async function runStoreTests() {
     };
   }
 
+  function importBoundaryState() {
+    const state = workspaceStore.createEmptyState(1);
+    state.conversations.push(
+      conversationRecord("conversation-import-primary", "stable:chatgpt.com:import-primary"),
+    );
+    const term = workspace.canonicalizeTerm("State");
+    state.glossaryConcepts.push({
+      id: "concept-import-state",
+      displayTerm: term.displayTerm,
+      canonicalTerm: term.canonicalTerm,
+      normalizedKey: term.normalizedKey,
+      createdAt: 10,
+      updatedAt: 20,
+    });
+    state.glossarySenses.push({
+      id: "sense-import-state",
+      conceptId: "concept-import-state",
+      translation: "состояние",
+      definition: "Состояние системы.",
+      normalizedTranslation: "состояние",
+      normalizedDefinition: "состояние системы.",
+      naturalKey: workspace.createSenseNaturalKey(
+        "concept-import-state",
+        "состояние",
+        "Состояние системы.",
+      ),
+      createdAt: 10,
+      updatedAt: 20,
+    });
+    return state;
+  }
+
+  function userStoresFrom(state) {
+    return Object.fromEntries(
+      workspaceStore.USER_STORE_NAMES.map((name) => [name, clone(state[name])]),
+    );
+  }
+
+  async function assertImportFinalBoundary(label, adapter, snapshot) {
+    const initial = clone(snapshot());
+    const initialUserData = userStoresFrom(initial);
+    const initialRevision = initial.meta.find((item) => item.key === "revision:all")?.value || 0;
+
+    const duplicateSenseId = clone(initialUserData);
+    const secondTerm = workspace.canonicalizeTerm("Route");
+    duplicateSenseId.glossaryConcepts.push({
+      id: "concept-import-route",
+      displayTerm: secondTerm.displayTerm,
+      canonicalTerm: secondTerm.canonicalTerm,
+      normalizedKey: secondTerm.normalizedKey,
+      createdAt: 10,
+      updatedAt: 20,
+    });
+    duplicateSenseId.glossarySenses.push({
+      ...clone(duplicateSenseId.glossarySenses[0]),
+      conceptId: "concept-import-route",
+      naturalKey: workspace.createSenseNaturalKey(
+        "concept-import-route",
+        "состояние",
+        "Состояние системы.",
+      ),
+    });
+    await assert.rejects(
+      async () => adapter.replaceUserData(duplicateSenseId),
+      /GLOSSARY_INVARIANT_VIOLATION/,
+      `${label} rejects duplicate sense ids`,
+    );
+    assert.deepEqual(snapshot(), initial, `${label} duplicate-sense rejection is atomic`);
+
+    const multipleSenses = clone(initialUserData);
+    multipleSenses.glossarySenses.push({
+      id: "sense-import-state-second",
+      conceptId: "concept-import-state",
+      translation: "режим",
+      definition: "Другая версия состояния.",
+      normalizedTranslation: "режим",
+      normalizedDefinition: "другая версия состояния.",
+      naturalKey: workspace.createSenseNaturalKey(
+        "concept-import-state",
+        "режим",
+        "Другая версия состояния.",
+      ),
+      createdAt: 10,
+      updatedAt: 20,
+    });
+    await assert.rejects(
+      async () => adapter.replaceUserData(multipleSenses),
+      /GLOSSARY_INVARIANT_VIOLATION/,
+      `${label} Replace rejects two senses for one concept`,
+    );
+    assert.deepEqual(snapshot(), initial, `${label} multiplicity Replace is atomic`);
+    await assert.rejects(
+      async () => adapter.mergeUserData(multipleSenses),
+      /GLOSSARY_INVARIANT_VIOLATION/,
+      `${label} Merge rejects two senses for one concept`,
+    );
+    assert.deepEqual(snapshot(), initial, `${label} multiplicity Merge is atomic`);
+
+    const forgedIdentity = clone(initialUserData);
+    forgedIdentity.glossaryConcepts[0].normalizedKey = "forged-state";
+    await assert.rejects(
+      async () => adapter.replaceUserData(forgedIdentity),
+      /GLOSSARY_INVARIANT_VIOLATION/,
+      `${label} rejects forged canonical identity`,
+    );
+    assert.deepEqual(snapshot(), initial, `${label} forged-identity rejection is atomic`);
+
+    const noOpReplace = await adapter.replaceUserData(initialUserData);
+    assert.equal(noOpReplace.changed, false, `${label} identical Replace is a no-op`);
+    assert.equal(noOpReplace.revision, initialRevision);
+    assert.deepEqual(snapshot(), initial, `${label} identical Replace writes nothing`);
+
+    const conflictingMerge = userStoresFrom(workspaceStore.createEmptyState(1));
+    conflictingMerge.glossaryConcepts = [clone(initial.glossaryConcepts[0])];
+    conflictingMerge.glossarySenses = [{
+      ...clone(initial.glossarySenses[0]),
+      definition: "Другая версия.",
+      normalizedDefinition: "другая версия.",
+      naturalKey: workspace.createSenseNaturalKey(
+        "concept-import-state",
+        "состояние",
+        "Другая версия.",
+      ),
+    }];
+    await assert.rejects(
+      async () => adapter.mergeUserData(conflictingMerge),
+      /GLOSSARY_IMPORT_CONFLICT/,
+      `${label} rejects a conflicting Merge`,
+    );
+    assert.deepEqual(snapshot(), initial, `${label} conflicting Merge is atomic`);
+
+    const equalLinksOnlyMerge = userStoresFrom(workspaceStore.createEmptyState(1));
+    equalLinksOnlyMerge.conversations = [
+      conversationRecord("conversation-import-second", "stable:chatgpt.com:import-second"),
+    ];
+    equalLinksOnlyMerge.glossaryConcepts = [{
+      ...clone(initial.glossaryConcepts[0]),
+      createdAt: 1,
+      updatedAt: 999,
+    }];
+    equalLinksOnlyMerge.glossarySenses = [{
+      ...clone(initial.glossarySenses[0]),
+      createdAt: 1,
+      updatedAt: 999,
+    }];
+    equalLinksOnlyMerge.glossaryLinks = [{
+      id: "link-import-second",
+      senseId: "sense-import-state",
+      conversationId: "conversation-import-second",
+      linkKey: "sense-import-state\u001fconversation-import-second",
+      localOrder: 0,
+      firstSeenAt: 30,
+      lastSeenAt: 30,
+    }];
+    const equalMerge = await adapter.mergeUserData(equalLinksOnlyMerge);
+    assert.equal(equalMerge.changed, true, `${label} equal-content Merge adds links`);
+    const afterEqualMerge = snapshot();
+    assert.deepEqual(
+      afterEqualMerge.glossaryConcepts[0],
+      initial.glossaryConcepts[0],
+      `${label} preserves the local concept record`,
+    );
+    assert.deepEqual(
+      afterEqualMerge.glossarySenses[0],
+      initial.glossarySenses[0],
+      `${label} preserves the local sense record`,
+    );
+    assert.equal(
+      afterEqualMerge.glossaryLinks.some((link) => link.id === "link-import-second"),
+      true,
+      `${label} adds only the planned link`,
+    );
+  }
+
+  const memoryImportBoundary = createStore(importBoundaryState());
+  await assertImportFinalBoundary(
+    "Memory",
+    memoryImportBoundary,
+    () => memoryImportBoundary.snapshot(),
+  );
+  const indexedImportFinalBoundary = createProductionAdapter(importBoundaryState());
+  await assertImportFinalBoundary(
+    "IndexedDB",
+    indexedImportFinalBoundary.adapter,
+    () => indexedImportFinalBoundary.fake.snapshot(),
+  );
+
   const insertState = workspaceStore.createEmptyState(1);
   insertState.conversations.push(conversationRecord("conversation-local", "stable:chatgpt.com:adapter-local"));
   const insertBoundary = createProductionAdapter(insertState);
@@ -2580,9 +3299,50 @@ async function runStoreTests() {
     mode: transaction.mode,
   })), [
     { storeNames: ["meta"], mode: "readonly" },
-    { storeNames: ["meta"], mode: "readonly" },
+    { storeNames: ["meta", "glossaryConcepts", "glossarySenses"], mode: "readonly" },
   ]);
   assert.equal(migrationBoundary.fake.instrumentation.calls.some((call) => ["put", "add", "delete", "clear"].includes(call.operation)), false);
+  const corruptCompletedMigrationState = clone(completedMigrationState);
+  const corruptCompletedTerm = workspace.canonicalizeTerm("State");
+  corruptCompletedMigrationState.glossaryConcepts.push({
+    id: "concept-completed-corrupt",
+    displayTerm: corruptCompletedTerm.displayTerm,
+    canonicalTerm: corruptCompletedTerm.canonicalTerm,
+    normalizedKey: corruptCompletedTerm.normalizedKey,
+    createdAt: 1,
+    updatedAt: 1,
+  });
+  for (const id of ["sense-completed-corrupt-a", "sense-completed-corrupt-b"]) {
+    corruptCompletedMigrationState.glossarySenses.push({
+      id,
+      conceptId: "concept-completed-corrupt",
+      translation: "состояние",
+      definition: id.endsWith("-a") ? "Первая версия." : "Другая версия.",
+      normalizedTranslation: "состояние",
+      normalizedDefinition: id.endsWith("-a") ? "первая версия." : "другая версия.",
+      naturalKey: workspace.createSenseNaturalKey(
+        "concept-completed-corrupt",
+        "состояние",
+        id.endsWith("-a") ? "Первая версия." : "Другая версия.",
+      ),
+      createdAt: 1,
+      updatedAt: 1,
+    });
+  }
+  await assert.rejects(
+    createStore(corruptCompletedMigrationState).migrateLegacyGlossary([]),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+  const indexedCorruptCompletedMigration = createProductionAdapter(
+    corruptCompletedMigrationState,
+  );
+  await assert.rejects(
+    indexedCorruptCompletedMigration.adapter.migrateLegacyGlossary([]),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+  assert.equal(indexedCorruptCompletedMigration.fake.instrumentation.calls.some((call) => (
+    ["put", "add", "delete", "clear"].includes(call.operation)
+  )), false);
 
   const queryState = workspaceStore.createEmptyState(1);
   queryState.conversations.push(conversationRecord("conversation-query", "stable:chatgpt.com:adapter-query"));
@@ -2598,6 +3358,113 @@ async function runStoreTests() {
   })).length, 1);
   assert.equal(localQueryBoundary.fake.instrumentation.calls.some((call) => call.store === "savedItems" || call.store === "savedItemLinks" || call.store === "importBackups"), false);
   assert.equal(localQueryBoundary.fake.instrumentation.calls.some((call) => call.operation === "getAll"), false);
+
+  const exactLookupBoundary = createProductionAdapter(exactLookupState);
+  const indexedExactLookup = await exactLookupBoundary.adapter.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "State machine / unknown",
+  });
+  assert.deepEqual(indexedExactLookup, exactLookup);
+  assert.deepEqual(
+    indexedExactLookup.groups.flatMap((group) => group.entries.map((entry) => entry.id)),
+    ["sense-state-machine", "sense-state"],
+  );
+  assert.deepEqual(
+    exactLookupBoundary.fake.instrumentation.transactions.map((transaction) => transaction.mode),
+    ["readonly"],
+  );
+  assert.equal(exactLookupBoundary.fake.instrumentation.calls.some((call) => (
+    ["add", "put", "delete", "clear"].includes(call.operation)
+  )), false);
+  assert.equal(exactLookupBoundary.fake.instrumentation.calls.some((call) => (
+    ["savedItems", "savedItemLinks", "importBackups", "meta"].includes(call.store)
+  )), false);
+  const indexedUnknown = await exactLookupBoundary.adapter.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "unknown",
+  });
+  assert.equal(indexedUnknown.groups.length, 0);
+  assert.equal(indexedUnknown.missing[0].normalizedKey, "unknown");
+  const indexedCandidateLimited = await exactLookupBoundary.adapter.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: Array.from({ length: 70 }, (_, index) => `Api${index}`).join(" "),
+  });
+  const memoryCandidateLimited = await exactLookupStore.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: Array.from({ length: 70 }, (_, index) => `Api${index}`).join(" "),
+  });
+  assert.deepEqual(indexedCandidateLimited, memoryCandidateLimited);
+  assert.equal(indexedCandidateLimited.truncated.candidates, true);
+
+  const indexedTruncatedBoundary = createProductionAdapter(truncatedState);
+  const indexedTruncatedLookup = await indexedTruncatedBoundary.adapter.lookupGlossarySelection({
+    conversationScope: exactLookupScope,
+    text: "API",
+  });
+  assert.deepEqual(indexedTruncatedLookup, truncatedLookup);
+  const indexedFairTruncation = createProductionAdapter(fairTruncationState);
+  assert.deepEqual(
+    await indexedFairTruncation.adapter.lookupGlossarySelection({
+      conversationScope: exactLookupScope,
+      text: "API / DTO",
+    }),
+    fairTruncationLookup,
+  );
+
+  const indexedCorruptBoundary = createProductionAdapter(corruptLookupState);
+  await assert.rejects(
+    indexedCorruptBoundary.adapter.lookupGlossarySelection({
+      conversationScope: exactLookupScope,
+      text: "state",
+    }),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+  const indexedZeroSenseBoundary = createProductionAdapter(zeroSenseLookupState);
+  await assert.rejects(
+    indexedZeroSenseBoundary.adapter.lookupGlossarySelection({
+      conversationScope: exactLookupScope,
+      text: "state",
+    }),
+    /GLOSSARY_INVARIANT_VIOLATION/,
+  );
+
+  const indexedPersistenceState = workspaceStore.createEmptyState(1);
+  const indexedPersistenceScope = "stable:chatgpt.com:indexed-persistence";
+  indexedPersistenceState.conversations.push(
+    conversationRecord("conversation-indexed-persistence", indexedPersistenceScope),
+  );
+  const indexedPersistence = createProductionAdapter(indexedPersistenceState);
+  const indexedNew = await indexedPersistence.adapter.addAnalysisTerms([{
+    term: "route",
+    translation: "маршрут",
+    definition: "Старое определение.",
+  }], indexedPersistenceScope);
+  const indexedProposal = await indexedPersistence.adapter.addAnalysisTerms([{
+    term: "Route",
+    translation: "маршрут",
+    definition: "Новое определение.",
+  }], indexedPersistenceScope);
+  assert.equal(indexedNew.results[0].status, "new");
+  assert.equal(indexedProposal.results[0].status, "replacementAvailable");
+  assert.equal(indexedPersistence.fake.snapshot().glossarySenses.length, 1);
+  const indexedBeforeReplacement = indexedPersistence.fake.snapshot();
+  const indexedReplaced = await indexedPersistence.adapter.replaceGlossarySense({
+    senseId: indexedNew.results[0].senseId,
+    expectedUpdatedAt: indexedProposal.results[0].replacementCandidate.expectedUpdatedAt,
+    replacement: indexedProposal.results[0].replacementCandidate.proposed,
+  }, indexedPersistenceScope);
+  assert.equal(indexedReplaced.changed, true);
+  const indexedAfterReplacement = indexedPersistence.fake.snapshot();
+  assert.equal(indexedAfterReplacement.glossarySenses.length, 1);
+  assert.equal(indexedAfterReplacement.glossarySenses[0].id, indexedBeforeReplacement.glossarySenses[0].id);
+  assert.equal(indexedAfterReplacement.glossarySenses[0].createdAt, indexedBeforeReplacement.glossarySenses[0].createdAt);
+  assert.deepEqual(indexedAfterReplacement.glossaryLinks, indexedBeforeReplacement.glossaryLinks);
+  const indexedIdempotent = await indexedPersistence.adapter.replaceGlossarySense({
+    senseId: indexedNew.results[0].senseId,
+    expectedUpdatedAt: indexedReplaced.entry.updatedAt,
+    replacement: indexedProposal.results[0].replacementCandidate.proposed,
+  }, indexedPersistenceScope);
+  assert.equal(indexedIdempotent.changed, false);
 
   const globalQueryState = workspaceStore.createEmptyState(1);
   globalQueryState.conversations.push(conversationRecord("conversation-global", "stable:chatgpt.com:adapter-global"));
