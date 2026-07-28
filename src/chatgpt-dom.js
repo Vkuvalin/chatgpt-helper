@@ -351,6 +351,22 @@
     return rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
   }
 
+  function inlineSelectionDirection(options) {
+    const selection = options?.selectionValue;
+    const range = options?.rangeValue;
+    const anchorAtStart = selection?.anchorNode === range?.startContainer
+      && selection?.anchorOffset === range?.startOffset;
+    const anchorAtEnd = selection?.anchorNode === range?.endContainer
+      && selection?.anchorOffset === range?.endOffset;
+    const focusAtStart = selection?.focusNode === range?.startContainer
+      && selection?.focusOffset === range?.startOffset;
+    const focusAtEnd = selection?.focusNode === range?.endContainer
+      && selection?.focusOffset === range?.endOffset;
+    if (anchorAtStart && focusAtEnd) return "forward";
+    if (anchorAtEnd && focusAtStart) return "backward";
+    return null;
+  }
+
   function captureInlineGlossarySelection(options) {
     const pageUrl = String(options?.pageUrl || window.location?.href || "");
     if (!inlineSupportedPage(pageUrl)) return inlineSelectionFailure("empty");
@@ -389,12 +405,18 @@
       : Number(window.innerHeight);
     const visibleRects = Array.from(range.getClientRects?.() || [])
       .filter((rect) => inlineVisibleRect(rect, viewportWidth, viewportHeight));
-    const rect = visibleRects.at(-1);
+    const direction = inlineSelectionDirection({
+      selectionValue: selection,
+      rangeValue: range,
+    });
+    const anchorSide = direction === "backward" ? "left" : "right";
+    const rect = direction === "backward" ? visibleRects[0] : visibleRects.at(-1);
     if (!rect) return inlineSelectionFailure("no-geometry");
 
     return Object.freeze({
       ok: true,
       text: sourceText,
+      anchorSide,
       anchorRect: Object.freeze({
         top: rect.top,
         right: rect.right,

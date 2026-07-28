@@ -5,6 +5,7 @@ const { webcrypto } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const analysis = require("../src/analysis-contract.js");
 const workspace = require("../src/workspace-contract.js");
 const conversations = require("../src/conversation-context.js");
 const commands = require("../src/command-registry.js");
@@ -14,6 +15,38 @@ const importExport = require("../src/import-export.js");
 const asyncBoundaryTests = [];
 const serviceWorkerSource = fs.readFileSync(path.join(__dirname, "../src/service-worker.js"), "utf8");
 
+const translationHandlerSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("async function handleTranslation"),
+  serviceWorkerSource.indexOf("async function mutateAndBroadcast"),
+);
+const contentMessageRouterSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("async function handleMessage"),
+  serviceWorkerSource.indexOf("function supportedCommandTab"),
+);
+assert.equal(
+  analysis.MESSAGE_TYPES.TRANSLATE_SELECTED_TEXT,
+  "chatgpt-helper:translate-selected-text",
+);
+assert.equal(
+  contentMessageRouterSource.indexOf("message.type === MESSAGES.OPEN_OPTIONS")
+    < contentMessageRouterSource.indexOf("message.type === MESSAGES.TRANSLATE_SELECTED_TEXT"),
+  true,
+);
+assert.equal(
+  contentMessageRouterSource.indexOf("message.type === MESSAGES.TRANSLATE_SELECTED_TEXT")
+    < contentMessageRouterSource.indexOf("LOCAL_MUTATION_MESSAGES.has(message.type)"),
+  true,
+);
+assert.equal(
+  contentMessageRouterSource.indexOf("message.type === MESSAGES.TRANSLATE_SELECTED_TEXT")
+    < contentMessageRouterSource.indexOf("if (workspaceRecoveryRequired)"),
+  true,
+);
+assert.doesNotMatch(
+  translationHandlerSource,
+  /ensureMigrated|getWorkspace|resolveConversationContext|handleWorkspaceMessage|broadcastWorkspaceChange|chrome\.storage\.local/,
+);
+
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
@@ -21,7 +54,7 @@ function clone(value) {
 assert.equal(workspace.DB_NAME, "chatgpt-helper-workspace");
 assert.equal(workspace.DB_VERSION, 1);
 assert.equal(workspace.WORKSPACE_SCHEMA_VERSION, 2);
-assert.equal(workspace.MAX_INLINE_SELECTION_LENGTH, 2000);
+assert.equal(workspace.MAX_INLINE_SELECTION_LENGTH, 5000);
 assert.equal(workspace.MAX_INLINE_SELECTION_LINES, 40);
 assert.equal(workspace.MAX_INLINE_CANDIDATES, 64);
 assert.equal(workspace.MAX_INLINE_CANDIDATE_LENGTH, 80);
@@ -63,7 +96,8 @@ assert.deepEqual(workspace.validateInlineSelectionText(" OpenAPI\r\nGraphRAG "),
   text: "OpenAPI\nGraphRAG",
   lineCount: 2,
 });
-assert.equal(workspace.validateInlineSelectionText("x".repeat(2001)).error, "GLOSSARY_SELECTION_TOO_LARGE");
+assert.equal(workspace.validateInlineSelectionText("x".repeat(5000)).ok, true);
+assert.equal(workspace.validateInlineSelectionText("x".repeat(5001)).error, "GLOSSARY_SELECTION_TOO_LARGE");
 assert.equal(
   workspace.validateInlineSelectionText(Array.from({ length: 41 }, () => "API").join("\n")).error,
   "GLOSSARY_SELECTION_TOO_MANY_LINES",
@@ -284,8 +318,14 @@ assert.equal(conversations.extractStableConversation("https://example.com/c/abc"
 assert.equal(conversations.extractStableConversation("not a URL"), null);
 assert.equal(conversations.contextChanged({ scopeKey: "stable:chatgpt.com:a" }, { scopeKey: "stable:chatgpt.com:b" }), true);
 
-assert.deepEqual(Object.keys(commands.COMMAND_BY_ID), ["analyze-selection", "save-selection", "normalize-composer"]);
+assert.deepEqual(Object.keys(commands.COMMAND_BY_ID), [
+  "analyze-selection",
+  "translate-selection",
+  "save-selection",
+  "normalize-composer",
+]);
 assert.equal(commands.COMMANDS.analyzeSelection.messageType, "RUN_ANALYSIS_COMMAND");
+assert.equal(commands.COMMANDS.translateSelection.messageType, "RUN_TRANSLATE_SELECTION_COMMAND");
 assert.equal(commands.COMMANDS.saveSelection.messageType, "RUN_SAVE_SELECTION_COMMAND");
 assert.equal(commands.COMMANDS.normalizeComposer.messageType, "RUN_NORMALIZE_COMPOSER_COMMAND");
 assert.equal(commands.selectionEligible({ supportedPage: true, isEditable: false, selectionText: "save me" }), true);

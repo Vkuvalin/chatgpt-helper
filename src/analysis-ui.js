@@ -15,6 +15,20 @@
   ].join(", ");
   const DRAG_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/></svg>';
   const TRASH_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14m-9-3h4l1 3H9l1-3Zm-3 3 1 13h8l1-13M10 10v6m4-6v6"/></svg>';
+  const INLINE_ACTION_ICONS = Object.freeze({
+    glossary: Object.freeze([
+      "M3.5 5.5c3-1.1 5.8-.5 8.5 1.4v11c-2.7-1.9-5.5-2.5-8.5-1.4v-11Z",
+      "M20.5 5.5c-3-1.1-5.8-.5-8.5 1.4v11c2.7-1.9 5.5-2.5 8.5-1.4v-11Z",
+    ]),
+    translate: Object.freeze([
+      "M4 7h11M11 4l4 3-4 3",
+      "M20 17H9m4-3-4 3 4 3",
+    ]),
+    analyze: Object.freeze([
+      "M5 6.5h8M5 10.5h6M5 14.5h4",
+      "M15.5 14.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm2.5 5.9 2 2",
+    ]),
+  });
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -178,6 +192,192 @@
     return Object.freeze({ left, top, width, maxHeight, placement });
   }
 
+  function inlineEndpointLeft(snapshotValue, surfaceWidthValue, viewportWidthValue) {
+    const snapshot = snapshotValue || {};
+    const anchorRect = snapshot.anchorRect || {};
+    const surfaceWidth = Math.max(0, Number(surfaceWidthValue) || 0);
+    const viewportWidth = Math.max(0, Number(viewportWidthValue) || 0);
+    const anchorSide = snapshot.anchorSide === "left" ? "left" : "right";
+    const endpoint = anchorSide === "left"
+      ? (Number(anchorRect.left) || 0)
+      : (Number(anchorRect.right) || 0);
+    const preferredLeft = anchorSide === "left" ? endpoint : endpoint - surfaceWidth;
+    return clampInlineCoordinate(
+      preferredLeft,
+      INLINE_VIEWPORT_MARGIN,
+      viewportWidth - INLINE_VIEWPORT_MARGIN - surfaceWidth,
+    );
+  }
+
+  function appendMarkdownText(parent, value) {
+    const text = String(value ?? "");
+    if (text) parent.appendChild(document.createTextNode(text));
+  }
+
+  function inlineEmphasisCanOpen(source, index, marker) {
+    if (marker === "`") return true;
+    const before = source[index - 1] || "";
+    const after = source[index + marker.length] || "";
+    if (!after || /\s/.test(after)) return false;
+    return !marker.includes("_") || !(/[A-Za-z0-9]/.test(before) && /[A-Za-z0-9]/.test(after));
+  }
+
+  function inlineEmphasisCanClose(source, index, marker) {
+    if (marker === "`") return true;
+    const before = source[index - 1] || "";
+    const after = source[index + marker.length] || "";
+    if (!before || /\s/.test(before)) return false;
+    return !marker.includes("_") || !(/[A-Za-z0-9]/.test(before) && /[A-Za-z0-9]/.test(after));
+  }
+
+  function findInlineClosing(source, marker, start) {
+    let closing = source.indexOf(marker, start);
+    while (closing >= 0 && !inlineEmphasisCanClose(source, closing, marker)) {
+      closing = source.indexOf(marker, closing + marker.length);
+    }
+    return closing;
+  }
+
+  function appendInlineMarkdown(parent, value, depth) {
+    const source = String(value ?? "");
+    const nesting = Number(depth) || 0;
+    if (nesting >= 3) {
+      appendMarkdownText(parent, source);
+      return;
+    }
+    let index = 0;
+    let plainStart = 0;
+    const flushPlain = (end) => {
+      if (end > plainStart) appendMarkdownText(parent, source.slice(plainStart, end));
+    };
+    while (index < source.length) {
+      let marker = null;
+      let tagName = null;
+      if (source[index] === "`") {
+        marker = "`";
+        tagName = "code";
+      } else if (source.startsWith("**", index) || source.startsWith("__", index)) {
+        marker = source.slice(index, index + 2);
+        tagName = "strong";
+      } else if (source[index] === "*" || source[index] === "_") {
+        marker = source[index];
+        tagName = "em";
+      }
+      if (!marker) {
+        index += 1;
+        continue;
+      }
+      if (!inlineEmphasisCanOpen(source, index, marker)) {
+        index += marker.length;
+        continue;
+      }
+      const closing = findInlineClosing(source, marker, index + marker.length);
+      if (closing <= index + marker.length) {
+        index += marker.length;
+        continue;
+      }
+      flushPlain(index);
+      const element = document.createElement(tagName);
+      const content = source.slice(index + marker.length, closing);
+      if (tagName === "code") element.textContent = content;
+      else appendInlineMarkdown(element, content, nesting + 1);
+      parent.appendChild(element);
+      index = closing + marker.length;
+      plainStart = index;
+    }
+    flushPlain(source.length);
+  }
+
+  function appendMarkdownLines(parent, lines) {
+    lines.forEach((line, index) => {
+      if (index) parent.appendChild(document.createElement("br"));
+      appendInlineMarkdown(parent, line, 0);
+    });
+  }
+
+  function renderTranslationMarkdown(container, value) {
+    const lines = String(value ?? "").replace(/\r\n?/g, "\n").split("\n");
+    let index = 0;
+    const startsBlock = (line) => (
+      /^\s*```/.test(line)
+      || /^(#{1,6})\s+/.test(line)
+      || /^\s*[-+*]\s+/.test(line)
+      || /^\s*\d+[.)]\s+/.test(line)
+      || /^\s*>\s?/.test(line)
+    );
+    while (index < lines.length) {
+      const line = lines[index];
+      if (!line.trim()) {
+        index += 1;
+        continue;
+      }
+      if (/^\s*```/.test(line)) {
+        index += 1;
+        const codeLines = [];
+        while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+          codeLines.push(lines[index]);
+          index += 1;
+        }
+        if (index < lines.length) index += 1;
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        code.textContent = codeLines.join("\n");
+        pre.appendChild(code);
+        container.appendChild(pre);
+        continue;
+      }
+      const headingMatch = /^(#{1,6})\s+(.+)$/.exec(line);
+      if (headingMatch) {
+        const heading = document.createElement(`h${headingMatch[1].length}`);
+        appendInlineMarkdown(heading, headingMatch[2], 0);
+        container.appendChild(heading);
+        index += 1;
+        continue;
+      }
+      const unorderedMatch = /^\s*[-+*]\s+(.+)$/.exec(line);
+      const orderedMatch = /^\s*\d+[.)]\s+(.+)$/.exec(line);
+      if (unorderedMatch || orderedMatch) {
+        const ordered = Boolean(orderedMatch);
+        const list = document.createElement(ordered ? "ol" : "ul");
+        while (index < lines.length) {
+          const match = ordered
+            ? /^\s*\d+[.)]\s+(.+)$/.exec(lines[index])
+            : /^\s*[-+*]\s+(.+)$/.exec(lines[index]);
+          if (!match) break;
+          const item = document.createElement("li");
+          appendInlineMarkdown(item, match[1], 0);
+          list.appendChild(item);
+          index += 1;
+        }
+        container.appendChild(list);
+        continue;
+      }
+      if (/^\s*>\s?/.test(line)) {
+        const quoteLines = [];
+        while (index < lines.length) {
+          const match = /^\s*>\s?(.*)$/.exec(lines[index]);
+          if (!match) break;
+          quoteLines.push(match[1]);
+          index += 1;
+        }
+        const quote = document.createElement("blockquote");
+        appendMarkdownLines(quote, quoteLines);
+        container.appendChild(quote);
+        continue;
+      }
+      const paragraphLines = [line];
+      index += 1;
+      while (index < lines.length && lines[index].trim() && !startsBlock(lines[index])) {
+        paragraphLines.push(lines[index]);
+        index += 1;
+      }
+      const paragraph = document.createElement("p");
+      appendMarkdownLines(paragraph, paragraphLines);
+      container.appendChild(paragraph);
+    }
+    return container;
+  }
+
   function nextFocusableIndex(currentIndex, count, backwards) {
     if (!Number.isInteger(count) || count <= 0) return -1;
     if (!Number.isInteger(currentIndex) || currentIndex < 0 || currentIndex >= count) {
@@ -302,10 +502,12 @@
       ".glossary-preview.size-large { font-size: 15px; }",
       ".inline-glossary-root { position: fixed; inset: 0; z-index: 10; color: var(--text); pointer-events: none; }",
       ".inline-glossary-live { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }",
-      ".inline-glossary-trigger { position: fixed; display: inline-grid; width: 36px; height: 36px; min-height: 36px; padding: 0; place-items: center; border: 1px solid var(--border); border-radius: 50%; background: var(--surface); color: var(--text); box-shadow: var(--shadow); cursor: pointer; font: inherit; line-height: 0; pointer-events: auto; }",
-      ".inline-glossary-trigger:hover { border-color: var(--accent); background: var(--surface-hover); }",
-      ".inline-glossary-trigger:focus-visible, .inline-glossary-close:focus-visible, .inline-glossary-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }",
-      ".inline-glossary-trigger svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }",
+      ".inline-selection-actions { position: fixed; display: flex; align-items: center; gap: 6px; pointer-events: auto; }",
+      ".inline-selection-action { display: inline-grid; width: 36px; height: 36px; min-height: 36px; padding: 0; place-items: center; border: 1px solid var(--border); border-radius: 50%; background: var(--surface); color: var(--text); box-shadow: var(--shadow); cursor: pointer; font: inherit; line-height: 0; }",
+      ".inline-selection-action:hover:not(:disabled) { border-color: var(--accent); background: var(--surface-hover); }",
+      ".inline-selection-action:disabled { cursor: not-allowed; opacity: .5; }",
+      ".inline-selection-action:focus-visible, .inline-glossary-close:focus-visible, .inline-glossary-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }",
+      ".inline-selection-action svg { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }",
       ".inline-glossary-popover { position: fixed; display: grid; width: min(360px, calc(100vw - 16px)); max-height: min(420px, 60vh); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); color: var(--text); box-shadow: var(--shadow); pointer-events: auto; }",
       ".inline-glossary-header { display: flex; padding: 9px 10px; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); }",
       ".inline-glossary-title { min-width: 0; overflow-wrap: anywhere; }",
@@ -367,6 +569,23 @@
       ".analysis-duplicate-tooltip { position: absolute; top: 39px; right: 7px; z-index: 2; width: min(260px, calc(100vw - 64px)); padding: 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); font-size: 12px; }",
       ".analysis-warning { margin: 0 0 10px; color: var(--danger); font-size: 12px; }",
       ".analysis-dialog-message { margin: 0; color: var(--text); }",
+      ".translation-dialog .analysis-dialog-header { padding-bottom: 10px; border-bottom: 1px solid var(--border); }",
+      ".translation-dialog .analysis-dialog-title { color: var(--accent); }",
+      ".translation-result { display: grid; margin: 0; gap: 10px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }",
+      ".translation-result > :first-child { margin-top: 0; }",
+      ".translation-result > :last-child { margin-bottom: 0; }",
+      ".translation-result h1, .translation-result h2, .translation-result h3, .translation-result h4, .translation-result h5, .translation-result h6, .translation-result p, .translation-result blockquote, .translation-result pre, .translation-result ul, .translation-result ol { margin-block: 0; }",
+      ".translation-result blockquote { padding-left: 12px; border-left: 3px solid var(--border); color: var(--muted); }",
+      ".translation-result pre { overflow-x: auto; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }",
+      ".translation-result code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }",
+      ".translation-result :not(pre) > code { padding: 1px 4px; border-radius: 4px; background: var(--surface); }",
+      ".translation-actions { display: flex; margin-top: 14px; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }",
+      ".translation-copy-button { display: inline-grid; width: 30px; height: 30px; padding: 0; place-items: center; border: 1px solid var(--border); border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; line-height: 0; }",
+      ".translation-copy-button:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }",
+      ".translation-copy-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }",
+      ".translation-copy-button:disabled { cursor: wait; opacity: .55; }",
+      ".translation-copy-button svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }",
+      ".translation-copy-status { color: var(--muted); font-size: 12px; }",
       "@media (prefers-reduced-motion: reduce) { .analysis-loading::before { animation: none; } }",
     ].join("\n");
   }
@@ -466,7 +685,10 @@
     let dialogCleanup = null;
     let dialogResizing = false;
     let inlineRoot = null;
+    let inlineOffer = null;
     let inlineTrigger = null;
+    let inlineTranslate = null;
+    let inlineAnalyze = null;
     let inlinePopover = null;
     let inlineBody = null;
     let inlineTitle = null;
@@ -489,50 +711,90 @@
       }
     }
 
-    function ensureInlineRoot(snapshot, handlers) {
+    function inlineActionButton(className, label, iconPaths, action) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `inline-selection-action ${className}`;
+      button.setAttribute("aria-label", label);
+      button.setAttribute("title", label);
+      const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      icon.setAttribute("viewBox", "0 0 24 24");
+      icon.setAttribute("fill", "none");
+      icon.setAttribute("stroke", "currentColor");
+      icon.setAttribute("aria-hidden", "true");
+      icon.setAttribute("focusable", "false");
+      iconPaths.forEach((pathData) => {
+        const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute("d", pathData);
+        icon.appendChild(path);
+      });
+      button.appendChild(icon);
+      button.addEventListener("pointerdown", (event) => {
+        if (event.button === 0) event.preventDefault();
+      });
+      button.addEventListener("click", action);
+      return button;
+    }
+
+    function updateInlineOfferAvailability(value) {
+      const glossaryEnabled = value?.glossaryEnabled !== false;
+      if (!inlineTrigger) return;
+      inlineTrigger.disabled = !glossaryEnabled;
+      inlineTrigger.setAttribute(
+        "title",
+        glossaryEnabled ? "Словарь" : "Словарь временно недоступен",
+      );
+    }
+
+    function ensureInlineRoot(snapshot, handlers, offerOptions) {
       inlineSnapshot = snapshot;
       inlineHandlers = handlers || {};
-      if (inlineRoot?.isConnected) return inlineRoot;
+      if (inlineRoot?.isConnected) {
+        updateInlineOfferAvailability(offerOptions);
+        return inlineRoot;
+      }
       inlineRoot = document.createElement("div");
       inlineRoot.className = "inline-glossary-root";
       inlineRoot.setAttribute("data-inline-glossary-root", "");
-      inlineTrigger = document.createElement("button");
-      inlineTrigger.type = "button";
-      inlineTrigger.className = "inline-glossary-trigger";
-      inlineTrigger.setAttribute("aria-label", "Открыть словарь по выделению");
-      inlineTrigger.setAttribute("title", "Словарь");
+      inlineOffer = document.createElement("div");
+      inlineOffer.className = "inline-selection-actions";
+      inlineOffer.setAttribute("role", "group");
+      inlineOffer.setAttribute("aria-label", "Действия с выделенным текстом");
+      inlineTrigger = inlineActionButton(
+        "inline-glossary-trigger",
+        "Словарь",
+        INLINE_ACTION_ICONS.glossary,
+        () => {
+          if (inlinePhase === "offering" && !inlineTrigger.disabled) inlineHandlers.onActivate?.();
+        },
+      );
       inlineTrigger.setAttribute("aria-expanded", "false");
       inlineTrigger.setAttribute("aria-controls", INLINE_POPOVER_ID);
-      const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-      icon.setAttribute("viewBox", "0 0 24 24");
-      icon.setAttribute("width", "18");
-      icon.setAttribute("height", "18");
-      icon.setAttribute("fill", "none");
-      icon.setAttribute("stroke", "currentColor");
-      icon.setAttribute("stroke-width", "1.8");
-      icon.setAttribute("stroke-linecap", "round");
-      icon.setAttribute("stroke-linejoin", "round");
-      icon.setAttribute("aria-hidden", "true");
-      icon.setAttribute("focusable", "false");
-      const leftPage = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      leftPage.setAttribute("d", "M3.5 5.5c3-1.1 5.8-.5 8.5 1.4v11c-2.7-1.9-5.5-2.5-8.5-1.4v-11Z");
-      const rightPage = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      rightPage.setAttribute("d", "M20.5 5.5c-3-1.1-5.8-.5-8.5 1.4v11c2.7-1.9 5.5-2.5 8.5-1.4v-11Z");
-      icon.append(leftPage, rightPage);
-      inlineTrigger.appendChild(icon);
-      inlineTrigger.addEventListener("pointerdown", (event) => {
-        if (event.button === 0) event.preventDefault();
-      });
-      inlineTrigger.addEventListener("click", () => {
-        if (inlinePhase === "offering") inlineHandlers.onActivate?.();
-      });
+      inlineTranslate = inlineActionButton(
+        "inline-translate-trigger",
+        "Перевести текст",
+        INLINE_ACTION_ICONS.translate,
+        () => {
+          if (inlinePhase === "offering") inlineHandlers.onTranslate?.();
+        },
+      );
+      inlineAnalyze = inlineActionButton(
+        "inline-analyze-trigger",
+        "Анализировать текст",
+        INLINE_ACTION_ICONS.analyze,
+        () => {
+          if (inlinePhase === "offering") inlineHandlers.onAnalyzeSelection?.();
+        },
+      );
+      inlineOffer.append(inlineTrigger, inlineTranslate, inlineAnalyze);
       inlineLive = document.createElement("span");
       inlineLive.className = "inline-glossary-live";
       inlineLive.setAttribute("role", "status");
       inlineLive.setAttribute("aria-live", "polite");
       inlineLive.setAttribute("aria-atomic", "true");
-      inlineRoot.append(inlineTrigger, inlineLive);
+      inlineRoot.append(inlineOffer, inlineLive);
       shell()?.appendChild(inlineRoot);
+      updateInlineOfferAvailability(offerOptions);
       return inlineRoot;
     }
 
@@ -562,40 +824,35 @@
     }
 
     function positionInline() {
-      if (!inlineSnapshot?.anchorNode?.isConnected || !inlineSnapshot.anchorRect || !inlineTrigger) return false;
+      if (!inlineSnapshot?.anchorNode?.isConnected || !inlineSnapshot.anchorRect || !inlineOffer) return false;
       const viewport = { width: window.innerWidth, height: window.innerHeight };
-      const triggerRect = inlineTrigger.getBoundingClientRect?.() || { width: 36, height: 36 };
-      const triggerVerticalPosition = inlinePopoverPosition(
-        inlineSnapshot.anchorRect,
-        { height: triggerRect.height || 36 },
-        viewport,
-      );
-      const triggerPosition = {
-        ...triggerVerticalPosition,
-        left: clampInlineCoordinate(
-          Number(inlineSnapshot.anchorRect.left) || 0,
-          INLINE_VIEWPORT_MARGIN,
-          viewport.width - INLINE_VIEWPORT_MARGIN - (triggerRect.width || 0),
-        ),
-      };
-      inlineTrigger.style.left = `${triggerPosition.left}px`;
-      inlineTrigger.style.top = `${triggerPosition.top}px`;
+      if (!inlineOffer.hidden) {
+        const triggerRect = inlineOffer.getBoundingClientRect?.() || { width: 120, height: 36 };
+        const triggerPosition = inlinePopoverPosition(
+          inlineSnapshot.anchorRect,
+          { height: triggerRect.height || 36 },
+          viewport,
+        );
+        const triggerWidth = triggerRect.width || 120;
+        inlineOffer.style.left = `${inlineEndpointLeft(inlineSnapshot, triggerWidth, viewport.width)}px`;
+        inlineOffer.style.top = `${triggerPosition.top}px`;
+      }
       if (inlinePopover && !inlinePopover.hidden) {
         const popoverRect = inlinePopover.getBoundingClientRect?.() || { height: 0 };
-        const triggerAnchor = {
-          top: triggerPosition.top,
-          bottom: triggerPosition.top + (triggerRect.height || 36),
-          left: triggerPosition.left,
-        };
+        const popoverWidth = inlinePopover.className.includes("is-many") ? 420 : 360;
         const popoverPosition = inlinePopoverPosition(
-          triggerAnchor,
+          inlineSnapshot.anchorRect,
           {
             height: popoverRect.height,
-            width: inlinePopover.className.includes("is-many") ? 420 : 360,
+            width: popoverWidth,
           },
           viewport,
         );
-        inlinePopover.style.left = `${popoverPosition.left}px`;
+        inlinePopover.style.left = `${inlineEndpointLeft(
+          inlineSnapshot,
+          popoverPosition.width,
+          viewport.width,
+        )}px`;
         inlinePopover.style.top = `${popoverPosition.top}px`;
         inlinePopover.style.width = `${popoverPosition.width}px`;
         inlinePopover.style.maxHeight = `${popoverPosition.maxHeight}px`;
@@ -608,7 +865,10 @@
       const consumed = inlinePhase !== "closed" || Boolean(inlineRoot);
       inlineRoot?.remove();
       inlineRoot = null;
+      inlineOffer = null;
       inlineTrigger = null;
+      inlineTranslate = null;
+      inlineAnalyze = null;
       inlinePopover = null;
       inlineBody = null;
       inlineTitle = null;
@@ -620,10 +880,11 @@
       return consumed;
     }
 
-    function showInlineOffer(snapshot, handlers) {
-      ensureInlineRoot(snapshot, handlers);
+    function showInlineOffer(snapshot, handlers, offerOptions) {
+      ensureInlineRoot(snapshot, handlers, offerOptions);
       inlinePhase = "offering";
       inlineRoot.dataset.phase = inlinePhase;
+      inlineOffer.hidden = false;
       inlineTrigger.setAttribute("aria-expanded", "false");
       if (inlinePopover) inlinePopover.hidden = true;
       return positionInline();
@@ -634,6 +895,7 @@
       ensureInlinePopover();
       inlinePhase = phase;
       inlineRoot.dataset.phase = phase;
+      inlineOffer.hidden = true;
       inlineTrigger.setAttribute("aria-expanded", "true");
       inlinePopover.className = "inline-glossary-popover";
       inlinePopover.hidden = false;
@@ -834,7 +1096,7 @@
 
     function inlineContainsPath(pathValue) {
       const path = Array.isArray(pathValue) ? pathValue : [];
-      return [inlineTrigger, inlinePopover].some((surface) => (
+      return [inlineOffer, inlinePopover].some((surface) => (
         surface
         && path.some((value) => inlineSurfaceContains(surface, value))
       ));
@@ -843,7 +1105,7 @@
     function inlineOwnsFocus() {
       const rootNode = shell()?.getRootNode?.();
       const activeElement = rootNode?.activeElement || document.activeElement || null;
-      return Boolean(activeElement && [inlineTrigger, inlinePopover].some(
+      return Boolean(activeElement && [inlineOffer, inlinePopover].some(
         (surface) => surface?.contains?.(activeElement),
       ));
     }
@@ -911,6 +1173,18 @@
       loading.className = "analysis-transient analysis-loading";
       loading.setAttribute("role", "status");
       loading.textContent = "Анализируем выделенный текст…";
+      shell()?.appendChild(loading);
+    }
+
+    function showTranslationLoading() {
+      closeInline();
+      closeDialog();
+      removeToast();
+      hideLoading();
+      loading = document.createElement("div");
+      loading.className = "analysis-transient analysis-loading";
+      loading.setAttribute("role", "status");
+      loading.textContent = "Переводим выделенный текст…";
       shell()?.appendChild(loading);
     }
 
@@ -1017,7 +1291,7 @@
       };
     }
 
-    function dialogFrame(title) {
+    function dialogFrame(title, variant) {
       closeInline();
       const focusOrigin = backdrop ? previouslyFocused : currentFocusedElement();
       closeDialog(false);
@@ -1026,7 +1300,7 @@
       backdrop = document.createElement("div");
       backdrop.className = "analysis-backdrop";
       const dialog = document.createElement("section");
-      dialog.className = "analysis-dialog";
+      dialog.className = `analysis-dialog${variant ? ` ${variant}-dialog` : ""}`;
       const analysisSettings = contract.normalizeAnalysisSettings(options.getSettings()).analysis;
       if (analysisSettings.termColorMode === "custom") {
         dialog.style.setProperty("--term-color", analysisSettings.customTermColor);
@@ -1239,12 +1513,100 @@
       }
     }
 
+    async function copyTextWithFallback(text) {
+      try {
+        if (typeof root.navigator?.clipboard?.writeText === "function") {
+          await root.navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (_) {}
+
+      if (typeof document.execCommand !== "function") return false;
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.setAttribute("aria-hidden", "true");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-10000px";
+      textarea.style.top = "0";
+      shell()?.appendChild(textarea);
+      try {
+        textarea.focus?.();
+        textarea.select?.();
+        textarea.setSelectionRange?.(0, textarea.value.length);
+        return document.execCommand("copy") === true;
+      } catch (_) {
+        return false;
+      } finally {
+        textarea.remove();
+      }
+    }
+
+    function showTranslationResult(translatedText) {
+      const sourceText = String(translatedText ?? "");
+      const body = dialogFrame("Перевод", "translation");
+      const result = document.createElement("div");
+      result.className = "translation-result";
+      renderTranslationMarkdown(result, sourceText);
+      const actions = document.createElement("div");
+      actions.className = "translation-actions";
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "translation-copy-button";
+      copy.setAttribute("title", "Скопировать");
+      copy.setAttribute("aria-label", "Скопировать перевод");
+      const copyIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      copyIcon.setAttribute("viewBox", "0 0 24 24");
+      copyIcon.setAttribute("fill", "none");
+      copyIcon.setAttribute("stroke", "currentColor");
+      copyIcon.setAttribute("aria-hidden", "true");
+      copyIcon.setAttribute("focusable", "false");
+      const copyFront = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      copyFront.setAttribute("d", "M8 8h11v11H8z");
+      const copyBack = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      copyBack.setAttribute("d", "M16 6V4H4v12h2");
+      copyIcon.append(copyFront, copyBack);
+      copy.appendChild(copyIcon);
+      const status = document.createElement("span");
+      status.className = "translation-copy-status";
+      status.setAttribute("role", "status");
+      status.setAttribute("aria-live", "polite");
+      copy.addEventListener("click", async () => {
+        copy.disabled = true;
+        const copied = await copyTextWithFallback(sourceText);
+        status.textContent = copied ? "Скопировано." : "Не удалось скопировать.";
+        copy.disabled = false;
+        focusWithoutScroll(copy);
+      });
+      actions.append(copy, status);
+      body.append(result, actions);
+    }
+
+    function showTranslationError(error) {
+      const body = dialogFrame("Не удалось выполнить перевод");
+      const message = document.createElement("p");
+      message.className = "analysis-dialog-message";
+      message.textContent = error?.message || contract.ERROR_MESSAGES.PROVIDER_ERROR;
+      body.appendChild(message);
+      if (["API_KEY_MISSING", "API_KEY_INVALID"].includes(error?.code)) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "button primary";
+        button.textContent = "Открыть настройки";
+        button.addEventListener("click", () => { void options.onOpenOptions(); });
+        body.appendChild(button);
+      }
+    }
+
     return Object.freeze({
       showLoading,
+      showTranslationLoading,
       hideLoading,
       showHint,
       showResult,
       showError,
+      showTranslationResult,
+      showTranslationError,
       closeDialog,
       handleEscape,
       showInlineOffer,

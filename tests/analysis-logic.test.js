@@ -101,18 +101,30 @@ function inlineSelectionFragmentElement(tagName, children, attributes) {
 function inlineSelectionFixture(options) {
   const value = options || {};
   const anchor = value.anchor || inlineSelectionElement();
+  const startContainer = value.startContainer || anchor;
+  const endContainer = value.endContainer || anchor;
+  const startOffset = Number.isInteger(value.startOffset) ? value.startOffset : 0;
+  const endOffset = Number.isInteger(value.endOffset) ? value.endOffset : String(value.text || "").length;
   const range = {
     commonAncestorContainer: anchor,
-    startContainer: value.startContainer || anchor,
-    endContainer: value.endContainer || anchor,
+    startContainer,
+    startOffset,
+    endContainer,
+    endOffset,
     collapsed: value.collapsed === true,
     getClientRects() { return value.rects || []; },
     cloneContents() { return value.fragment || null; },
     toString() { return String(value.text || ""); },
   };
+  const backward = value.direction === "backward";
+  const endpointsKnown = value.direction !== "unknown";
   const selection = {
     rangeCount: value.rangeCount === undefined ? 1 : value.rangeCount,
     isCollapsed: value.collapsed === true,
+    anchorNode: endpointsKnown ? (backward ? endContainer : startContainer) : null,
+    anchorOffset: endpointsKnown ? (backward ? endOffset : startOffset) : -1,
+    focusNode: endpointsKnown ? (backward ? startContainer : endContainer) : null,
+    focusOffset: endpointsKnown ? (backward ? startOffset : endOffset) : -1,
     getRangeAt() { return range; },
     toString() { return String(value.text || ""); },
   };
@@ -758,8 +770,11 @@ function createInlineUiHarness() {
     }
 
     getBoundingClientRect() {
-      if (this.className === "inline-glossary-trigger") {
-        return { top: 0, right: 36, bottom: 36, left: 0, width: 36, height: 36 };
+      if (this.className === "inline-selection-actions") {
+        if (this.hidden) {
+          return { top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0 };
+        }
+        return { top: 0, right: 120, bottom: 36, left: 0, width: 120, height: 36 };
       }
       if (this.className.startsWith("inline-glossary-popover")) {
         const width = this.className.includes("is-many") ? 420 : 360;
@@ -810,6 +825,7 @@ function createInlineContentHarness(harnessOptions) {
   const uiCalls = [];
   const lookupCalls = [];
   const analysisCalls = [];
+  const translationCalls = [];
   const timers = new Map();
   const frames = new Map();
   let timerId = 0;
@@ -831,6 +847,7 @@ function createInlineContentHarness(harnessOptions) {
   });
   const state = {
     analysisBusy: false,
+    translationBusy: false,
     workspaceStatus: { status: "ready" },
     workspaceContext: { scopeKey: "stable:chatgpt.com:inline-content" },
     inlineGesture: {
@@ -855,8 +872,8 @@ function createInlineContentHarness(harnessOptions) {
     },
     host: { id: "extension-root" },
     analysisUi: {
-      showInlineOffer(snapshot, handlers) {
-        uiCalls.push({ phase: "offering", snapshot, handlers });
+      showInlineOffer(snapshot, handlers, offerOptions) {
+        uiCalls.push({ phase: "offering", snapshot, handlers, offerOptions });
         return snapshot.anchorNode?.isConnected === true;
       },
       showInlineLoading(snapshot, handlers) {
@@ -891,7 +908,7 @@ function createInlineContentHarness(harnessOptions) {
     },
   };
   const inlineSource = contentScriptSource.slice(
-    contentScriptSource.indexOf("function inlineSelectionSignature"),
+    contentScriptSource.indexOf("function aiOperationBusy"),
     contentScriptSource.indexOf("async function deleteWorkspaceEntry"),
   );
   const context = vm.createContext({
@@ -900,6 +917,7 @@ function createInlineContentHarness(harnessOptions) {
     __workspaceContract: workspaceContract,
     __capture() { return captureValue; },
     __analysisCalls: analysisCalls,
+    __translationCalls: translationCalls,
     __timers: timers,
     __frames: frames,
     __nextTimerId() { timerId += 1; return timerId; },
@@ -952,12 +970,21 @@ function createInlineContentHarness(harnessOptions) {
         });
         return { ok: true, requestId: "analysis-inline-content" };
       };
+      const runTranslation = async (...args) => {
+        globalThis.__translationCalls.push({
+          args,
+          phaseAtStart: state.inlineGlossary.phase,
+        });
+        return { ok: true, requestId: "translation-inline-content" };
+      };
       ${inlineSource}
       globalThis.__inlineContentApi = Object.freeze({
         closeInlineGlossary,
         inlineSnapshotCurrent,
         showInlineOffer,
         activateInlineGlossary,
+        translateInlineSelection,
+        analyzeInlineSelection,
         retryInlineGlossary,
         analyzeInlineGlossaryCandidate,
         captureInlineGlossarySelection,
@@ -987,6 +1014,7 @@ function createInlineContentHarness(harnessOptions) {
     uiCalls,
     lookupCalls,
     analysisCalls,
+    translationCalls,
     timers,
     frames,
     setCapture(value) {
@@ -1081,6 +1109,7 @@ assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "disp
 assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "canonicalTerm"), false);
 assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "normalizedKey"), false);
 assert.equal(capturedInlineSelection.anchorNode, successfulInlineSelection.anchor);
+assert.equal(capturedInlineSelection.anchorSide, "right");
 assert.deepEqual(
   { ...capturedInlineSelection.anchorRect },
   { top: 120, right: 210, bottom: 142, left: 140, width: 70, height: 22 },
@@ -1090,6 +1119,41 @@ assert.equal(Object.isFrozen(capturedInlineSelection), true);
 assert.equal(Object.isFrozen(capturedInlineSelection.anchorRect), true);
 assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "range"), false);
 assert.equal(Object.prototype.hasOwnProperty.call(capturedInlineSelection, "selection"), false);
+
+const backwardInlineSelection = inlineSelectionFixture({
+  text: "Backward State",
+  rects: visibleInlineRects,
+  direction: "backward",
+});
+const capturedBackwardInlineSelection = captureInlineGlossarySelection({
+  pageUrl: "https://chatgpt.com/c/inline-test",
+  selection: backwardInlineSelection.selection,
+  viewportWidth: 800,
+  viewportHeight: 600,
+});
+assert.equal(capturedBackwardInlineSelection.ok, true);
+assert.equal(capturedBackwardInlineSelection.anchorSide, "left");
+assert.deepEqual(
+  { ...capturedBackwardInlineSelection.anchorRect },
+  { top: 90, right: 160, bottom: 110, left: 100, width: 60, height: 20 },
+);
+
+const unknownDirectionSelection = inlineSelectionFixture({
+  text: "Fallback State",
+  rects: visibleInlineRects,
+  direction: "unknown",
+});
+const capturedUnknownDirectionSelection = captureInlineGlossarySelection({
+  pageUrl: "https://chatgpt.com/c/inline-test",
+  selection: unknownDirectionSelection.selection,
+  viewportWidth: 800,
+  viewportHeight: 600,
+});
+assert.equal(capturedUnknownDirectionSelection.anchorSide, "right");
+assert.deepEqual(
+  { ...capturedUnknownDirectionSelection.anchorRect },
+  { top: 120, right: 210, bottom: 142, left: 140, width: 70, height: 22 },
+);
 
 const singleStructuredListFragment = {
   nodeType: 11,
@@ -1219,9 +1283,9 @@ function inlineCaptureReason(options) {
 assert.equal(inlineCaptureReason({ collapsed: true }), "empty");
 assert.equal(inlineCaptureReason({ rangeCount: 2 }), "multiple-ranges");
 assert.equal(inlineCaptureReason({ text: "line one\nline two" }), undefined);
-assert.equal(inlineCaptureReason({ text: "a".repeat(2000) }), undefined);
+assert.equal(inlineCaptureReason({ text: "a".repeat(5000) }), undefined);
 assert.equal(
-  inlineCaptureReason({ text: "a".repeat(2001) }),
+  inlineCaptureReason({ text: "a".repeat(5001) }),
   "GLOSSARY_SELECTION_TOO_LARGE",
 );
 assert.equal(
@@ -1315,6 +1379,7 @@ try {
   const inlineAnchor = { isConnected: true };
   const inlineSnapshot = Object.freeze({
     text: "<State> and OpenAPI",
+    anchorSide: "right",
     anchorNode: inlineAnchor,
     anchorRect: Object.freeze({
       top: 20,
@@ -1329,10 +1394,14 @@ try {
   let analyzeCount = 0;
   let analyzedCandidate = null;
   let activateCount = 0;
+  let translateCount = 0;
+  let analyzeSelectionCount = 0;
   let closeCount = 0;
   let inlineUi;
   const handlers = {
     onActivate() { activateCount += 1; },
+    onTranslate() { translateCount += 1; },
+    onAnalyzeSelection() { analyzeSelectionCount += 1; },
     onRetry() { retryCount += 1; },
     onAnalyze(candidate) { analyzeCount += 1; analyzedCandidate = candidate; },
     onClose() {
@@ -1343,11 +1412,19 @@ try {
   inlineUi = inlineUiHarness.ui;
   assert.equal(inlineUi.showInlineOffer(inlineSnapshot, handlers), true);
   const inlineRoot = inlineUiHarness.shell.children[0];
-  const inlineTrigger = inlineRoot.children[0];
+  const inlineOffer = inlineRoot.children[0];
+  const [inlineTrigger, inlineTranslate, inlineAnalyze] = inlineOffer.children;
+  assert.equal(inlineOffer.getAttribute("role"), "group");
+  assert.equal(inlineOffer.getAttribute("aria-label"), "Действия с выделенным текстом");
+  assert.equal(inlineOffer.children.length, 3);
   assert.equal(inlineTrigger.tagName, "BUTTON");
   assert.equal(inlineTrigger.type, "button");
-  assert.equal(inlineTrigger.getAttribute("aria-label"), "Открыть словарь по выделению");
+  assert.equal(inlineTrigger.getAttribute("aria-label"), "Словарь");
   assert.equal(inlineTrigger.getAttribute("title"), "Словарь");
+  assert.equal(inlineTranslate.getAttribute("aria-label"), "Перевести текст");
+  assert.equal(inlineTranslate.getAttribute("title"), "Перевести текст");
+  assert.equal(inlineAnalyze.getAttribute("aria-label"), "Анализировать текст");
+  assert.equal(inlineAnalyze.getAttribute("title"), "Анализировать текст");
   assert.equal(inlineTrigger.getAttribute("aria-expanded"), "false");
   assert.equal(
     inlineTrigger.getAttribute("aria-controls"),
@@ -1358,26 +1435,69 @@ try {
   const inlineTriggerIcon = inlineTrigger.children[0];
   assert.equal(inlineTriggerIcon.tagName, "SVG");
   assert.equal(inlineTriggerIcon.getAttribute("viewBox"), "0 0 24 24");
-  assert.equal(inlineTriggerIcon.getAttribute("width"), "18");
-  assert.equal(inlineTriggerIcon.getAttribute("height"), "18");
+  assert.equal(inlineTriggerIcon.getAttribute("fill"), "none");
+  assert.equal(inlineTriggerIcon.getAttribute("stroke"), "currentColor");
   assert.equal(inlineTriggerIcon.getAttribute("aria-hidden"), "true");
   assert.equal(inlineTriggerIcon.children.length, 2);
   assert.equal(inlineTriggerIcon.children.every((element) => element.tagName === "PATH"), true);
-  assert.equal(inlineTrigger.style.left, "356px");
+  assert.equal(inlineOffer.style.left, "272px");
+  const backwardUiSnapshot = Object.freeze({
+    ...inlineSnapshot,
+    anchorSide: "left",
+    anchorRect: Object.freeze({
+      top: 50,
+      right: 150,
+      bottom: 70,
+      left: 80,
+      width: 70,
+      height: 20,
+    }),
+  });
+  assert.equal(inlineUi.showInlineOffer(backwardUiSnapshot, handlers, { glossaryEnabled: true }), true);
+  assert.equal(inlineOffer.style.left, "80px");
+  const forwardUiSnapshot = Object.freeze({
+    ...inlineSnapshot,
+    anchorSide: "right",
+    anchorRect: Object.freeze({
+      top: 50,
+      right: 250,
+      bottom: 70,
+      left: 180,
+      width: 70,
+      height: 20,
+    }),
+  });
+  assert.equal(inlineUi.showInlineOffer(forwardUiSnapshot, handlers, { glossaryEnabled: true }), true);
+  assert.equal(inlineOffer.style.left, "130px");
+  assert.equal(inlineUi.showInlineOffer(inlineSnapshot, handlers, { glossaryEnabled: true }), true);
+  assert.equal(inlineOffer.style.left, "272px");
   assert.equal(inlineUi.inlineContainsPath([inlineTrigger]), true);
   assert.equal(inlineUi.inlineContainsPath([inlineRoot]), false);
   assert.equal(inlineUiHarness.rootNode.activeElement, null);
   inlineTrigger.click();
   assert.equal(activateCount, 1);
+  inlineTranslate.click();
+  inlineAnalyze.click();
+  assert.equal(translateCount, 1);
+  assert.equal(analyzeSelectionCount, 1);
+  assert.equal(inlineUi.showInlineOffer(inlineSnapshot, handlers, { glossaryEnabled: false }), true);
+  assert.equal(inlineTrigger.disabled, true);
+  assert.equal(inlineTrigger.getAttribute("title"), "Словарь временно недоступен");
+  assert.notEqual(inlineTranslate.disabled, true);
+  assert.notEqual(inlineAnalyze.disabled, true);
+  assert.equal(inlineUi.showInlineOffer(inlineSnapshot, handlers, { glossaryEnabled: true }), true);
+  assert.equal(inlineTrigger.disabled, false);
 
   assert.equal(inlineUi.showInlineLoading(inlineSnapshot, handlers), true);
   const inlineLive = inlineRoot.children[1];
   const inlinePopover = inlineRoot.children[2];
+  assert.equal(inlineOffer.hidden, true);
   assert.equal(inlinePopover.getAttribute("role"), "region");
   assert.equal(inlinePopover.getAttribute("aria-modal"), null);
   assert.equal(inlineTrigger.getAttribute("aria-expanded"), "true");
   assert.equal(inlinePopover.hidden, false);
   assert.equal(inlinePopover.style.left, "32px");
+  assert.equal(inlinePopover.style.top, "46px");
   assert.equal(inlineUi.inlineContainsPath([inlinePopover]), true);
   assert.equal(inlineUi.inlineContainsPath([inlinePopover.children[0]]), true);
   const externalBrowserPath = [
@@ -1437,6 +1557,13 @@ try {
   assert.equal(activateCount, 1);
   assert.equal(inlinePopover.hidden, false);
 
+  assert.equal(inlineUi.showInlineOffer(inlineSnapshot, handlers, { glossaryEnabled: true }), true);
+  assert.equal(inlineOffer.hidden, false);
+  assert.equal(inlineOffer.children.length, 3);
+  assert.equal(inlinePopover.hidden, true);
+  assert.equal(inlineUi.showInlineLoading(inlineSnapshot, handlers), true);
+  assert.equal(inlineOffer.hidden, true);
+
   const stateCandidate = {
     displayTerm: "State",
     normalizedKey: "state",
@@ -1470,6 +1597,7 @@ try {
     },
     truncated: { candidates: false, entries: false },
   }, handlers), true);
+  assert.equal(inlineOffer.hidden, true);
   assert.match(inlinePopover.textContent, /Одно значение\./);
   assert.match(inlinePopover.textContent, /Точное совпадение/);
   assert.match(inlinePopover.textContent, /Точное значение/);
@@ -1614,6 +1742,7 @@ try {
   assert.equal(inlinePopover.style.width, "384px");
   assert.match(inlineLive.textContent, /0 совпадений, 7 без совпадений/);
   assert.equal(inlineUi.showInlineLoading(inlineSnapshot, handlers), true);
+  assert.equal(inlineOffer.hidden, true);
   assert.equal(inlinePopover.className, "inline-glossary-popover");
   assert.equal(inlinePopover.style.width, "360px");
   assert.match(inlineLive.textContent, /Ищем в словаре/);
@@ -1623,6 +1752,7 @@ try {
     { message: "<unsafe workspace error>" },
     handlers,
   ), true);
+  assert.equal(inlineOffer.hidden, true);
   const errorElements = inlineDescendants(inlineRoot);
   errorElements.find((element) => element.tagName === "BUTTON" && element.textContent === "Повторить").click();
   assert.equal(retryCount, 1);
@@ -1864,16 +1994,19 @@ assert.doesNotMatch(inlineCaptureSource, /cloneRange|removeAllRanges|addRange|in
 assert.doesNotMatch(inlineCaptureSource, /\b(?:range|selection)\s*[:,]\s*(?:range|selection)\b/);
 
 const inlineUiRendererSource = analysisUiSource.slice(
-  analysisUiSource.indexOf("function ensureInlineRoot"),
+  analysisUiSource.indexOf("function inlineActionButton"),
   analysisUiSource.indexOf("function removeToast"),
 );
 assert.match(inlineUiRendererSource, /document\.createElement\("button"\)/);
-assert.match(inlineUiRendererSource, /inlineTrigger\.type = "button"/);
+assert.match(inlineUiRendererSource, /button\.type = "button"/);
 assert.match(inlineUiRendererSource, /shell\(\)\?\.appendChild\(inlineRoot\)/);
 assert.match(inlineUiRendererSource, /setAttribute\("role", "region"\)/);
 assert.doesNotMatch(inlineUiRendererSource, /aria-modal|innerHTML/);
-assert.match(inlineUiRendererSource, /setAttribute\("aria-label", "Открыть словарь по выделению"\)/);
-assert.match(inlineUiRendererSource, /setAttribute\("title", "Словарь"\)/);
+assert.match(inlineUiRendererSource, /"Словарь"/);
+assert.match(inlineUiRendererSource, /"Перевести текст"/);
+assert.match(inlineUiRendererSource, /"Анализировать текст"/);
+assert.match(inlineUiRendererSource, /inlineOffer\.append\(inlineTrigger, inlineTranslate, inlineAnalyze\)/);
+assert.match(inlineUiRendererSource, /glossaryEnabled \? "Словарь" : "Словарь временно недоступен"/);
 assert.match(inlineUiRendererSource, /createElementNS\("http:\/\/www\.w3\.org\/2000\/svg", "svg"\)/);
 assert.match(inlineUiRendererSource, /setAttribute\("aria-hidden", "true"\)/);
 assert.doesNotMatch(inlineUiRendererSource, /📖|label\.textContent = "Словарь"/);
@@ -1908,10 +2041,10 @@ const providerDialogOwnerSource = analysisUiSource.slice(
   analysisUiSource.indexOf("function showResult"),
 );
 assert.match(providerLoadingOwnerSource, /function showLoading\(\) \{\s*closeInline\(\);/);
-assert.match(providerDialogOwnerSource, /function dialogFrame\(title\) \{\s*closeInline\(\);/);
+assert.match(providerDialogOwnerSource, /function dialogFrame\(title, variant\) \{\s*closeInline\(\);/);
 
 const inlineSessionSource = contentScriptSource.slice(
-  contentScriptSource.indexOf("function inlineSelectionSignature"),
+  contentScriptSource.indexOf("function aiOperationBusy"),
   contentScriptSource.indexOf("function handleWorkspaceContextChange"),
 );
 const inlineOfferSource = inlineSessionSource.slice(
@@ -1950,13 +2083,13 @@ assert.match(inlineSessionSource, /const snapshot = Object\.freeze/);
 assert.match(inlineOwnershipSource, /current\.requestToken === requestToken/);
 assert.match(inlineOwnershipSource, /current\.selectionToken === selectionToken/);
 assert.match(inlineOwnershipSource, /current\.snapshot === snapshot/);
-assert.match(inlineOwnershipSource, /inlineSnapshotCurrent\(snapshot\)/);
+assert.match(inlineOwnershipSource, /inlineGlossarySnapshotCurrent\(snapshot\)/);
 assert.match(inlineSnapshotCurrentSource, /snapshot\.pageUrl === location\.href/);
 assert.match(inlineSnapshotCurrentSource, /scopeKey === snapshot\.conversationScope/);
 assert.match(inlineSnapshotCurrentSource, /snapshot\.anchorNode\?\.isConnected === true/);
 assert.match(inlineSnapshotCurrentSource, /state\.workspaceStatus\.status === "ready"/);
 assert.equal(
-  inlineLookupDispatchSource.indexOf("inlineSnapshotCurrent(snapshot)")
+  inlineLookupDispatchSource.indexOf("inlineGlossarySnapshotCurrent(snapshot)")
     < inlineLookupDispatchSource.indexOf("lookupGlossarySelection(snapshot.text)"),
   true,
 );
@@ -1966,7 +2099,7 @@ assert.doesNotMatch(inlineUiRendererSource, /function (?:collapseInline|showInli
 assert.match(inlineSessionCaptureSource, /generation/);
 assert.match(inlineFallbackSource, /current\.phase !== "showing"/);
 assert.match(inlineFallbackSource, /inlineResultContainsCandidate/);
-assert.match(inlineFallbackSource, /inlineSnapshotCurrent\(snapshot\)/);
+assert.match(inlineFallbackSource, /inlineGlossarySnapshotCurrent\(snapshot\)/);
 assert.match(inlineFallbackSource, /const displayTerm = candidate\.displayTerm/);
 assert.match(inlineFallbackSource, /const pageUrl = snapshot\.pageUrl/);
 assert.equal(
@@ -2014,7 +2147,7 @@ const inlinePathOwnerSource = inlineUiRendererSource.slice(
   inlineUiRendererSource.indexOf("function inlineContainsPath"),
   inlineUiRendererSource.indexOf("function inlineOwnsFocus"),
 );
-assert.match(inlinePathOwnerSource, /\[inlineTrigger, inlinePopover\]/);
+assert.match(inlinePathOwnerSource, /\[inlineOffer, inlinePopover\]/);
 assert.doesNotMatch(inlinePathOwnerSource, /path\.includes\(inlineRoot\)|inlineRoot\.contains/);
 const inlineResizeSource = contentScriptSource.slice(
   contentScriptSource.indexOf('window.addEventListener("resize", function handleWindowResize'),
@@ -2087,10 +2220,12 @@ assert.match(analysisStyles, /\.analysis-replace \{[^}]*display: inline-flex;[^}
 assert.match(analysisStyles, /\.analysis-replace svg \{[^}]*display: block;[^}]*width: 16px;[^}]*height: 16px;/);
 assert.doesNotMatch(analysisStyles, /analysis-search-clear/);
 assert.match(analysisStyles, /\.inline-glossary-root \{[^}]*position: fixed;[^}]*pointer-events: none;/);
-assert.match(analysisStyles, /\.inline-glossary-trigger \{[^}]*position: fixed;[^}]*width: 36px;[^}]*height: 36px;[^}]*border-radius: 50%;[^}]*pointer-events: auto;/);
-assert.match(analysisStyles, /\.inline-glossary-trigger svg \{[^}]*width: 18px;[^}]*height: 18px;[^}]*stroke-width: 1\.8;/);
+assert.match(analysisStyles, /\.inline-selection-actions \{[^}]*position: fixed;[^}]*display: flex;[^}]*gap: 6px;[^}]*pointer-events: auto;/);
+assert.match(analysisStyles, /\.inline-selection-action \{[^}]*width: 36px;[^}]*height: 36px;[^}]*border-radius: 50%;/);
+assert.match(analysisStyles, /\.inline-selection-action svg \{[^}]*width: 18px;[^}]*height: 18px;[^}]*stroke-width: 1\.8;/);
 assert.match(analysisStyles, /\.inline-glossary-popover \{[^}]*width: min\(360px, calc\(100vw - 16px\)\);[^}]*max-height: min\(420px, 60vh\);[^}]*grid-template-rows: auto minmax\(0, 1fr\);[^}]*overflow: hidden;/);
 assert.match(analysisStyles, /\.inline-glossary-body \{[^}]*overflow-y: auto;[^}]*overscroll-behavior: contain;/);
+assert.match(analysisStyles, /\.translation-result \{[^}]*white-space: pre-wrap;[^}]*overflow-wrap: anywhere;[^}]*user-select: text;/);
 const keyMarkupState = {
   glossaryEntries: [],
   glossarySearch: "query",
@@ -2849,23 +2984,27 @@ async function runAsyncTests() {
     );
   }
 
-  for (const closeAction of [
-    (harness) => harness.api.handleWorkspaceContextChange({
-      scopeKey: "stable:chatgpt.com:changed-context",
-    }),
-    (harness) => harness.api.handleWorkspaceStatusChange({
-      status: "unavailable",
-      context: null,
-      errorCode: "RECOVERY_REQUIRED",
-      message: "Unavailable",
-    }),
-  ]) {
-    const harness = createInlineContentHarness();
-    harness.api.showInlineOffer(inlineContentSnapshot("State", 0));
-    closeAction(harness);
-    assert.equal(harness.state.inlineGlossary.phase, "closed");
-    assert.equal(harness.state.inlineGlossary.snapshot, null);
-  }
+  const contextChangeHarness = createInlineContentHarness();
+  contextChangeHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  contextChangeHarness.api.handleWorkspaceContextChange({
+    scopeKey: "stable:chatgpt.com:changed-context",
+  });
+  assert.equal(contextChangeHarness.state.inlineGlossary.phase, "closed");
+  assert.equal(contextChangeHarness.state.inlineGlossary.snapshot, null);
+
+  const workspaceUnavailableOfferHarness = createInlineContentHarness();
+  workspaceUnavailableOfferHarness.api.showInlineOffer(inlineContentSnapshot("State", 0));
+  workspaceUnavailableOfferHarness.api.handleWorkspaceStatusChange({
+    status: "unavailable",
+    context: null,
+    errorCode: "RECOVERY_REQUIRED",
+    message: "Unavailable",
+  });
+  assert.equal(workspaceUnavailableOfferHarness.state.inlineGlossary.phase, "offering");
+  assert.equal(
+    workspaceUnavailableOfferHarness.uiCalls.at(-1).offerOptions.glossaryEnabled,
+    false,
+  );
 
   const sameTermReselectionHarness = createInlineContentHarness();
   const sameSnapshot = inlineContentSnapshot("State", 0);
@@ -2888,6 +3027,43 @@ async function runAsyncTests() {
     2,
     "an intentional same-term re-selection is not suppressed",
   );
+
+  const fullSelectionText = "State and OpenAPI remain in the full selected fragment.";
+  const translationActionHarness = createInlineContentHarness();
+  translationActionHarness.api.showInlineOffer(inlineContentSnapshot(fullSelectionText, 0));
+  assert.equal(
+    translationActionHarness.uiCalls.find((call) => call.phase === "offering").offerOptions.glossaryEnabled,
+    true,
+  );
+  const translatedSelection = await translationActionHarness.api.translateInlineSelection();
+  assert.equal(translatedSelection.ok, true);
+  assert.deepEqual(clone(translationActionHarness.translationCalls), [{
+    args: ["inline-assistant", fullSelectionText, "https://chatgpt.com/c/inline-content"],
+    phaseAtStart: "closed",
+  }]);
+  assert.deepEqual(translationActionHarness.lookupCalls, []);
+
+  const analysisActionHarness = createInlineContentHarness();
+  analysisActionHarness.api.showInlineOffer(inlineContentSnapshot(fullSelectionText, 0));
+  const analyzedSelection = await analysisActionHarness.api.analyzeInlineSelection();
+  assert.equal(analyzedSelection.ok, true);
+  assert.deepEqual(clone(analysisActionHarness.analysisCalls), [{
+    args: ["inline-assistant", fullSelectionText, "https://chatgpt.com/c/inline-content"],
+    phaseAtStart: "closed",
+  }]);
+  assert.deepEqual(analysisActionHarness.lookupCalls, []);
+
+  const unavailableQuickActionHarness = createInlineContentHarness();
+  unavailableQuickActionHarness.state.workspaceStatus = { status: "unavailable" };
+  unavailableQuickActionHarness.state.workspaceContext = null;
+  unavailableQuickActionHarness.api.showInlineOffer(inlineContentSnapshot(fullSelectionText, 0));
+  assert.equal(
+    unavailableQuickActionHarness.uiCalls.find((call) => call.phase === "offering").offerOptions.glossaryEnabled,
+    false,
+  );
+  assert.equal((await unavailableQuickActionHarness.api.activateInlineGlossary()).ignored, true);
+  unavailableQuickActionHarness.api.showInlineOffer(inlineContentSnapshot(fullSelectionText, 0));
+  assert.equal((await unavailableQuickActionHarness.api.translateInlineSelection()).ok, true);
 
   const lookupHarness = createInlineContentHarness();
   lookupHarness.api.showInlineOffer(inlineContentSnapshot("State and OpenAPI", 0));
@@ -3234,6 +3410,7 @@ async function runAsyncTests() {
   await noOpMigration.runStartup();
   assert.deepEqual(noOpMigration.contextMenuCalls.map((call) => [call.operation, call.id]), [
     ["update", "chatgpt-helper-analyze-selection"],
+    ["update", "chatgpt-helper-translate-selection"],
     ["update", "chatgpt-helper-save-selection"],
     ["update", "chatgpt-helper-normalize-composer"],
   ]);
@@ -4996,17 +5173,19 @@ async function runAsyncTests() {
   });
   const commandTab = { id: 81, url: "https://chatgpt.com/c/event-tab" };
   await commandHarness.runCommand("analyze-selection", commandTab);
+  await commandHarness.runCommand("translate-selection", commandTab);
   await commandHarness.runCommand("save-selection", commandTab);
   await commandHarness.runCommand("normalize-composer", commandTab);
   await commandHarness.runCommand("normalize-composer", commandTab);
   assert.deepEqual(commandHarness.tabMessages.map((item) => item.message.type), [
     commandRegistry.CONTENT_MESSAGE_TYPES.ANALYZE,
+    commandRegistry.CONTENT_MESSAGE_TYPES.TRANSLATE,
     commandRegistry.CONTENT_MESSAGE_TYPES.SAVE,
     commandRegistry.CONTENT_MESSAGE_TYPES.NORMALIZE,
   ]);
   assert.equal(commandHarness.tabQueryCalls.length, 0);
   await commandHarness.runCommand("unsupported-command", commandTab);
-  assert.equal(commandHarness.tabMessages.length, 3);
+  assert.equal(commandHarness.tabMessages.length, 4);
   await commandHarness.runCommand("save-selection", { id: 90, url: "https://example.com/" });
   assert.deepEqual(commandHarness.tabQueryCalls.at(-1), { active: true, lastFocusedWindow: true });
   assert.equal(commandHarness.tabMessages.at(-1).tabId, 82);
@@ -5020,6 +5199,10 @@ async function runAsyncTests() {
     selectionText: "Menu analysis",
   }, { id: 71, url: "https://chatgpt.com/c/menu" });
   await menuHarness.runContextMenu({
+    menuItemId: "chatgpt-helper-translate-selection",
+    selectionText: "Menu translation",
+  }, { id: 71, url: "https://chatgpt.com/c/menu" });
+  await menuHarness.runContextMenu({
     menuItemId: "chatgpt-helper-save-selection",
     selectionText: "Menu snapshot",
   }, { id: 71, url: "https://chatgpt.com/c/menu" });
@@ -5028,6 +5211,7 @@ async function runAsyncTests() {
   }, { id: 71, url: "https://chatgpt.com/c/menu" });
   assert.deepEqual(menuHarness.tabMessages.map((item) => item.message.type), [
     contract.MESSAGE_TYPES.CONTEXT_MENU_SELECTION,
+    commandRegistry.CONTENT_MESSAGE_TYPES.TRANSLATE,
     workspaceContract.MESSAGE_TYPES.CONTEXT_MENU_SAVE_SELECTION,
     workspaceContract.MESSAGE_TYPES.CONTEXT_MENU_NORMALIZE_COMPOSER,
   ]);

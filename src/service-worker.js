@@ -33,6 +33,12 @@ const CONTEXT_MENUS = Object.freeze([
     documentUrlPatterns: SUPPORTED_PATTERNS,
   }),
   Object.freeze({
+    id: commandRegistry.COMMANDS.translateSelection.contextMenuId,
+    title: "Перевести выделенный текст",
+    contexts: ["selection"],
+    documentUrlPatterns: SUPPORTED_PATTERNS,
+  }),
+  Object.freeze({
     id: commandRegistry.COMMANDS.saveSelection.contextMenuId,
     title: "Сохранить выделенный текст",
     contexts: ["selection"],
@@ -997,7 +1003,7 @@ async function handleAnalysis(message, sender, workspaceAvailable) {
   if (!selection.ok) return { ok: false, requestId: snapshot.requestId, error: selection.error };
   try {
     if (!await acquireAnalysisLock(tabId, snapshot.requestId)) {
-      return contract.errorEnvelope(snapshot.requestId, "ANALYSIS_ALREADY_RUNNING");
+      return contract.errorEnvelope(snapshot.requestId, "AI_OPERATION_ALREADY_RUNNING");
     }
   } catch (_) {
     return contract.errorEnvelope(snapshot.requestId, "PROVIDER_ERROR");
@@ -1042,6 +1048,43 @@ async function handleAnalysis(message, sender, workspaceAvailable) {
         error: workspaceError("GLOSSARY_INVARIANT_VIOLATION"),
       };
     }
+    return contract.errorEnvelope(snapshot.requestId, "PROVIDER_ERROR");
+  } finally {
+    await releaseAnalysisLock(tabId, snapshot.requestId);
+  }
+}
+
+async function handleTranslation(message, sender) {
+  const tabId = sender.tab.id;
+  const snapshot = message?.snapshot;
+  const senderUrl = sender?.tab?.url || sender?.url || "";
+  if (!snapshot || !validRequestId(snapshot.requestId)
+    || !["browser-command", "context-menu", "inline-assistant"].includes(snapshot.trigger)
+    || typeof snapshot.createdAt !== "number"
+    || !isSupportedAnalysisPageTransition(snapshot.pageUrl, senderUrl)) {
+    return contract.errorEnvelope(snapshot?.requestId, "UNSUPPORTED_PAGE");
+  }
+  const selection = contract.validateSelection(snapshot.text);
+  if (!selection.ok) return { ok: false, requestId: snapshot.requestId, error: selection.error };
+  try {
+    if (!await acquireAnalysisLock(tabId, snapshot.requestId)) {
+      return contract.errorEnvelope(snapshot.requestId, "AI_OPERATION_ALREADY_RUNNING");
+    }
+  } catch (_) {
+    return contract.errorEnvelope(snapshot.requestId, "PROVIDER_ERROR");
+  }
+
+  try {
+    const apiKey = await secretStore.getKey();
+    if (!apiKey) return contract.errorEnvelope(snapshot.requestId, "API_KEY_MISSING");
+    const translated = await openRouterClient.translate(selection.text, apiKey);
+    if (!translated.ok) return { ok: false, requestId: snapshot.requestId, error: translated.error };
+    return {
+      ok: true,
+      requestId: snapshot.requestId,
+      translatedText: translated.translatedText,
+    };
+  } catch (_) {
     return contract.errorEnvelope(snapshot.requestId, "PROVIDER_ERROR");
   } finally {
     await releaseAnalysisLock(tabId, snapshot.requestId);
@@ -1274,6 +1317,9 @@ async function handleMessage(message, sender) {
     }
     return { ok: true };
   }
+  if (message.type === MESSAGES.TRANSLATE_SELECTED_TEXT) {
+    return handleTranslation(message, sender);
+  }
   if (LOCAL_MUTATION_MESSAGES.has(message.type)) {
     try {
       await ensureMigrated();
@@ -1373,6 +1419,13 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === commandRegistry.COMMANDS.analyzeSelection.contextMenuId) {
     void chrome.tabs.sendMessage(tab.id, {
       type: MESSAGES.CONTEXT_MENU_SELECTION,
+      selectionText: typeof info.selectionText === "string" ? info.selectionText : "",
+      pageUrl: tab.url,
+    }).catch(() => {});
+  } else if (info.menuItemId === commandRegistry.COMMANDS.translateSelection.contextMenuId) {
+    void chrome.tabs.sendMessage(tab.id, {
+      type: commandRegistry.CONTENT_MESSAGE_TYPES.TRANSLATE,
+      trigger: "context-menu",
       selectionText: typeof info.selectionText === "string" ? info.selectionText : "",
       pageUrl: tab.url,
     }).catch(() => {});

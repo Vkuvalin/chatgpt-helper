@@ -38,6 +38,9 @@
     "analyze-selection": {
       "description": "Анализировать выделенный текст"
     },
+    "translate-selection": {
+      "description": "Перевести выделенный текст"
+    },
     "save-selection": {
       "description": "Сохранить выделенный текст"
     },
@@ -58,6 +61,7 @@
         "src/chatgpt-dom.js",
         "src/analysis-contract.js",
         "src/analysis-controller.js",
+        "src/translation-controller.js",
         "src/analysis-ui.js",
         "src/workspace-ui.js",
         "src/content-script.js"

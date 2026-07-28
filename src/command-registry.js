@@ -6,6 +6,7 @@
   const TEXT_ENTRY_SELECTOR = "input, textarea, select, [contenteditable='true'], [contenteditable=''], [role='textbox']";
   const CONTENT_MESSAGE_TYPES = Object.freeze({
     ANALYZE: "RUN_ANALYSIS_COMMAND",
+    TRANSLATE: "RUN_TRANSLATE_SELECTION_COMMAND",
     SAVE: "RUN_SAVE_SELECTION_COMMAND",
     NORMALIZE: "RUN_NORMALIZE_COMPOSER_COMMAND",
   });
@@ -18,6 +19,14 @@
       contextMenuId: "chatgpt-helper-analyze-selection",
       messageType: CONTENT_MESSAGE_TYPES.ANALYZE,
       handlerId: "runAnalysis",
+    }),
+    translateSelection: Object.freeze({
+      id: "translate-selection",
+      description: "Перевести выделенный текст",
+      allowedContext: "pageSelection",
+      contextMenuId: "chatgpt-helper-translate-selection",
+      messageType: CONTENT_MESSAGE_TYPES.TRANSLATE,
+      handlerId: "runTranslation",
     }),
     saveSelection: Object.freeze({
       id: "save-selection",

@@ -6,6 +6,7 @@
   const conversationContextModule = globalThis.ChatGPTHelperConversationContext;
   const commandRegistry = globalThis.ChatGPTHelperCommandRegistry;
   const analysisControllerModule = globalThis.ChatGPTHelperAnalysisController;
+  const translationControllerModule = globalThis.ChatGPTHelperTranslationController;
   const analysisUiModule = globalThis.ChatGPTHelperAnalysisUi;
   const workspaceUiModule = globalThis.ChatGPTHelperWorkspaceUi;
   const chatGptDom = globalThis.ChatGPTTemplateDom;
@@ -86,8 +87,11 @@
     sidebarWidthCommitToken: 0,
     sidebarWidthCommitPending: false,
     analysisBusy: false,
+    translationBusy: false,
     analysisController: null,
+    translationController: null,
     analysisUi: null,
+    pageUrl: location.href,
     inlineGesture: {
       generation: 0,
       pointerId: null,
@@ -1336,6 +1340,10 @@
     updateSavedEntries(response.entries);
   }
 
+  function aiOperationBusy() {
+    return state.analysisBusy || state.translationBusy;
+  }
+
   function inlineSelectionSignature() {
     const selection = window.getSelection?.();
     if (!selection) return "";
@@ -1350,10 +1358,14 @@
   function inlineSnapshotCurrent(snapshot) {
     return Boolean(snapshot
       && snapshot.pageUrl === location.href
+      && snapshot.anchorNode?.isConnected === true);
+  }
+
+  function inlineGlossarySnapshotCurrent(snapshot) {
+    return Boolean(inlineSnapshotCurrent(snapshot)
       && workspaceContract.isScopeKey(snapshot.conversationScope)
       && state.workspaceContext?.scopeKey === snapshot.conversationScope
-      && state.workspaceStatus.status === "ready"
-      && snapshot.anchorNode?.isConnected === true);
+      && state.workspaceStatus.status === "ready");
   }
 
   function cancelInlineGestureSettle() {
@@ -1405,6 +1417,8 @@
   function inlineUiHandlers() {
     return {
       onActivate() { void activateInlineGlossary(); },
+      onTranslate() { void translateInlineSelection(); },
+      onAnalyzeSelection() { void analyzeInlineSelection(); },
       onClose() { closeInlineGlossary(); },
       onRetry() { void retryInlineGlossary(); },
       onAnalyze(candidate) { void analyzeInlineGlossaryCandidate(candidate); },
@@ -1421,7 +1435,9 @@
       result: null,
       error: null,
     };
-    if (!state.analysisUi?.showInlineOffer(snapshot, inlineUiHandlers())) {
+    if (!state.analysisUi?.showInlineOffer(snapshot, inlineUiHandlers(), {
+      glossaryEnabled: state.workspaceStatus.status === "ready" && Boolean(state.workspaceContext),
+    })) {
       closeInlineGlossary();
       return false;
     }
@@ -1437,11 +1453,11 @@
       && current.snapshot?.text === snapshot.text
       && current.snapshot?.pageUrl === snapshot.pageUrl
       && current.snapshot?.conversationScope === snapshot.conversationScope
-      && inlineSnapshotCurrent(snapshot);
+      && inlineGlossarySnapshotCurrent(snapshot);
   }
 
   async function performInlineGlossaryLookup(snapshot, selectionToken) {
-    if (!inlineSnapshotCurrent(snapshot)) {
+    if (!inlineGlossarySnapshotCurrent(snapshot)) {
       closeInlineGlossary();
       return { ok: false, ignored: true };
     }
@@ -1499,7 +1515,9 @@
     const current = state.inlineGlossary;
     const offer = current.snapshot;
     const scope = state.workspaceContext?.scopeKey;
-    if (current.phase !== "offering" || !offer) {
+    if (current.phase !== "offering" || !offer
+      || state.workspaceStatus.status !== "ready"
+      || !workspaceContract.isScopeKey(scope)) {
       closeInlineGlossary();
       return Promise.resolve({ ok: false, ignored: true });
     }
@@ -1512,6 +1530,32 @@
     });
     state.inlineGlossary = { ...current, snapshot };
     return performInlineGlossaryLookup(snapshot, current.selectionToken);
+  }
+
+  function translateInlineSelection() {
+    const current = state.inlineGlossary;
+    const snapshot = current.snapshot;
+    if (current.phase !== "offering" || !inlineSnapshotCurrent(snapshot)) {
+      closeInlineGlossary();
+      return Promise.resolve({ ok: false, ignored: true });
+    }
+    const text = snapshot.text;
+    const pageUrl = snapshot.pageUrl;
+    closeInlineGlossary();
+    return runTranslation("inline-assistant", text, pageUrl);
+  }
+
+  function analyzeInlineSelection() {
+    const current = state.inlineGlossary;
+    const snapshot = current.snapshot;
+    if (current.phase !== "offering" || !inlineSnapshotCurrent(snapshot)) {
+      closeInlineGlossary();
+      return Promise.resolve({ ok: false, ignored: true });
+    }
+    const text = snapshot.text;
+    const pageUrl = snapshot.pageUrl;
+    closeInlineGlossary();
+    return runAnalysis("inline-assistant", text, pageUrl);
   }
 
   function retryInlineGlossary() {
@@ -1541,7 +1585,7 @@
       return { ok: false, ignored: true };
     }
     const snapshot = current.snapshot;
-    if (!inlineSnapshotCurrent(snapshot)) {
+    if (!inlineGlossarySnapshotCurrent(snapshot)) {
       closeInlineGlossary();
       return { ok: false, ignored: true };
     }
@@ -1553,9 +1597,7 @@
 
   function captureInlineGlossarySelection(generation) {
     if (state.inlineGesture.generation !== generation) return false;
-    if (state.analysisBusy
-      || state.workspaceStatus.status !== "ready"
-      || !state.workspaceContext
+    if (aiOperationBusy()
       || !conversationContextModule.isSupportedPage(location.href)) {
       closeInlineGlossary();
       return false;
@@ -1768,11 +1810,27 @@
     const previous = state.workspaceStatus;
     state.workspaceStatus = status;
     if (status.status === "unavailable") {
-      closeInlineGlossary();
+      if (state.inlineGlossary.phase === "offering" && state.inlineGlossary.snapshot) {
+        state.analysisUi?.showInlineOffer(
+          state.inlineGlossary.snapshot,
+          inlineUiHandlers(),
+          { glossaryEnabled: false },
+        );
+      } else {
+        closeInlineGlossary();
+      }
       closeWorkspaceDelete();
       state.workspaceContext = null;
       state.glossaryEntries = [];
       state.savedEntries = [];
+    } else if (status.status === "ready"
+      && state.inlineGlossary.phase === "offering"
+      && state.inlineGlossary.snapshot) {
+      state.analysisUi?.showInlineOffer(
+        state.inlineGlossary.snapshot,
+        inlineUiHandlers(),
+        { glossaryEnabled: Boolean(state.workspaceContext) },
+      );
     }
     if (state.open && ["analysis", "saved"].includes(state.activeSection)
       && (previous.status !== status.status || previous.message !== status.message)) {
@@ -1879,6 +1937,12 @@
     const response = await state.analysisController?.start(snapshot, trigger, pageUrl || location.href);
     if (response?.mutationBusy) state.analysisUi?.showHint("Импорт выполняется. Повторите сохранение терминов позже.");
     return response;
+  }
+
+  async function runTranslation(trigger, selectionText, pageUrl) {
+    closeInlineGlossary();
+    const snapshot = readSelectedTextSnapshot(selectionText);
+    return state.translationController?.start(snapshot, trigger, pageUrl || location.href);
   }
 
   async function runSaveSelection(trigger, selectionText, pageUrl) {
@@ -2520,6 +2584,11 @@
   }
 
   function ensureMounted() {
+    if (state.pageUrl !== location.href) {
+      state.pageUrl = location.href;
+      state.translationController?.cancel();
+      closeInlineGlossary();
+    }
     if (state.inlineGlossary.phase !== "closed"
       && !state.inlineGlossary.snapshot?.anchorNode?.isConnected) {
       closeInlineGlossary();
@@ -2663,6 +2732,28 @@
         .catch(() => sendResponse({ ok: false }));
       return true;
     }
+    if (message?.type === commandRegistry.CONTENT_MESSAGE_TYPES.TRANSLATE) {
+      const trigger = message.trigger === "context-menu" ? "context-menu" : "browser-command";
+      const currentSelection = readSelectedTextSnapshot(String(window.getSelection?.().toString() || ""));
+      const currentValidation = contract.validateSelection(currentSelection);
+      const selectionText = trigger === "context-menu" && !currentValidation.ok
+        ? readSelectedTextSnapshot(String(message.selectionText || ""))
+        : currentSelection;
+      const eligible = commandRegistry.selectionEligible({
+        supportedPage: conversationContextModule.isSupportedPage(location.href),
+        selectionText,
+        isEditable: commandRegistry.isTextEntryTarget(document.activeElement),
+      });
+      if (!eligible) {
+        state.analysisUi?.showHint("Выделите текст вне поля ввода ChatGPT.");
+        sendResponse({ ok: false });
+        return false;
+      }
+      void runTranslation(trigger, selectionText, message.pageUrl || location.href)
+        .then((response) => sendResponse(response || { ok: false }))
+        .catch(() => sendResponse({ ok: false }));
+      return true;
+    }
     if (message?.type === commandRegistry.CONTENT_MESSAGE_TYPES.SAVE
       || message?.type === workspaceContract.MESSAGE_TYPES.CONTEXT_MENU_SAVE_SELECTION) {
       const trigger = message.type === commandRegistry.CONTENT_MESSAGE_TYPES.SAVE ? "browser-command" : "context-menu";
@@ -2754,7 +2845,10 @@
     onHint: function showAnalysisHint(text) { state.analysisUi?.showHint(text); },
     onLoading: function showAnalysisLoading() { state.analysisUi?.showLoading(); },
     onLoadingEnd: function hideAnalysisLoading() { state.analysisUi?.hideLoading(); },
-    onBusyChange: function setAnalysisBusy(value) { state.analysisBusy = value; },
+    onBusyChange: function setAnalysisBusy(value) {
+      state.analysisBusy = value;
+      if (aiOperationBusy()) closeInlineGlossary();
+    },
     onKeyStatusChanged: updateKeyStatus,
     onError: function showAnalysisError(error) {
       if (["API_KEY_MISSING", "API_KEY_INVALID"].includes(error?.code)) state.keyConfigured = false;
@@ -2763,6 +2857,22 @@
     onResult: function showAnalysisResult(response) {
       void refreshGlossary().catch(handleUiError);
       state.analysisUi?.showResult(response);
+    },
+  });
+  state.translationController = translationControllerModule.create({
+    onHint: function showTranslationHint(text) { state.analysisUi?.showHint(text); },
+    onLoading: function showTranslationLoading() { state.analysisUi?.showTranslationLoading(); },
+    onLoadingEnd: function hideTranslationLoading() { state.analysisUi?.hideLoading(); },
+    onBusyChange: function setTranslationBusy(value) {
+      state.translationBusy = value;
+      if (aiOperationBusy()) closeInlineGlossary();
+    },
+    onError: function showTranslationError(error) {
+      if (["API_KEY_MISSING", "API_KEY_INVALID"].includes(error?.code)) state.keyConfigured = false;
+      state.analysisUi?.showTranslationError(error);
+    },
+    onResult: function showTranslationResult(response) {
+      state.analysisUi?.showTranslationResult(response.translatedText);
     },
   });
   state.contextClient = conversationContextModule.createClient({
