@@ -4,10 +4,46 @@
   if (root.ChatGPTHelperWorkspaceUi) return;
 
   const contract = root.ChatGPTHelperWorkspaceContract;
+  const templateTree = root.ChatGPTHelperTemplateTree
+    || (typeof module === "object" && module.exports ? require("./template-tree.js") : null);
   const DRAG_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01"/></svg>';
   const COPY_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 8.75h8.25A1.75 1.75 0 0 1 19 10.5v7.25a1.75 1.75 0 0 1-1.75 1.75H10a1.75 1.75 0 0 1-1.75-1.75V10.5A1.75 1.75 0 0 1 10 8.75Zm6.75 0V6.5A1.75 1.75 0 0 0 14 4.75H6.75A1.75 1.75 0 0 0 5 6.5v7.25a1.75 1.75 0 0 0 1.75 1.75h1.5"/></svg>';
   const CHECK_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.25 4.25L19 7"/></svg>';
   const TRASH_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14m-9-3h4l1 3H9l1-3Zm-3 3 1 13h8l1-13M10 10v6m4-6v6"/></svg>';
+  const TEMPLATE_ICON_SVGS = Object.freeze({
+    folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M3 6.5h7l2 2h9v10H3z"/></svg>',
+    document: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 13h6M9 17h6"/></svg>',
+    code: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="m9 7-5 5 5 5m6-10 5 5-5 5m-2-12-2 14"/></svg>',
+    terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="m5 7 4 5-4 5m7 0h7M3 4h18v16H3z"/></svg>',
+    database: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></svg>',
+    checklist: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="m4 6 2 2 3-4m2 3h9M4 14l2 2 3-4m2 3h9"/></svg>',
+    chart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M4 20V10h4v10m4 0V4h4v16m4 0V7M2 20h20"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></svg>',
+    translate: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M3 5h10M8 3v2m-3 4c2 3 4 5 7 6m0-6c-2 3-4 5-8 7m10 4 4-10 4 10m-7-3h6"/></svg>',
+    brain: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M9 4a3 3 0 0 0-5 2 3 3 0 0 0 0 5 3 3 0 0 0 2 5 3 3 0 0 0 3 4m6-16a3 3 0 0 1 5 2 3 3 0 0 1 0 5 3 3 0 0 1-2 5 3 3 0 0 1-3 4M9 4v16m6-16v16M9 9H6m9 5h3"/></svg>',
+    spark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="m12 2 2.2 6.8L21 11l-6.8 2.2L12 20l-2.2-6.8L3 11l6.8-2.2z"/></svg>',
+    shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M12 3 20 6v6c0 5-3.4 8-8 9-4.6-1-8-4-8-9V6zM8 12l3 3 5-6"/></svg>',
+    bug: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M8 8h8v9a4 4 0 0 1-8 0zM9 8a3 3 0 0 1 6 0M4 11h4m8 0h4M4 16h4m8 0h4M7 4l2 2m8-2-2 2"/></svg>',
+    bookmark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4z"/></svg>',
+    rocket: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M14 4c3-2 6-2 6-2s0 3-2 6l-7 7-4-4zM9 13l-4 1-3 3 5 1m4-7 1-4 3-3 1 5M8 19c-1 2-4 3-6 3 0-2 1-5 3-6"/></svg>',
+  });
+
+  function trustedTemplateIcon(iconKey, kind) {
+    const normalized = templateTree
+      ? templateTree.normalizeIconKey(kind || templateTree.NODE_KINDS.TEMPLATE, iconKey)
+      : (Object.prototype.hasOwnProperty.call(TEMPLATE_ICON_SVGS, iconKey) ? iconKey : "document");
+    return TEMPLATE_ICON_SVGS[normalized];
+  }
+
+  function templateDropZone(kind, ratioValue) {
+    const ratio = Math.max(0, Math.min(1, Number(ratioValue) || 0));
+    if (kind === "folder") {
+      if (ratio < 0.25) return "before";
+      if (ratio < 0.75) return "inside";
+      return "after";
+    }
+    return ratio < 0.5 ? "before" : "after";
+  }
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -252,9 +288,12 @@
     const templates = Array.isArray(templatesValue) ? templatesValue : [];
     const byId = new Map(templates.map((template) => [template?.id, template]));
     const count = contract.normalizeRecentTemplatesHoverCount(countValue);
-    return contract.normalizeRecentTemplateIds(recentTemplateIds).flatMap((id) => {
+    const normalizedIds = templateTree
+      ? templateTree.normalizeRecentTemplateIds(recentTemplateIds, templates)
+      : contract.normalizeRecentTemplateIds(recentTemplateIds);
+    return normalizedIds.flatMap((id) => {
       const template = byId.get(id);
-      return template ? [template] : [];
+      return template?.kind === "template" ? [template] : [];
     }).slice(0, count);
   }
 
@@ -518,6 +557,9 @@
     nextSidebarPhase,
     quickActionStateForPhase,
     createTransformTransitionController,
+    TEMPLATE_ICON_SVGS,
+    trustedTemplateIcon,
+    templateDropZone,
     recentTemplatesForDisplay,
     previewPosition,
     previewAnchorFromTarget,

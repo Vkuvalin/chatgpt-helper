@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "chatgpt-helper",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Шаблоны, быстрые действия и анализ английских терминов для ChatGPT.",
   "icons": {
     "16": "icons/chatgpt-helper-16.png",
@@ -56,6 +56,7 @@
       ],
       "js": [
         "src/workspace-contract.js",
+        "src/template-tree.js",
         "src/conversation-context.js",
         "src/command-registry.js",
         "src/chatgpt-dom.js",

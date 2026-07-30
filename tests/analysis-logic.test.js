@@ -7,6 +7,7 @@ const vm = require("node:vm");
 const { webcrypto } = require("node:crypto");
 const contract = require("../src/analysis-contract.js");
 const workspaceContract = require("../src/workspace-contract.js");
+const templateTree = require("../src/template-tree.js");
 const conversationContext = require("../src/conversation-context.js");
 const commandRegistry = require("../src/command-registry.js");
 const importExport = require("../src/import-export.js");
@@ -31,6 +32,18 @@ const manifestSource = fs.readFileSync(path.join(__dirname, "../manifest.json"),
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function typedTemplate(id, name, content, autoSend = false, parentId = null, iconKey = "document") {
+  return {
+    id,
+    kind: "template",
+    parentId,
+    name,
+    iconKey,
+    content,
+    autoSend,
+  };
 }
 
 function createInlineSelectionCaptureHarness() {
@@ -145,9 +158,18 @@ function validStorage(overrides) {
     },
   });
   return {
-    templates: [{ id: "template-1", name: "Template", content: "Content", autoSend: true }],
+    templates: [{
+      id: "template-1",
+      kind: "template",
+      parentId: null,
+      name: "Template",
+      iconKey: "document",
+      content: "Content",
+      autoSend: true,
+    }],
     settings,
     recentTemplateIds: ["template-1"],
+    templateTreeUiState: { collapsedFolderIds: [] },
     glossarySchemaVersion: 1,
     glossaryEntries: [],
     ...(overrides || {}),
@@ -340,6 +362,7 @@ function createServiceWorkerHarness(initialStorage, harnessOptions) {
     chrome,
     ChatGPTHelperAnalysisContract: contract,
     ChatGPTHelperWorkspaceContract: workspaceContract,
+    ChatGPTHelperTemplateTree: templateTree,
     ChatGPTHelperConversationContext: conversationContext,
     ChatGPTHelperCommandRegistry: commandRegistry,
     ChatGPTHelperImportExport: importExport,
@@ -3443,6 +3466,33 @@ async function runAsyncTests() {
   assert.deepEqual(patchMigration.storage.templates, validStorage().templates);
   assert.deepEqual(patchMigration.storage.recentTemplateIds, validStorage().recentTemplateIds);
 
+  const legacyTemplateMigration = createServiceWorkerHarness(validStorage({
+    templates: [{
+      id: "legacy-template",
+      name: " Legacy name ",
+      content: " Legacy content ",
+      autoSend: true,
+    }],
+    recentTemplateIds: ["legacy-template", "stale-template"],
+    templateTreeUiState: undefined,
+  }));
+  await legacyTemplateMigration.waitForMigration();
+  assert.deepEqual(legacyTemplateMigration.storage.templates, [
+    typedTemplate(
+      "legacy-template",
+      " Legacy name ",
+      " Legacy content ",
+      true,
+    ),
+  ]);
+  assert.deepEqual(legacyTemplateMigration.storage.recentTemplateIds, ["legacy-template"]);
+  assert.deepEqual(legacyTemplateMigration.storage.templateTreeUiState, {
+    collapsedFolderIds: [],
+  });
+  assert.equal(legacyTemplateMigration.setCalls.filter(
+    (changes) => Object.prototype.hasOwnProperty.call(changes, "templates"),
+  ).length, 1);
+
   const missingAnalysisMigration = createServiceWorkerHarness(validStorage({
     settings: {
       theme: "navy",
@@ -3460,12 +3510,11 @@ async function runAsyncTests() {
   });
   assert.equal(Object.prototype.hasOwnProperty.call(missingAnalysisMigration.storage.settings, "futureSettingsField"), false);
 
-  const completeRecentTemplates = Array.from({ length: 8 }, (_, index) => ({
-    id: `history-${index + 1}`,
-    name: `History ${index + 1}`,
-    content: `Content ${index + 1}`,
-    autoSend: false,
-  }));
+  const completeRecentTemplates = Array.from({ length: 8 }, (_, index) => typedTemplate(
+    `history-${index + 1}`,
+    `History ${index + 1}`,
+    `Content ${index + 1}`,
+  ));
   const completeRecentHistory = completeRecentTemplates.map((template) => template.id);
   const completeHistoryMigration = createServiceWorkerHarness(validStorage({
     templates: completeRecentTemplates,
@@ -3556,7 +3605,11 @@ async function runAsyncTests() {
     theme: "navy",
   }, { exportedAt: "2026-07-18T12:00:00.000Z", extensionVersion: "2.0.0" }).text;
   const importedDataState = {
-    templates: [{ id: "imported-template", name: "Импорт", content: "Импортированный шаблон", autoSend: false }],
+    templates: [typedTemplate(
+      "imported-template",
+      "Импорт",
+      "Импортированный шаблон",
+    )],
     conversations: [],
     glossaryConcepts: [],
     glossarySenses: [],
@@ -3572,6 +3625,113 @@ async function runAsyncTests() {
   const settingsMessage = { type: workspaceContract.MESSAGE_TYPES.IMPORT_SETTINGS_APPLY, text: importedSettingsText, mode: "merge" };
   const mergeDataMessage = { type: workspaceContract.MESSAGE_TYPES.IMPORT_DATA_APPLY, text: importedDataText, mode: "merge" };
   const replaceDataMessage = { ...mergeDataMessage, mode: "replace" };
+
+  const invalidTypedTemplates = [
+    typedTemplate(
+      "broken-template",
+      "Broken",
+      "Broken",
+      false,
+      "missing-folder",
+    ),
+  ];
+  const invalidTreeRecoveryHarness = createServiceWorkerHarness(validStorage({
+    templates: invalidTypedTemplates,
+    recentTemplateIds: ["broken-template", "stale-template"],
+    templateTreeUiState: { collapsedFolderIds: ["missing-folder"] },
+  }));
+  await invalidTreeRecoveryHarness.waitForMigration();
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.templates, invalidTypedTemplates);
+  assert.deepEqual(
+    invalidTreeRecoveryHarness.storage.recentTemplateIds,
+    ["broken-template", "stale-template"],
+  );
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.templateTreeUiState, {
+    collapsedFolderIds: ["missing-folder"],
+  });
+  const invalidTreeMutation = await invalidTreeRecoveryHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.TEMPLATE_NODE_UPDATE,
+    nodeId: "broken-template",
+    patch: { name: "Must not persist" },
+  }, {
+    tab: { id: 299, url: "https://chatgpt.com/c/invalid-tree" },
+    url: "https://chatgpt.com/c/invalid-tree",
+  });
+  assert.equal(
+    invalidTreeMutation.error.code,
+    templateTree.ERROR_CODES.INVALID_STORED_STATE,
+  );
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.templates, invalidTypedTemplates);
+  const invalidTreeMergePreview = await invalidTreeRecoveryHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.IMPORT_DATA_PREVIEW,
+    text: importedDataText,
+    mode: "merge",
+  }, optionsSender);
+  assert.equal(
+    invalidTreeMergePreview.error.code,
+    templateTree.ERROR_CODES.INVALID_STORED_STATE,
+  );
+  const invalidTreeMergeApply = await invalidTreeRecoveryHarness.handleMessage(
+    mergeDataMessage,
+    optionsSender,
+  );
+  assert.equal(
+    invalidTreeMergeApply.error.code,
+    templateTree.ERROR_CODES.INVALID_STORED_STATE,
+  );
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.templates, invalidTypedTemplates);
+  const invalidTreeReplacePreview = await invalidTreeRecoveryHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.IMPORT_DATA_PREVIEW,
+    text: importedDataText,
+    mode: "replace",
+  }, optionsSender);
+  assert.equal(invalidTreeReplacePreview.ok, true);
+  assert.equal(invalidTreeReplacePreview.recoveryAvailable, true);
+  assert.equal(invalidTreeReplacePreview.preview.warnings.some(
+    (warning) => warning.code === "CURRENT_TEMPLATE_TREE_INVALID"
+      && warning.recovery === "replace",
+  ), true);
+  const invalidTreeExport = await invalidTreeRecoveryHarness.handleMessage({
+    type: workspaceContract.MESSAGE_TYPES.EXPORT_DATA,
+  }, optionsSender);
+  assert.equal(invalidTreeExport.ok, false);
+  assert.equal(
+    invalidTreeExport.error.code,
+    templateTree.ERROR_CODES.INVALID_STORED_STATE,
+  );
+  assert.equal(invalidTreeExport.recoveryAvailable, true);
+
+  let invalidTreeApplyReadCount = 0;
+  invalidTreeRecoveryHarness.injectLocalGetTransform(
+    (names) => names.includes("templates") && ++invalidTreeApplyReadCount === 3,
+    (result) => ({ ...result, templates: [] }),
+  );
+  const invalidTreeRollback = await invalidTreeRecoveryHarness.handleMessage(
+    replaceDataMessage,
+    optionsSender,
+  );
+  assert.equal(invalidTreeRollback.rolledBack, true);
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.templates, invalidTypedTemplates);
+  assert.deepEqual(
+    invalidTreeRecoveryHarness.storage.recentTemplateIds,
+    ["broken-template", "stale-template"],
+  );
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.templateTreeUiState, {
+    collapsedFolderIds: ["missing-folder"],
+  });
+  const invalidTreeReplaceRecovery = await invalidTreeRecoveryHarness.handleMessage(
+    replaceDataMessage,
+    optionsSender,
+  );
+  assert.equal(invalidTreeReplaceRecovery.ok, true);
+  assert.deepEqual(
+    invalidTreeRecoveryHarness.storage.templates,
+    importedDataState.templates,
+  );
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.recentTemplateIds, []);
+  assert.deepEqual(invalidTreeRecoveryHarness.storage.templateTreeUiState, {
+    collapsedFolderIds: [],
+  });
 
   const optionsBoundaryHarness = createServiceWorkerHarness(validStorage());
   await optionsBoundaryHarness.waitForMigration();
@@ -3826,8 +3986,8 @@ async function runAsyncTests() {
 
   const orderedQueueStorage = validStorage({
     templates: [
-      { id: "queue-one", name: "One", content: "One", autoSend: false },
-      { id: "queue-two", name: "Two", content: "Two", autoSend: false },
+      typedTemplate("queue-one", "One", "One"),
+      typedTemplate("queue-two", "Two", "Two"),
     ],
     recentTemplateIds: ["queue-one"],
   });
@@ -3860,7 +4020,7 @@ async function runAsyncTests() {
     ],
   ]) {
     const templatePatchHarness = createServiceWorkerHarness(validStorage({
-      templates: [{ id: "patch-target", name: "Old name", content: "Old content", autoSend: false }],
+      templates: [typedTemplate("patch-target", "Old name", "Old content")],
       recentTemplateIds: ["patch-target"],
     }));
     await templatePatchHarness.waitForMigration();
@@ -3872,7 +4032,10 @@ async function runAsyncTests() {
     assert.equal(responses.every((response) => response.ok), true);
     assert.deepEqual(templatePatchHarness.storage.templates[0], {
       id: "patch-target",
+      kind: "template",
+      parentId: null,
       name: "Edited name",
+      iconKey: "document",
       content: "Edited\n\n\ncontent",
       autoSend: true,
     });
@@ -3891,7 +4054,7 @@ async function runAsyncTests() {
   ]);
   for (const patches of [independentEditorPatches, independentEditorPatches.slice().reverse()]) {
     const independentEditorsHarness = createServiceWorkerHarness(validStorage({
-      templates: [{ id: "independent-edit", name: "Old name", content: "Old content", autoSend: false }],
+      templates: [typedTemplate("independent-edit", "Old name", "Old content")],
       recentTemplateIds: ["independent-edit"],
     }));
     await independentEditorsHarness.waitForMigration();
@@ -3903,7 +4066,10 @@ async function runAsyncTests() {
     assert.equal(responses.every((response) => response.ok), true);
     assert.deepEqual(independentEditorsHarness.storage.templates[0], {
       id: "independent-edit",
+      kind: "template",
+      parentId: null,
       name: "Name from tab A",
+      iconKey: "document",
       content: "Content from tab B",
       autoSend: false,
     });
@@ -3938,8 +4104,8 @@ async function runAsyncTests() {
 
   const recentQueueHarness = createServiceWorkerHarness(validStorage({
     templates: [
-      { id: "recent-a", name: "A", content: "A", autoSend: false },
-      { id: "recent-b", name: "B", content: "B", autoSend: false },
+      typedTemplate("recent-a", "A", "A"),
+      typedTemplate("recent-b", "B", "B"),
     ],
     recentTemplateIds: [],
   }));
@@ -4196,7 +4362,7 @@ async function runAsyncTests() {
   await verificationFailureHarness.waitForMigration();
   let templateReadCount = 0;
   verificationFailureHarness.injectLocalGetTransform(
-    (names) => names.includes("templates") && ++templateReadCount === 2,
+    (names) => names.includes("templates") && ++templateReadCount === 3,
     (result) => ({ ...result, templates: [] }),
   );
   const verificationFailure = await verificationFailureHarness.handleMessage(mergeDataMessage, optionsSender);
@@ -4204,30 +4370,61 @@ async function runAsyncTests() {
   assert.deepEqual(verificationFailureHarness.storage.templates, validStorage().templates);
 
   const orderedTemplates = [
-    { id: "template-z", name: "Z", content: "Z", autoSend: false },
-    { id: "template-a", name: "A", content: "A", autoSend: false },
+    {
+      id: "folder-ordered",
+      kind: "folder",
+      parentId: null,
+      name: "Ordered",
+      iconKey: "folder",
+    },
+    typedTemplate("template-z", "Z", "Z", false, "folder-ordered"),
+    typedTemplate("template-a", "A", "A"),
   ];
-  const orderedRollbackHarness = createServiceWorkerHarness(validStorage({ templates: orderedTemplates, recentTemplateIds: ["template-z"] }));
+  const orderedRollbackHarness = createServiceWorkerHarness(validStorage({
+    templates: orderedTemplates,
+    recentTemplateIds: ["template-z"],
+    templateTreeUiState: { collapsedFolderIds: ["folder-ordered"] },
+  }));
   await orderedRollbackHarness.waitForMigration();
   const orderedExport = await orderedRollbackHarness.handleMessage({
     type: workspaceContract.MESSAGE_TYPES.EXPORT_DATA,
   }, optionsSender);
-  assert.deepEqual(JSON.parse(orderedExport.text).payload.templates.map((item) => item.id), ["template-z", "template-a"]);
+  const orderedPortableTemplates = JSON.parse(orderedExport.text).payload.templates;
+  assert.deepEqual(orderedPortableTemplates.map((item) => item.id), [
+    "folder-ordered",
+    "template-z",
+    "template-a",
+  ]);
+  assert.deepEqual(orderedPortableTemplates.map(
+    ({ kind, parentId, iconKey }) => ({ kind, parentId, iconKey }),
+  ), [
+    { kind: "folder", parentId: null, iconKey: "folder" },
+    { kind: "template", parentId: "folder-ordered", iconKey: "document" },
+    { kind: "template", parentId: null, iconKey: "document" },
+  ]);
   let orderedTemplateReadCount = 0;
   orderedRollbackHarness.injectLocalGetTransform(
-    (names) => names.includes("templates") && ++orderedTemplateReadCount === 2,
+    (names) => names.includes("templates") && ++orderedTemplateReadCount === 3,
     (result) => ({ ...result, templates: [] }),
   );
-  const orderedRollback = await orderedRollbackHarness.handleMessage(mergeDataMessage, optionsSender);
+  const orderedRollback = await orderedRollbackHarness.handleMessage(replaceDataMessage, optionsSender);
   assert.equal(orderedRollback.rolledBack, true);
-  assert.deepEqual(orderedRollbackHarness.storage.templates.map((item) => item.id), ["template-z", "template-a"]);
+  assert.deepEqual(orderedRollbackHarness.storage.templates.map((item) => item.id), [
+    "folder-ordered",
+    "template-z",
+    "template-a",
+  ]);
   assert.deepEqual(orderedRollbackHarness.storage.recentTemplateIds, ["template-z"]);
+  assert.deepEqual(orderedRollbackHarness.storage.templateTreeUiState, {
+    collapsedFolderIds: ["folder-ordered"],
+  });
 
   async function seedInterruptedDataImport(harness, phase, mutateTemplates) {
     const workspaceSnapshot = await harness.memoryWorkspace.snapshotUserData();
     await harness.memoryWorkspace.putImportBackup("data", {
       templates: clone(harness.storage.templates),
       recentTemplateIds: clone(harness.storage.recentTemplateIds),
+      templateTreeUiState: clone(harness.storage.templateTreeUiState),
       workspace: workspaceSnapshot,
     });
     await harness.memoryWorkspace.setMetaValue("dataImportOperation", {
@@ -4240,7 +4437,11 @@ async function runAsyncTests() {
     const interruptedWorkspace = clone(workspaceSnapshot);
     interruptedWorkspace.savedItems = [{ id: `interrupted-${phase}`, text: "partial", normalizedTextKey: "partial", createdAt: 1, updatedAt: 1 }];
     await harness.memoryWorkspace.replaceUserData(interruptedWorkspace);
-    if (mutateTemplates) harness.storage.templates = clone(importedDataState.templates);
+    if (mutateTemplates) {
+      harness.storage.templates = clone(importedDataState.templates);
+      harness.storage.recentTemplateIds = [];
+      harness.storage.templateTreeUiState = { collapsedFolderIds: [] };
+    }
   }
 
   const workspacePhaseHarness = createServiceWorkerHarness(validStorage());
@@ -4469,6 +4670,7 @@ async function runAsyncTests() {
   await invalidBackupHarness.memoryWorkspace.putImportBackup("data", {
     templates: clone(invalidBackupHarness.storage.templates),
     recentTemplateIds: clone(invalidBackupHarness.storage.recentTemplateIds),
+    templateTreeUiState: clone(invalidBackupHarness.storage.templateTreeUiState),
     workspace: invalidBackupPayload,
   });
   await invalidBackupHarness.memoryWorkspace.setMetaValue("dataImportOperation", {
@@ -4510,7 +4712,7 @@ async function runAsyncTests() {
   const successfulDataApply = await successfulDataApplyHarness.handleMessage(mergeDataMessage, optionsSender);
   assert.equal(successfulDataApply.ok, true);
   assert.equal(successfulDataApplyHarness.storage.templates.some((item) => item.id === "imported-template"), true);
-  assert.equal(successfulDataApplyHarness.tabMessages.filter((item) => item.message.entityFamily === workspaceContract.ENTITY_FAMILIES.ALL).length, 1);
+  assert.equal(successfulDataApplyHarness.tabMessages.filter((item) => item.message.entityFamily === workspaceContract.ENTITY_FAMILIES.ALL).length, 0);
 
   const temporaryImportText = importExport.createDataExport({
     templates: [],

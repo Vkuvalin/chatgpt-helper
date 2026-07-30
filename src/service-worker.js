@@ -3,6 +3,7 @@
 
 importScripts(
   "workspace-contract.js",
+  "template-tree.js",
   "conversation-context.js",
   "command-registry.js",
   "import-export.js",
@@ -15,6 +16,7 @@ importScripts(
 
 const contract = globalThis.ChatGPTHelperAnalysisContract;
 const workspaceContract = globalThis.ChatGPTHelperWorkspaceContract;
+const templateTree = globalThis.ChatGPTHelperTemplateTree;
 const conversationContext = globalThis.ChatGPTHelperConversationContext;
 const commandRegistry = globalThis.ChatGPTHelperCommandRegistry;
 const importExport = globalThis.ChatGPTHelperImportExport;
@@ -71,6 +73,11 @@ const LOCAL_MUTATION_MESSAGES = new Set([
   WORKSPACE_MESSAGES.TEMPLATE_UPDATE,
   WORKSPACE_MESSAGES.TEMPLATE_DELETE,
   WORKSPACE_MESSAGES.TEMPLATE_REORDER,
+  WORKSPACE_MESSAGES.TEMPLATE_NODE_CREATE,
+  WORKSPACE_MESSAGES.TEMPLATE_NODE_UPDATE,
+  WORKSPACE_MESSAGES.TEMPLATE_NODE_MOVE,
+  WORKSPACE_MESSAGES.TEMPLATE_NODE_DELETE,
+  WORKSPACE_MESSAGES.TEMPLATE_TREE_UI_UPDATE,
   WORKSPACE_MESSAGES.RECENT_TEMPLATE_TOUCH,
   WORKSPACE_MESSAGES.SETTINGS_UPDATE,
 ]);
@@ -103,42 +110,27 @@ let deferredOrphanPersistence = Promise.resolve();
 let deferredOrphanFlushPromise = null;
 let workspaceRecoveryRequired = false;
 
-function createStableId() {
-  return contract.createId("template");
-}
-
-function normalizeTemplates(value) {
-  if (!Array.isArray(value)) return [];
-  const usedIds = new Set();
-  return value.flatMap((template) => {
-    if (!template || typeof template !== "object") return [];
-    const name = typeof template.name === "string" ? template.name : "";
-    const content = typeof template.content === "string" ? template.content : "";
-    if (!name.trim() || !content.trim()) return [];
-    let id = typeof template.id === "string" && template.id.trim() ? template.id : createStableId();
-    if (usedIds.has(id)) id = createStableId();
-    usedIds.add(id);
-    return [{ ...template, id, name, content, autoSend: template.autoSend === true }];
-  });
+function createStableId(kind) {
+  return contract.createId(kind === templateTree.NODE_KINDS.FOLDER ? "folder" : "template");
 }
 
 function normalizeSettings(value) {
   return workspaceContract.normalizeActiveSettings(value);
 }
 
-function normalizeRecentTemplateIds(value) {
-  return workspaceContract.normalizeRecentTemplateIds(value);
-}
-
 async function migrateStorage() {
-  const stored = await chrome.storage.local.get([
-    "templates", "settings", "selectedTemplate", "recentTemplateIds",
-    "glossarySchemaVersion", "glossaryEntries",
-  ]);
-  const migration = buildStorageMigrationPatch(stored);
-  if (Object.keys(migration.changes).length) await chrome.storage.local.set(migration.changes);
-  if (migration.removeSelectedTemplate) await chrome.storage.local.remove("selectedTemplate");
-  return migration;
+  const guarded = await runLocalStorageMigration(async () => {
+    const stored = await chrome.storage.local.get([
+      "templates", "settings", "selectedTemplate", "recentTemplateIds", "templateTreeUiState",
+      "glossarySchemaVersion", "glossaryEntries",
+    ]);
+    const migration = buildStorageMigrationPatch(stored);
+    if (Object.keys(migration.changes).length) await chrome.storage.local.set(migration.changes);
+    if (migration.removeSelectedTemplate) await chrome.storage.local.remove("selectedTemplate");
+    return migration;
+  });
+  if (!guarded.acquired) throw new Error("LOCAL_STORAGE_MIGRATION_BUSY");
+  return guarded.value;
 }
 
 function storageValuesEqual(left, right) {
@@ -160,13 +152,28 @@ function storageValuesEqual(left, right) {
 function buildStorageMigrationPatch(storedValue) {
   const stored = storedValue && typeof storedValue === "object" ? storedValue : {};
   const changes = {};
-  const normalizedTemplates = normalizeTemplates(stored.templates);
   const normalizedSettings = normalizeSettings(stored.settings);
-  const normalizedRecentTemplateIds = normalizeRecentTemplateIds(stored.recentTemplateIds);
-
-  if (!storageValuesEqual(stored.templates, normalizedTemplates)) changes.templates = normalizedTemplates;
   if (!storageValuesEqual(stored.settings, normalizedSettings)) changes.settings = normalizedSettings;
-  if (!storageValuesEqual(stored.recentTemplateIds, normalizedRecentTemplateIds)) changes.recentTemplateIds = normalizedRecentTemplateIds;
+
+  const preparedTemplates = templateTree.prepareStoredNodes(stored.templates);
+  if (preparedTemplates.ok) {
+    const normalizedTemplates = preparedTemplates.nodes;
+    const normalizedRecentTemplateIds = templateTree.normalizeRecentTemplateIds(
+      stored.recentTemplateIds,
+      normalizedTemplates,
+    );
+    const normalizedTreeUiState = templateTree.normalizeTreeUiState(
+      stored.templateTreeUiState,
+      normalizedTemplates,
+    );
+    if (!storageValuesEqual(stored.templates, normalizedTemplates)) changes.templates = normalizedTemplates;
+    if (!storageValuesEqual(stored.recentTemplateIds, normalizedRecentTemplateIds)) {
+      changes.recentTemplateIds = normalizedRecentTemplateIds;
+    }
+    if (!storageValuesEqual(stored.templateTreeUiState, normalizedTreeUiState)) {
+      changes.templateTreeUiState = normalizedTreeUiState;
+    }
+  }
 
   const futureGlossarySchema = Number.isInteger(stored.glossarySchemaVersion)
     && stored.glossarySchemaVersion > glossaryStore.SCHEMA_VERSION;
@@ -178,7 +185,11 @@ function buildStorageMigrationPatch(storedValue) {
     }
   }
 
-  return { changes, removeSelectedTemplate: stored.selectedTemplate !== undefined };
+  return {
+    changes,
+    removeSelectedTemplate: stored.selectedTemplate !== undefined,
+    templateTreeError: preparedTemplates.ok ? null : preparedTemplates.error,
+  };
 }
 
 function getWorkspace() {
@@ -365,7 +376,13 @@ function stableWorkspaceError(error, fallbackCode, fallbackMessage) {
 }
 
 function stableImportError(error, fallbackCode, fallbackMessage) {
-  const code = error?.message;
+  const code = error?.code || error?.message;
+  if (code === templateTree.ERROR_CODES.INVALID_STORED_STATE) {
+    return importError(
+      code,
+      "Сохранённое дерево шаблонов повреждено. Импорт в режиме объединения недоступен; используйте проверенный файл данных в режиме замены.",
+    );
+  }
   if (code === "GLOSSARY_INVARIANT_VIOLATION" || code === "GLOSSARY_IMPORT_CONFLICT") {
     return importError(code);
   }
@@ -429,95 +446,260 @@ function runLocalMutation(operation) {
   return settled;
 }
 
+function runLocalStorageMigration(operation) {
+  if (activeImport || workspaceRecoveryRequired) {
+    return Promise.resolve({ acquired: false, error: mutationBusyError() });
+  }
+  pendingLocalMutations += 1;
+  const queued = localMutationQueue.then(async () => {
+    if (activeImport || workspaceRecoveryRequired) {
+      return { acquired: false, error: mutationBusyError() };
+    }
+    return { acquired: true, value: await operation() };
+  });
+  const settled = queued.finally(() => {
+    pendingLocalMutations -= 1;
+  });
+  localMutationQueue = settled.then(() => undefined, () => undefined);
+  return settled;
+}
+
 async function currentSettings() {
   const stored = await chrome.storage.local.get("settings");
   return normalizeSettings(stored.settings);
 }
 
-async function currentDataState() {
+async function currentDataState(options) {
   const [workspace, stored] = await Promise.all([
     getWorkspace().snapshotUserData(),
     chrome.storage.local.get(["templates", "recentTemplateIds"]),
   ]);
+  const prepared = templateTree.prepareStoredNodes(stored.templates);
+  if (!prepared.ok) {
+    if (options?.allowInvalidTemplates === true) {
+      return {
+        templates: [],
+        recentTemplateIds: [],
+        templateTreeInvalid: true,
+        ...workspace,
+      };
+    }
+    const error = new Error("Stored template tree is invalid.");
+    error.code = templateTree.ERROR_CODES.INVALID_STORED_STATE;
+    throw error;
+  }
   return {
-    templates: normalizeTemplates(stored.templates),
-    recentTemplateIds: normalizeRecentTemplateIds(stored.recentTemplateIds),
+    templates: prepared.nodes,
+    recentTemplateIds: templateTree.normalizeRecentTemplateIds(
+      stored.recentTemplateIds,
+      prepared.nodes,
+    ),
     ...workspace,
   };
 }
 
-function validTemplateRecord(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (!workspaceContract.validEntityId(value.id)
-    || typeof value.name !== "string" || !value.name.trim()
-    || typeof value.content !== "string" || !value.content.trim()
-    || value.content.length > workspaceContract.MAX_TEMPLATE_LENGTH
-    || typeof value.autoSend !== "boolean") return null;
-  return { id: value.id, name: value.name, content: value.content, autoSend: value.autoSend };
+function invalidStoredTreeResponse(error) {
+  return {
+    ok: false,
+    error: {
+      code: templateTree.ERROR_CODES.INVALID_STORED_STATE,
+      message: "Сохранённое дерево шаблонов повреждено. Используйте проверенный файл данных в режиме замены; исходное состояние не будет перезаписано до подтверждённого импорта.",
+    },
+  };
+}
+
+function localTreeSnapshot(stored) {
+  const prepared = templateTree.prepareStoredNodes(stored.templates);
+  if (!prepared.ok) return invalidStoredTreeResponse(prepared.error);
+  return {
+    ok: true,
+    templates: prepared.nodes,
+    recentTemplateIds: templateTree.normalizeRecentTemplateIds(
+      stored.recentTemplateIds,
+      prepared.nodes,
+    ),
+    templateTreeUiState: templateTree.normalizeTreeUiState(
+      stored.templateTreeUiState,
+      prepared.nodes,
+    ),
+  };
+}
+
+function treeMutationError(result) {
+  return { ok: false, error: result.error };
 }
 
 async function handleLocalMutation(message) {
-  const guarded = await runLocalMutation(async () => {
-    if (message.type === WORKSPACE_MESSAGES.SETTINGS_UPDATE) {
-      const applied = workspaceContract.applyActiveSettingsPatch(await currentSettings(), message.patch);
-      if (!applied.ok) return { ok: false, error: workspaceError("INVALID_SETTINGS_PATCH") };
-      const settings = applied.settings;
-      await chrome.storage.local.set({ settings });
-      return { ok: true, settings };
-    }
+  try {
+    const guarded = await runLocalMutation(async () => {
+      if (message.type === WORKSPACE_MESSAGES.SETTINGS_UPDATE) {
+        const applied = workspaceContract.applyActiveSettingsPatch(await currentSettings(), message.patch);
+        if (!applied.ok) return { ok: false, error: workspaceError("INVALID_SETTINGS_PATCH") };
+        const settings = applied.settings;
+        await chrome.storage.local.set({ settings });
+        return { ok: true, settings };
+      }
 
-    const stored = await chrome.storage.local.get(["templates", "recentTemplateIds"]);
-    const templates = normalizeTemplates(stored.templates);
-    let recentTemplateIds = normalizeRecentTemplateIds(stored.recentTemplateIds)
-      .filter((id) => templates.some((template) => template.id === id));
+      const stored = await chrome.storage.local.get([
+        "templates",
+        "recentTemplateIds",
+        "templateTreeUiState",
+      ]);
+      const snapshot = localTreeSnapshot(stored);
+      if (!snapshot.ok) return snapshot;
+      let templates = snapshot.templates;
+      let recentTemplateIds = snapshot.recentTemplateIds;
+      let templateTreeUiState = snapshot.templateTreeUiState;
+      let result = null;
+      let extras = {};
 
-    if (message.type === WORKSPACE_MESSAGES.TEMPLATE_CREATE) {
-      const template = validTemplateRecord(message.template);
-      if (!template || templates.some((item) => item.id === template.id)) {
-        return { ok: false, error: workspaceError("INVALID_TEMPLATE") };
+      if (message.type === WORKSPACE_MESSAGES.TEMPLATE_NODE_CREATE) {
+        result = templateTree.createNode(templates, {
+          id: createStableId(message.draft?.kind),
+          draft: message.draft,
+          targetParentId: message.targetParentId,
+          beforeNodeId: message.beforeNodeId,
+        });
+        if (result.ok) extras.createdNodeId = result.createdNodeId;
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_NODE_UPDATE) {
+        result = templateTree.updateNode(templates, {
+          nodeId: message.nodeId,
+          patch: message.patch,
+          placement: message.placement,
+        });
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_NODE_MOVE) {
+        result = templateTree.moveNode(templates, {
+          nodeId: message.nodeId,
+          targetParentId: message.targetParentId,
+          beforeNodeId: message.beforeNodeId,
+        });
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_NODE_DELETE) {
+        result = templateTree.deleteNode(templates, {
+          nodeId: message.nodeId,
+          mode: message.mode,
+        });
+        if (result.ok) {
+          extras = {
+            removedFolderCount: result.removedFolderCount,
+            removedTemplateCount: result.removedTemplateCount,
+          };
+        }
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_TREE_UI_UPDATE) {
+        const requestedState = message.templateTreeUiState
+          ?? { collapsedFolderIds: message.collapsedFolderIds };
+        templateTreeUiState = templateTree.normalizeTreeUiState(requestedState, templates);
+        result = {
+          ok: true,
+          nodes: templates,
+          changed: !storageValuesEqual(snapshot.templateTreeUiState, templateTreeUiState),
+        };
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_CREATE) {
+        const legacy = message.template;
+        result = legacy && typeof legacy === "object"
+          ? templateTree.createNode(templates, {
+            id: legacy.id,
+            draft: {
+              kind: templateTree.NODE_KINDS.TEMPLATE,
+              name: legacy.name,
+              iconKey: templateTree.DEFAULT_TEMPLATE_ICON,
+              content: legacy.content,
+              autoSend: legacy.autoSend,
+            },
+            targetParentId: null,
+            beforeNodeId: null,
+          })
+          : { ok: false };
+        if (!result.ok) return { ok: false, error: workspaceError("INVALID_TEMPLATE") };
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_UPDATE) {
+        const current = templateTree.findNode(templates, message.templateId);
+        const validated = workspaceContract.validateTemplatePatch(message.patch);
+        if (!current || current.kind !== templateTree.NODE_KINDS.TEMPLATE || !validated.ok) {
+          return { ok: false, error: workspaceError("INVALID_TEMPLATE_PATCH") };
+        }
+        result = templateTree.updateNode(templates, {
+          nodeId: message.templateId,
+          patch: validated.patch,
+        });
+        if (!result.ok) return { ok: false, error: workspaceError("INVALID_TEMPLATE_PATCH") };
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_DELETE) {
+        const current = templateTree.findNode(templates, message.templateId);
+        if (!current || current.kind !== templateTree.NODE_KINDS.TEMPLATE) {
+          return { ok: false, error: workspaceError("INVALID_TEMPLATE") };
+        }
+        result = templateTree.deleteNode(templates, {
+          nodeId: message.templateId,
+          mode: "node",
+        });
+      } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_REORDER) {
+        if (templates.some((node) => node.kind === templateTree.NODE_KINDS.FOLDER)) {
+          return {
+            ok: false,
+            error: {
+              code: templateTree.ERROR_CODES.RELOAD_REQUIRED,
+              message: "Перезагрузите вкладку, чтобы использовать дерево шаблонов.",
+            },
+          };
+        }
+        const ids = Array.isArray(message.templateIds) ? message.templateIds : [];
+        const byId = new Map(templates.map((node) => [node.id, node]));
+        if (ids.length !== templates.length || new Set(ids).size !== ids.length
+          || ids.some((id) => !byId.has(id))) {
+          return { ok: false, error: workspaceError("INVALID_TEMPLATE_ORDER") };
+        }
+        const reordered = ids.map((id) => byId.get(id));
+        result = {
+          ok: true,
+          nodes: reordered,
+          changed: !templateTree.nodesEqual(templates, reordered),
+        };
+      } else if (message.type === WORKSPACE_MESSAGES.RECENT_TEMPLATE_TOUCH) {
+        const current = templateTree.findNode(templates, message.templateId);
+        if (!current || current.kind !== templateTree.NODE_KINDS.TEMPLATE) {
+          return { ok: false, error: workspaceError("INVALID_TEMPLATE") };
+        }
+        recentTemplateIds = templateTree.normalizeRecentTemplateIds(
+          [message.templateId, ...recentTemplateIds],
+          templates,
+        );
+        result = {
+          ok: true,
+          nodes: templates,
+          changed: !storageValuesEqual(snapshot.recentTemplateIds, recentTemplateIds),
+        };
+      } else {
+        return { ok: false, error: workspaceError("INVALID_LOCAL_MUTATION") };
       }
-      templates.push(template);
-    } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_UPDATE) {
-      const validated = workspaceContract.validateTemplatePatch(message.patch);
-      const index = workspaceContract.validEntityId(message.templateId)
-        ? templates.findIndex((item) => item.id === message.templateId)
-        : -1;
-      const template = validated.ok && index >= 0
-        ? validTemplateRecord({ ...templates[index], ...validated.patch })
-        : null;
-      if (!template) return { ok: false, error: workspaceError("INVALID_TEMPLATE_PATCH") };
-      templates[index] = template;
-    } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_DELETE) {
-      if (!workspaceContract.validEntityId(message.templateId)) {
-        return { ok: false, error: workspaceError("INVALID_TEMPLATE") };
-      }
-      const index = templates.findIndex((item) => item.id === message.templateId);
-      if (index < 0) return { ok: false, error: workspaceError("INVALID_TEMPLATE") };
-      templates.splice(index, 1);
-      recentTemplateIds = recentTemplateIds.filter((id) => id !== message.templateId);
-    } else if (message.type === WORKSPACE_MESSAGES.TEMPLATE_REORDER) {
-      const ids = Array.isArray(message.templateIds) ? message.templateIds : [];
-      if (ids.length !== templates.length || new Set(ids).size !== ids.length
-        || ids.some((id) => !workspaceContract.validEntityId(id))
-        || ids.some((id) => !templates.some((template) => template.id === id))) {
-        return { ok: false, error: workspaceError("INVALID_TEMPLATE_ORDER") };
-      }
-      const byId = new Map(templates.map((template) => [template.id, template]));
-      templates.splice(0, templates.length, ...ids.map((id) => byId.get(id)));
-    } else if (message.type === WORKSPACE_MESSAGES.RECENT_TEMPLATE_TOUCH) {
-      if (!workspaceContract.validEntityId(message.templateId)
-        || !templates.some((template) => template.id === message.templateId)) {
-        return { ok: false, error: workspaceError("INVALID_TEMPLATE") };
-      }
-      recentTemplateIds = normalizeRecentTemplateIds([message.templateId, ...recentTemplateIds]);
-    } else {
-      return { ok: false, error: workspaceError("INVALID_LOCAL_MUTATION") };
-    }
 
-    await chrome.storage.local.set({ templates, recentTemplateIds });
-    return { ok: true, templates, recentTemplateIds };
-  });
-  return guarded.acquired ? guarded.value : { ok: false, error: guarded.error };
+      if (!result.ok) return treeMutationError(result);
+      templates = result.nodes;
+      recentTemplateIds = templateTree.normalizeRecentTemplateIds(recentTemplateIds, templates);
+      templateTreeUiState = templateTree.normalizeTreeUiState(templateTreeUiState, templates);
+      const changes = {};
+      if (!storageValuesEqual(stored.templates, templates)) changes.templates = templates;
+      if (!storageValuesEqual(stored.recentTemplateIds, recentTemplateIds)) {
+        changes.recentTemplateIds = recentTemplateIds;
+      }
+      if (!storageValuesEqual(stored.templateTreeUiState, templateTreeUiState)) {
+        changes.templateTreeUiState = templateTreeUiState;
+      }
+      if (Object.keys(changes).length) await chrome.storage.local.set(changes);
+      return {
+        ok: true,
+        templates,
+        recentTemplateIds,
+        templateTreeUiState,
+        changed: Object.keys(changes).length > 0,
+        ...extras,
+      };
+    });
+    return guarded.acquired ? guarded.value : { ok: false, error: guarded.error };
+  } catch (error) {
+    if (message.type === WORKSPACE_MESSAGES.SETTINGS_UPDATE) throw error;
+    return {
+      ok: false,
+      error: workspaceError("LOCAL_MUTATION_FAILED", "Не удалось сохранить локальные данные."),
+    };
+  }
 }
 
 async function durableImportMarker() {
@@ -592,31 +774,68 @@ async function rollbackSettingsBackup() {
 function assertDataBackupValid(backup) {
   const payload = backup?.payload;
   const workspace = payload?.workspace;
-  if (!payload || !workspace || !Array.isArray(payload.templates)
-    || !Array.isArray(payload.recentTemplateIds)
+  const invalidTemplateTree = payload?.templateTreeInvalid === true;
+  const hasTemplates = Boolean(payload)
+    && Object.prototype.hasOwnProperty.call(payload, "templates");
+  const hasRecent = Boolean(payload)
+    && Object.prototype.hasOwnProperty.call(payload, "recentTemplateIds");
+  const hasTreeUiState = Boolean(payload)
+    && Object.prototype.hasOwnProperty.call(payload, "templateTreeUiState");
+  if (!payload || !workspace || !hasTemplates || !hasRecent
+    || (!invalidTemplateTree
+      && (!Array.isArray(payload.templates) || !Array.isArray(payload.recentTemplateIds)))
+    || (invalidTemplateTree && !hasTreeUiState)
     || workspaceStoreModule.USER_STORE_NAMES.some((name) => !Array.isArray(workspace[name]))) {
     throw new Error("DATA_BACKUP_MISSING");
   }
   workspaceStoreModule.assertGlossaryInvariant(workspace);
-  if (!storageValuesEqual(payload.templates, normalizeTemplates(payload.templates))
-    || !storageValuesEqual(
+  let normalizedLocal;
+  if (invalidTemplateTree) {
+    normalizedLocal = {
+      templates: payload.templates,
+      recentTemplateIds: payload.recentTemplateIds,
+      templateTreeUiState: payload.templateTreeUiState,
+      invalidTemplateTree: true,
+    };
+  } else {
+    const preparedTemplates = templateTree.prepareStoredNodes(payload.templates);
+    if (!preparedTemplates.ok) {
+      throw new Error("DATA_BACKUP_INVALID");
+    }
+    const normalizedRecentTemplateIds = templateTree.normalizeRecentTemplateIds(
       payload.recentTemplateIds,
-      normalizeRecentTemplateIds(payload.recentTemplateIds),
-    )) {
-    throw new Error("DATA_BACKUP_INVALID");
-  }
-  try {
-    const portable = importExport.createDataExport(
-      { templates: payload.templates, ...workspace },
-      {
-        datasetId: "00000000-0000-4000-8000-000000000000",
-        exportedAt: "2000-01-01T00:00:00.000Z",
-      },
+      preparedTemplates.nodes,
     );
-    const validated = importExport.validateDataText(portable.text);
-    if (!validated.ok) throw new Error(validated.errors[0]?.code || "DATA_BACKUP_INVALID");
-  } catch (_) {
-    throw new Error("DATA_BACKUP_INVALID");
+    const normalizedTreeUiState = templateTree.normalizeTreeUiState(
+      payload.templateTreeUiState,
+      preparedTemplates.nodes,
+    );
+    const rollingLegacyBackup = !hasTreeUiState;
+    if ((!rollingLegacyBackup
+      && !storageValuesEqual(payload.recentTemplateIds, normalizedRecentTemplateIds))
+      || (hasTreeUiState
+        && !storageValuesEqual(payload.templateTreeUiState, normalizedTreeUiState))) {
+      throw new Error("DATA_BACKUP_INVALID");
+    }
+    normalizedLocal = {
+      templates: preparedTemplates.nodes,
+      recentTemplateIds: normalizedRecentTemplateIds,
+      templateTreeUiState: normalizedTreeUiState,
+      invalidTemplateTree: false,
+    };
+    try {
+      const portable = importExport.createDataExport(
+        { templates: preparedTemplates.nodes, ...workspace },
+        {
+          datasetId: "00000000-0000-4000-8000-000000000000",
+          exportedAt: "2000-01-01T00:00:00.000Z",
+        },
+      );
+      const validated = importExport.validateDataText(portable.text);
+      if (!validated.ok) throw new Error(validated.errors[0]?.code || "DATA_BACKUP_INVALID");
+    } catch (_) {
+      throw new Error("DATA_BACKUP_INVALID");
+    }
   }
 
   const conversationIds = new Set();
@@ -664,24 +883,43 @@ function assertDataBackupValid(backup) {
       orders.add(order);
     });
   });
-  return true;
+  return {
+    ...normalizedLocal,
+    workspace,
+  };
 }
 
 async function rollbackDataBackup(shouldBroadcast) {
   const workspace = getWorkspace();
   const backup = await workspace.getImportBackup("data");
-  assertDataBackupValid(backup);
-  const restored = await workspace.replaceUserData(backup.payload.workspace);
+  const normalizedBackup = assertDataBackupValid(backup);
+  const restored = await workspace.replaceUserData(normalizedBackup.workspace);
   await chrome.storage.local.set({
-    templates: normalizeTemplates(backup.payload.templates),
-    recentTemplateIds: normalizeRecentTemplateIds(backup.payload.recentTemplateIds),
+    templates: normalizedBackup.templates,
+    recentTemplateIds: normalizedBackup.recentTemplateIds,
+    templateTreeUiState: normalizedBackup.templateTreeUiState,
   });
-  const readBack = await currentDataState();
-  const expected = { templates: normalizeTemplates(backup.payload.templates), ...backup.payload.workspace };
-  if (!importExport.canonicalDataEqual(expected, readBack)
+  const [workspaceReadBack, localReadBack] = await Promise.all([
+    workspace.snapshotUserData(),
+    chrome.storage.local.get([
+      "templates",
+      "recentTemplateIds",
+      "templateTreeUiState",
+    ]),
+  ]);
+  const workspaceMatches = importExport.canonicalDataEqual(
+    { templates: [], ...normalizedBackup.workspace },
+    { templates: [], ...workspaceReadBack },
+  );
+  if (!workspaceMatches
+    || !storageValuesEqual(normalizedBackup.templates, localReadBack.templates)
     || !storageValuesEqual(
-      normalizeRecentTemplateIds(backup.payload.recentTemplateIds),
-      readBack.recentTemplateIds,
+      normalizedBackup.recentTemplateIds,
+      localReadBack.recentTemplateIds,
+    )
+    || !storageValuesEqual(
+      normalizedBackup.templateTreeUiState,
+      localReadBack.templateTreeUiState,
     )) {
     throw new Error("DATA_ROLLBACK_VERIFICATION_FAILED");
   }
@@ -793,22 +1031,34 @@ async function applySettingsImport(message) {
 }
 
 async function exportData() {
-  const current = await currentDataState();
-  const result = importExport.createDataExport(current, {
-    datasetId: crypto.randomUUID(),
-    extensionVersion: chrome.runtime.getManifest().version,
-  });
-  return { ok: true, filename: result.filename, text: result.text };
+  try {
+    const current = await currentDataState();
+    const result = importExport.createDataExport(current, {
+      datasetId: crypto.randomUUID(),
+      extensionVersion: chrome.runtime.getManifest().version,
+    });
+    return { ok: true, filename: result.filename, text: result.text };
+  } catch (error) {
+    if (error?.code === templateTree.ERROR_CODES.INVALID_STORED_STATE) {
+      return {
+        ...invalidStoredTreeResponse(error),
+        recoveryAvailable: true,
+      };
+    }
+    throw error;
+  }
 }
 
 async function previewDataImport(message) {
   if (workspaceRecoveryRequired) return { ok: false, recoveryRequired: true, error: importError("RECOVERY_REQUIRED") };
   const validated = importExport.validateDataText(message.text);
   if (!validated.ok) return { ok: false, error: importError(validated.errors[0]?.code, "Файл данных не прошёл проверку."), details: validated.errors };
+  let current;
   let plan;
   try {
+    current = await currentDataState({ allowInvalidTemplates: message.mode === "replace" });
     plan = await importExport.buildDataPlan(
-      await currentDataState(),
+      current,
       validated,
       message.mode,
       crypto,
@@ -821,8 +1071,18 @@ async function previewDataImport(message) {
     preview: {
       metadata: { format: validated.envelope.format, schemaVersion: validated.envelope.schemaVersion, workspaceSchemaVersion: validated.envelope.workspaceSchemaVersion, datasetId: validated.envelope.datasetId, exportedAt: validated.envelope.exportedAt },
       ...plan.preview,
-      warnings: validated.warnings,
+      warnings: [
+        ...validated.warnings,
+        ...(current.templateTreeInvalid === true
+          ? [{
+            code: "CURRENT_TEMPLATE_TREE_INVALID",
+            path: "current.templates",
+            recovery: "replace",
+          }]
+          : []),
+      ],
     },
+    recoveryAvailable: current.templateTreeInvalid === true,
   };
 }
 
@@ -833,11 +1093,37 @@ async function applyDataImport(message) {
   try {
     const validated = importExport.validateDataText(message.text);
     if (!validated.ok) return { ok: false, error: importError(validated.errors[0]?.code, "Файл данных не прошёл повторную проверку.") };
-    const current = await currentDataState();
-    const plan = await importExport.buildDataPlan(current, validated, message.mode, crypto);
+    const requestedMode = message.mode === "replace" ? "replace" : "merge";
+    const currentLocal = await chrome.storage.local.get([
+      "templates",
+      "recentTemplateIds",
+      "templateTreeUiState",
+    ]);
+    const preparedCurrentTemplates = templateTree.prepareStoredNodes(currentLocal.templates);
+    const current = await currentDataState({
+      allowInvalidTemplates: requestedMode === "replace",
+    });
+    const plan = await importExport.buildDataPlan(current, validated, requestedMode, crypto);
+    const currentTreeUiState = preparedCurrentTemplates.ok
+      ? templateTree.normalizeTreeUiState(
+        currentLocal.templateTreeUiState,
+        preparedCurrentTemplates.nodes,
+      )
+      : { collapsedFolderIds: [] };
+    const invalidCurrentTemplateTree = !preparedCurrentTemplates.ok;
     await getWorkspace().putImportBackup("data", {
-      templates: current.templates,
-      recentTemplateIds: current.recentTemplateIds,
+      templateTreeInvalid: invalidCurrentTemplateTree,
+      templates: invalidCurrentTemplateTree ? currentLocal.templates : current.templates,
+      recentTemplateIds: invalidCurrentTemplateTree
+        ? (Object.prototype.hasOwnProperty.call(currentLocal, "recentTemplateIds")
+          ? currentLocal.recentTemplateIds
+          : [])
+        : current.recentTemplateIds,
+      templateTreeUiState: invalidCurrentTemplateTree
+        ? (Object.prototype.hasOwnProperty.call(currentLocal, "templateTreeUiState")
+          ? currentLocal.templateTreeUiState
+          : { collapsedFolderIds: [] })
+        : currentTreeUiState,
       workspace: Object.fromEntries(workspaceStoreModule.USER_STORE_NAMES.map((name) => [name, current[name]])),
     });
     const marker = { operationId: token.operationId, kind: "data", mode: plan.mode, datasetId: validated.envelope.datasetId, phase: "prepared", startedAt: token.startedAt };
@@ -847,25 +1133,46 @@ async function applyDataImport(message) {
       ? await getWorkspace().replaceUserData(plan.state)
       : await getWorkspace().mergeUserData(plan.state);
     await getWorkspace().setMetaValue(IMPORT_MARKERS.data, { ...marker, phase: "workspace-applied" });
-    const localUpdate = { templates: normalizeTemplates(plan.state.templates) };
-    if (plan.mode === "replace") localUpdate.recentTemplateIds = [];
-    const localChanged = !storageValuesEqual(current.templates, localUpdate.templates)
-      || (Object.prototype.hasOwnProperty.call(localUpdate, "recentTemplateIds")
-        && !storageValuesEqual(current.recentTemplateIds, localUpdate.recentTemplateIds));
+    const preparedPlanTemplates = templateTree.validateTypedNodes(plan.state.templates);
+    if (!preparedPlanTemplates.ok) throw new Error("DATA_IMPORT_TEMPLATE_TREE_INVALID");
+    const localUpdate = {
+      templates: preparedPlanTemplates.nodes,
+      recentTemplateIds: plan.mode === "replace"
+        ? []
+        : templateTree.normalizeRecentTemplateIds(current.recentTemplateIds, preparedPlanTemplates.nodes),
+      templateTreeUiState: plan.mode === "replace"
+        ? { collapsedFolderIds: [] }
+        : templateTree.normalizeTreeUiState(currentTreeUiState, preparedPlanTemplates.nodes),
+    };
     await chrome.storage.local.set(localUpdate);
     await getWorkspace().setMetaValue(IMPORT_MARKERS.data, { ...marker, phase: "templates-applied" });
-    const readBack = await currentDataState();
-    const expectedRecentTemplateIds = plan.mode === "replace"
-      ? []
-      : current.recentTemplateIds;
-    if (!importExport.canonicalDataEqual(plan.expectedCanonical, readBack)
-      || !storageValuesEqual(expectedRecentTemplateIds, readBack.recentTemplateIds)) {
+    const [workspaceReadBack, localReadBack] = await Promise.all([
+      getWorkspace().snapshotUserData(),
+      chrome.storage.local.get([
+        "templates",
+        "recentTemplateIds",
+        "templateTreeUiState",
+      ]),
+    ]);
+    if (!importExport.canonicalDataEqual(
+      plan.expectedCanonical,
+      { templates: localReadBack.templates, ...workspaceReadBack },
+    )
+      || !storageValuesEqual(localUpdate.templates, localReadBack.templates)
+      || !storageValuesEqual(
+        localUpdate.recentTemplateIds,
+        localReadBack.recentTemplateIds,
+      )
+      || !storageValuesEqual(
+        localUpdate.templateTreeUiState,
+        localReadBack.templateTreeUiState,
+      )) {
       throw new Error("DATA_IMPORT_VERIFICATION_FAILED");
     }
     await getWorkspace().setMetaValue("lastImportAt", Date.now());
     await getWorkspace().deleteMetaValue(IMPORT_MARKERS.data);
     workspaceRecoveryRequired = false;
-    if (workspaceResult.changed || localChanged) {
+    if (workspaceResult.changed) {
       await broadcastWorkspaceChange(
         workspaceContract.ENTITY_FAMILIES.ALL,
         null,
@@ -1321,13 +1628,15 @@ async function handleMessage(message, sender) {
     return handleTranslation(message, sender);
   }
   if (LOCAL_MUTATION_MESSAGES.has(message.type)) {
-    try {
-      await ensureMigrated();
-    } catch (_) {
+    if (message.type === WORKSPACE_MESSAGES.SETTINGS_UPDATE) {
       try {
-        if (await durableImportMarker()) workspaceRecoveryRequired = true;
-      } catch (_) {}
-      if (workspaceRecoveryRequired) return { ok: false, error: mutationBusyError() };
+        await ensureMigrated();
+      } catch (_) {
+        try {
+          if (await durableImportMarker()) workspaceRecoveryRequired = true;
+        } catch (_) {}
+        if (workspaceRecoveryRequired) return { ok: false, error: mutationBusyError() };
+      }
     }
     return handleLocalMutation(message);
   }

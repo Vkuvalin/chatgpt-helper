@@ -11,9 +11,16 @@ const conversations = require("../src/conversation-context.js");
 const commands = require("../src/command-registry.js");
 const workspaceStore = require("../src/workspace-store.js");
 const workspaceUi = require("../src/workspace-ui.js");
+const templateTree = require("../src/template-tree.js");
 const importExport = require("../src/import-export.js");
 const asyncBoundaryTests = [];
 const serviceWorkerSource = fs.readFileSync(path.join(__dirname, "../src/service-worker.js"), "utf8");
+const contentScriptSource = fs.readFileSync(path.join(__dirname, "../src/content-script.js"), "utf8");
+const importExportSource = fs.readFileSync(path.join(__dirname, "../src/import-export.js"), "utf8");
+const workspaceUiSource = fs.readFileSync(path.join(__dirname, "../src/workspace-ui.js"), "utf8");
+const optionsHtmlSource = fs.readFileSync(path.join(__dirname, "../src/options.html"), "utf8");
+const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8"));
+const packageLock = JSON.parse(fs.readFileSync(path.join(__dirname, "../package-lock.json"), "utf8"));
 
 const translationHandlerSource = serviceWorkerSource.slice(
   serviceWorkerSource.indexOf("async function handleTranslation"),
@@ -51,6 +58,585 @@ function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
+function folderNode(id, name, parentId = null, iconKey = templateTree.DEFAULT_FOLDER_ICON) {
+  return { id, kind: templateTree.NODE_KINDS.FOLDER, parentId, name, iconKey };
+}
+
+function templateNode(
+  id,
+  name,
+  content,
+  autoSend = false,
+  parentId = null,
+  iconKey = templateTree.DEFAULT_TEMPLATE_ICON,
+) {
+  return {
+    id,
+    kind: templateTree.NODE_KINDS.TEMPLATE,
+    parentId,
+    name,
+    iconKey,
+    content,
+    autoSend,
+  };
+}
+
+function createTemplateMutationRuntime(initialStorage) {
+  const storage = clone(initialStorage);
+  const setCalls = [];
+  const forbiddenCalls = [];
+  let nextId = 0;
+  const chrome = {
+    storage: {
+      local: {
+        async get(keysValue) {
+          const keys = Array.isArray(keysValue) ? keysValue : [keysValue];
+          return Object.fromEntries(keys
+            .filter((key) => Object.prototype.hasOwnProperty.call(storage, key))
+            .map((key) => [key, clone(storage[key])]));
+        },
+        async set(changes) {
+          const copied = clone(changes);
+          setCalls.push(copied);
+          Object.assign(storage, copied);
+        },
+      },
+    },
+  };
+  const context = vm.createContext({
+    chrome,
+    contract: {
+      createId(prefix) {
+        nextId += 1;
+        return `${prefix}-runtime-${nextId}`;
+      },
+    },
+    templateTree,
+    workspaceContract: workspace,
+    WORKSPACE_MESSAGES: workspace.MESSAGE_TYPES,
+    activeImport: null,
+    workspaceRecoveryRequired: false,
+    pendingLocalMutations: 0,
+    localMutationQueue: Promise.resolve(),
+    activeUserMutations: new Set(),
+    deferredOrphanTabIds: new Set(),
+    beginUserMutation() { return {}; },
+    endUserMutation() {},
+    mutationBusyError() { return { code: "MUTATION_BUSY" }; },
+    flushDeferredOrphans() { return Promise.resolve(); },
+    workspaceError(code, message) {
+      return { code, message: message || "Workspace must remain untouched." };
+    },
+    getWorkspace() {
+      forbiddenCalls.push("workspace");
+      throw new Error("WORKSPACE_FORBIDDEN");
+    },
+    broadcastWorkspaceChange() {
+      forbiddenCalls.push("broadcast");
+      throw new Error("BROADCAST_FORBIDDEN");
+    },
+    openRouterClient: new Proxy({}, {
+      get() {
+        forbiddenCalls.push("provider");
+        throw new Error("PROVIDER_FORBIDDEN");
+      },
+    }),
+  });
+  const sourceParts = [
+    serviceWorkerSource.slice(
+      serviceWorkerSource.indexOf("function createStableId"),
+      serviceWorkerSource.indexOf("function normalizeSettings"),
+    ),
+    serviceWorkerSource.slice(
+      serviceWorkerSource.indexOf("function storageValuesEqual"),
+      serviceWorkerSource.indexOf("function buildStorageMigrationPatch"),
+    ),
+    serviceWorkerSource.slice(
+      serviceWorkerSource.indexOf("function runLocalMutation"),
+      serviceWorkerSource.indexOf("function runLocalStorageMigration"),
+    ),
+    serviceWorkerSource.slice(
+      serviceWorkerSource.indexOf("function invalidStoredTreeResponse"),
+      serviceWorkerSource.indexOf("async function durableImportMarker"),
+    ),
+  ];
+  assert.equal(sourceParts.every((part) => part.trim().length > 0), true);
+  vm.runInContext(
+    `${sourceParts.join("\n")}\nglobalThis.__templateMutationRuntime = { handleLocalMutation };`,
+    context,
+  );
+  return {
+    handle: context.__templateMutationRuntime.handleLocalMutation,
+    storage,
+    setCalls,
+    forbiddenCalls,
+  };
+}
+
+function createTemplateDropIntentRuntime(templates, draggingNodeId) {
+  const state = {
+    templates: clone(templates),
+    templateTreeDrag: {
+      draggingNodeId,
+      invalidError: null,
+    },
+  };
+  const context = vm.createContext({
+    state,
+    templateTree,
+    workspaceUiModule: workspaceUi,
+  });
+  const source = contentScriptSource.slice(
+    contentScriptSource.indexOf("function nextTemplateSiblingId"),
+    contentScriptSource.indexOf("function showTemplateDropIntent"),
+  );
+  assert.equal(source.trim().length > 0, true);
+  vm.runInContext(
+    `${source}\nglobalThis.__templateDropIntent = templateDropIntent;`,
+    context,
+  );
+  return function evaluateTemplateDropIntent(event) {
+    return clone(context.__templateDropIntent(event));
+  };
+}
+
+function createTestClassList(initialValues) {
+  const values = new Set(initialValues || []);
+  return {
+    add(...names) {
+      names.forEach((name) => values.add(name));
+    },
+    remove(...names) {
+      names.forEach((name) => values.delete(name));
+    },
+    contains(name) {
+      return values.has(name);
+    },
+  };
+}
+
+function createTemplateDragUiRuntime(templates) {
+  const rootTarget = {
+    classList: createTestClassList(),
+    closest(selector) {
+      return selector === "[data-template-root-target]" ? this : null;
+    },
+  };
+  const rootChild = {
+    closest(selector) {
+      return selector === "[data-template-root-target]" ? rootTarget : null;
+    },
+  };
+  const rootList = {
+    closest(selector) {
+      return selector === ".templates-list" ? this : null;
+    },
+  };
+  const slot = {
+    classList: createTestClassList(),
+    dataset: { templateSlotId: "drop-template" },
+  };
+  const templateCard = { classList: createTestClassList() };
+  const savedCard = { classList: createTestClassList() };
+  const glossaryCard = { classList: createTestClassList() };
+  const body = { classList: createTestClassList() };
+  const state = {
+    activeSection: "templates",
+    body,
+    shadow: null,
+    sidebarResizing: false,
+    glossarySearch: "",
+    glossaryRequestedMode: "local",
+    glossaryDraggingId: null,
+    savedSearch: "",
+    savedRequestedMode: "local",
+    savedDraggingId: null,
+    editing: null,
+    status: { kind: "", text: "" },
+    templateDeleteId: null,
+    folderDelete: { nodeId: null, phase: "closed" },
+    preview: { anchor: null },
+    movedIntent: null,
+    templates: clone(templates),
+    templateTreeDrag: {
+      draggingNodeId: null,
+      intent: null,
+      hoverFolderId: null,
+      hoverTimer: null,
+      temporarilyExpandedFolderIds: [],
+      invalidError: null,
+    },
+  };
+  state.shadow = {
+    querySelector(selector) {
+      return selector === "[data-template-root-target]" ? rootTarget : null;
+    },
+    querySelectorAll(selector) {
+      if (selector === "[data-template-slot-id]") return [slot];
+      if (selector === ".template-card.is-dragging") return [templateCard];
+      if (selector === ".delete-confirm") return [];
+      if (selector.includes(".template-node-slot.is-drop-before")) return [slot, rootTarget];
+      return [];
+    },
+  };
+  const context = vm.createContext({
+    state,
+    templateTree,
+    workspaceUiModule: workspaceUi,
+    clearTimeout() {},
+    removeTemporaryTemplateExpansionMarkup() {},
+    closeTemplatePreview() {},
+    closeRecentPopup() {},
+    closedFolderDeleteState() {
+      return { nodeId: null, phase: "closed" };
+    },
+    editorOpen() {
+      return state.editing !== null;
+    },
+    setTemporaryTemplateExpansions(folderIds) {
+      state.templateTreeDrag.temporarilyExpandedFolderIds = [...folderIds];
+    },
+    scheduleTemplateFolderAutoExpand() {},
+    reconcileWorkspaceDeleteEntry() {},
+    applyShellState() {},
+    templatesMarkup() {
+      return "<div></div>";
+    },
+    analysisMarkup() {
+      return "";
+    },
+    savedMarkup() {
+      return "";
+    },
+    settingsMarkup() {
+      return "";
+    },
+    restorePendingTemplateFocus() {},
+    moveTemplateNode(intent) {
+      state.movedIntent = intent;
+      return Promise.resolve();
+    },
+    reorderGlossaryEntries() {
+      return Promise.resolve();
+    },
+    reorderSavedEntries() {
+      return Promise.resolve();
+    },
+    templateMutationErrorText(error) {
+      return error?.message || "";
+    },
+    handleUiError() {},
+  });
+  const sourceParts = [
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function clearTemplateDropIndicators"),
+      contentScriptSource.indexOf("function effectiveCollapsedFolderIds"),
+    ),
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function nextTemplateSiblingId"),
+      contentScriptSource.indexOf("function removeTemporaryTemplateExpansionMarkup"),
+    ),
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function clearTemplateDragIntent"),
+      contentScriptSource.indexOf("function templateIntentFolderPath"),
+    ),
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function renderSection"),
+      contentScriptSource.indexOf("function openSection"),
+    ),
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function onDragStart"),
+      contentScriptSource.indexOf("function onDragEnd"),
+    ),
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function onDragEnd"),
+      contentScriptSource.indexOf("function onDragOver"),
+    ),
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function onDragOver"),
+      contentScriptSource.indexOf("function onDragLeave"),
+    ),
+    contentScriptSource.slice(
+      contentScriptSource.indexOf("function onDrop"),
+      contentScriptSource.indexOf("function mount"),
+    ),
+  ];
+  assert.equal(sourceParts.every((part) => part.trim().length > 0), true);
+  vm.runInContext(
+    `${sourceParts.join("\n")}
+      globalThis.__templateDragUiRuntime = {
+        cleanupTemplateTreeDrag,
+        onDragEnd,
+        onDragOver,
+        onDragStart,
+        onDrop,
+        renderSection,
+        setTemplateRootDropZoneVisible,
+        showTemplateDropIntent,
+      };`,
+    context,
+  );
+
+  function dragStart(kind) {
+    const structural = kind === "template" || kind === "folder";
+    const handle = {
+      dataset: structural
+        ? { templateDragId: kind === "folder" ? "drop-folder" : "drop-drag" }
+        : kind === "saved"
+          ? { savedDragId: "saved-drag" }
+          : { glossaryDragId: "glossary-drag" },
+      closest(selector) {
+        if (structural && selector === ".template-card") return templateCard;
+        if (kind === "saved" && selector === ".saved-card") return savedCard;
+        if (kind === "glossary" && selector === ".glossary-card") return glossaryCard;
+        return null;
+      },
+    };
+    let prevented = false;
+    const dataTransfer = {
+      dropEffect: "none",
+      effectAllowed: "none",
+      values: {},
+      setData(type, value) {
+        this.values[type] = value;
+      },
+    };
+    const event = {
+      dataTransfer,
+      preventDefault() {
+        prevented = true;
+      },
+      target: {
+        closest(selector) {
+          if (structural && selector === "[data-template-drag-id]") return handle;
+          if (kind === "saved" && selector === "[data-saved-drag-id]") return handle;
+          if (kind === "glossary" && selector === "[data-glossary-drag-id]") return handle;
+          return null;
+        },
+      },
+    };
+    context.__templateDragUiRuntime.onDragStart(event);
+    return { dataTransfer, prevented };
+  }
+
+  function dragOver(target) {
+    let prevented = false;
+    const dataTransfer = { dropEffect: "none" };
+    context.__templateDragUiRuntime.onDragOver({
+      dataTransfer,
+      target,
+      preventDefault() {
+        prevented = true;
+      },
+    });
+    return {
+      dataTransfer,
+      intent: clone(state.templateTreeDrag.intent),
+      prevented,
+    };
+  }
+
+  function dragEnd() {
+    context.__templateDragUiRuntime.onDragEnd({
+      target: {
+        closest() {
+          return null;
+        },
+      },
+    });
+  }
+
+  function drop(target) {
+    let prevented = false;
+    context.__templateDragUiRuntime.onDrop({
+      clientY: 0,
+      dataTransfer: { dropEffect: "none" },
+      target,
+      preventDefault() {
+        prevented = true;
+      },
+    });
+    return {
+      intent: clone(state.movedIntent),
+      prevented,
+    };
+  }
+
+  return {
+    body,
+    cleanup() {
+      context.__templateDragUiRuntime.cleanupTemplateTreeDrag();
+    },
+    dragEnd,
+    dragOver,
+    dragStart,
+    drop,
+    glossaryCard,
+    rootChild,
+    rootList,
+    rootTarget,
+    savedCard,
+    render() {
+      context.__templateDragUiRuntime.renderSection();
+    },
+    show(intent) {
+      context.__templateDragUiRuntime.showTemplateDropIntent(intent);
+    },
+    slot,
+    state,
+    templateCard,
+  };
+}
+
+function createTemplateFocusRuntime(controls) {
+  const state = {
+    activeSection: "templates",
+    pendingTemplateFocusTarget: null,
+    body: {
+      querySelectorAll(selector) {
+        return selector === "[data-action]" ? controls : [];
+      },
+    },
+  };
+  const context = vm.createContext({
+    state,
+    TEMPLATE_FOCUS_RETURN_ACTIONS: new Set([
+      "add-template",
+      "add-folder",
+      "add-template-in-folder",
+      "add-folder-in-folder",
+      "edit-node",
+      "ask-node-delete",
+    ]),
+    TEMPLATE_TOOLBAR_FOCUS_ACTIONS: ["add-template", "add-folder", "toggle-delete-mode"],
+  });
+  const source = contentScriptSource.slice(
+    contentScriptSource.indexOf("function boundedTemplateFocusTarget"),
+    contentScriptSource.indexOf("function renderSection"),
+  );
+  assert.equal(source.trim().length > 0, true);
+  vm.runInContext(
+    `${source}\nglobalThis.__templateFocusRuntime = {
+      boundedTemplateFocusTarget,
+      templateFocusTargetFromAction,
+      queuePendingTemplateFocus,
+      restorePendingTemplateFocus,
+    };`,
+    context,
+  );
+  return {
+    state,
+    bounded(value) {
+      return clone(context.__templateFocusRuntime.boundedTemplateFocusTarget(value));
+    },
+    fromAction(element) {
+      return clone(context.__templateFocusRuntime.templateFocusTargetFromAction(element));
+    },
+    queue(value) {
+      context.__templateFocusRuntime.queuePendingTemplateFocus(value);
+    },
+    restore() {
+      return context.__templateFocusRuntime.restorePendingTemplateFocus();
+    },
+  };
+}
+
+function renderTemplateEditorMarkup(editor, editorError) {
+  const context = vm.createContext({
+    state: {
+      templates: [],
+      editorError,
+    },
+    templateTree,
+    TEMPLATE_EDITOR_ERROR_ID: "template-editor-error",
+    TEMPLATE_ICON_TITLES: Object.freeze({}),
+    escapeHtml(value) { return String(value ?? ""); },
+    trustedTemplateIcon() { return "<svg></svg>"; },
+  });
+  const source = contentScriptSource.slice(
+    contentScriptSource.indexOf("function iconPickerMarkup"),
+    contentScriptSource.indexOf("function templateDeleteMarkup"),
+  );
+  assert.equal(source.trim().length > 0, true);
+  vm.runInContext(
+    `${source}\nglobalThis.__renderTemplateEditorMarkup = editorMarkup;`,
+    context,
+  );
+  return context.__renderTemplateEditorMarkup(editor, "");
+}
+
+function createTemplateDismissRuntime(controls) {
+  const state = {
+    activeSection: "templates",
+    pendingTemplateFocusTarget: null,
+    editorReturnFocusTarget: null,
+    deleteReturnFocusTarget: null,
+    editing: null,
+    editorError: "",
+    templateDeleteId: null,
+    folderDelete: { nodeId: null, phase: "closed" },
+    body: {
+      querySelectorAll(selector) {
+        return selector === "[data-action]" ? controls : [];
+      },
+    },
+  };
+  const context = vm.createContext({
+    state,
+    TEMPLATE_FOCUS_RETURN_ACTIONS: new Set([
+      "add-template",
+      "add-folder",
+      "add-template-in-folder",
+      "add-folder-in-folder",
+      "edit-node",
+      "ask-node-delete",
+    ]),
+    TEMPLATE_TOOLBAR_FOCUS_ACTIONS: ["add-template", "add-folder", "toggle-delete-mode"],
+    closedFolderDeleteState() {
+      return { nodeId: null, phase: "closed" };
+    },
+  });
+  const focusSource = contentScriptSource.slice(
+    contentScriptSource.indexOf("function boundedTemplateFocusTarget"),
+    contentScriptSource.indexOf("function renderSection"),
+  );
+  const dismissSource = contentScriptSource.slice(
+    contentScriptSource.indexOf("function dismissTemplateEditorAndRender"),
+    contentScriptSource.indexOf("async function saveEditor"),
+  );
+  assert.equal(focusSource.trim().length > 0 && dismissSource.trim().length > 0, true);
+  vm.runInContext(
+    `${focusSource}
+    ${dismissSource}
+    globalThis.__templateDismissRenderCount = 0;
+    function renderSection() {
+      globalThis.__templateDismissRenderCount += 1;
+      restorePendingTemplateFocus();
+    }
+    globalThis.__templateDismissRuntime = {
+      templateFocusTargetFromAction,
+      dismissTemplateEditorAndRender,
+      dismissTemplateNodeDeleteAndRender,
+    };`,
+    context,
+  );
+  return {
+    state,
+    capture(element) {
+      return clone(context.__templateDismissRuntime.templateFocusTargetFromAction(element));
+    },
+    dismissEditor() {
+      return context.__templateDismissRuntime.dismissTemplateEditorAndRender();
+    },
+    dismissDelete() {
+      return context.__templateDismissRuntime.dismissTemplateNodeDeleteAndRender();
+    },
+    renderCount() {
+      return context.__templateDismissRenderCount;
+    },
+  };
+}
+
 assert.equal(workspace.DB_NAME, "chatgpt-helper-workspace");
 assert.equal(workspace.DB_VERSION, 1);
 assert.equal(workspace.WORKSPACE_SCHEMA_VERSION, 2);
@@ -64,6 +650,30 @@ assert.equal(
   workspace.MESSAGE_TYPES.LOOKUP_GLOSSARY_SELECTION,
   "chatgpt-helper:workspace-lookup-glossary-selection",
 );
+assert.deepEqual({
+  TEMPLATE_NODE_CREATE: workspace.MESSAGE_TYPES.TEMPLATE_NODE_CREATE,
+  TEMPLATE_NODE_UPDATE: workspace.MESSAGE_TYPES.TEMPLATE_NODE_UPDATE,
+  TEMPLATE_NODE_MOVE: workspace.MESSAGE_TYPES.TEMPLATE_NODE_MOVE,
+  TEMPLATE_NODE_DELETE: workspace.MESSAGE_TYPES.TEMPLATE_NODE_DELETE,
+  TEMPLATE_TREE_UI_UPDATE: workspace.MESSAGE_TYPES.TEMPLATE_TREE_UI_UPDATE,
+}, {
+  TEMPLATE_NODE_CREATE: "chatgpt-helper:template-node-create",
+  TEMPLATE_NODE_UPDATE: "chatgpt-helper:template-node-update",
+  TEMPLATE_NODE_MOVE: "chatgpt-helper:template-node-move",
+  TEMPLATE_NODE_DELETE: "chatgpt-helper:template-node-delete",
+  TEMPLATE_TREE_UI_UPDATE: "chatgpt-helper:template-tree-ui-update",
+});
+assert.deepEqual({
+  TEMPLATE_CREATE: workspace.MESSAGE_TYPES.TEMPLATE_CREATE,
+  TEMPLATE_UPDATE: workspace.MESSAGE_TYPES.TEMPLATE_UPDATE,
+  TEMPLATE_DELETE: workspace.MESSAGE_TYPES.TEMPLATE_DELETE,
+  TEMPLATE_REORDER: workspace.MESSAGE_TYPES.TEMPLATE_REORDER,
+}, {
+  TEMPLATE_CREATE: "chatgpt-helper:template-create",
+  TEMPLATE_UPDATE: "chatgpt-helper:template-update",
+  TEMPLATE_DELETE: "chatgpt-helper:template-delete",
+  TEMPLATE_REORDER: "chatgpt-helper:template-reorder",
+});
 assert.deepEqual(Object.keys(workspace.STORE_DEFINITIONS), [
   "meta",
   "conversations",
@@ -282,6 +892,959 @@ const workerLookupRoute = serviceWorkerSource.slice(
 assert.match(workerLookupRoute, /validateInlineSelectionText\(message\.text\)/);
 assert.match(workerLookupRoute, /workspace\.lookupGlossarySelection/);
 assert.doesNotMatch(workerLookupRoute, /runUserMutation|broadcastWorkspaceChange|mutateAndBroadcast|openRouterClient/);
+
+assert.equal(manifest.version, "1.2.0");
+assert.deepEqual(manifest.permissions, ["storage", "contextMenus"]);
+assert.deepEqual(manifest.host_permissions, [
+  "https://chatgpt.com/*",
+  "https://chat.openai.com/*",
+  "https://openrouter.ai/*",
+]);
+assert.deepEqual(manifest.content_scripts[0].js, [
+  "src/workspace-contract.js",
+  "src/template-tree.js",
+  "src/conversation-context.js",
+  "src/command-registry.js",
+  "src/chatgpt-dom.js",
+  "src/analysis-contract.js",
+  "src/analysis-controller.js",
+  "src/translation-controller.js",
+  "src/analysis-ui.js",
+  "src/workspace-ui.js",
+  "src/content-script.js",
+]);
+const workerImportScripts = serviceWorkerSource
+  .slice(serviceWorkerSource.indexOf("importScripts("), serviceWorkerSource.indexOf(");", serviceWorkerSource.indexOf("importScripts(")))
+  .match(/"([^"]+\.js)"/g)
+  .map((value) => value.slice(1, -1));
+assert.deepEqual(workerImportScripts.slice(0, 5), [
+  "workspace-contract.js",
+  "template-tree.js",
+  "conversation-context.js",
+  "command-registry.js",
+  "import-export.js",
+]);
+const optionsScriptSources = [...optionsHtmlSource.matchAll(/<script src="([^"]+)"><\/script>/g)]
+  .map((match) => match[1]);
+assert.deepEqual(optionsScriptSources, [
+  "workspace-contract.js",
+  "template-tree.js",
+  "import-export.js",
+  "analysis-contract.js",
+  "options.js",
+]);
+assert.deepEqual(packageLock.packages, {});
+assert.equal(packageLock.lockfileVersion, 3);
+
+assert.match(serviceWorkerSource, /const templateTree = globalThis\.ChatGPTHelperTemplateTree;/);
+assert.match(contentScriptSource, /const templateTree = globalThis\.ChatGPTHelperTemplateTree;/);
+assert.match(importExportSource, /root\.ChatGPTHelperTemplateTree[\s\S]*require\("\.\/template-tree\.js"\)/);
+assert.match(workspaceUiSource, /root\.ChatGPTHelperTemplateTree[\s\S]*require\("\.\/template-tree\.js"\)/);
+for (const [owner, source] of [
+  ["service worker", serviceWorkerSource],
+  ["content script", contentScriptSource],
+  ["import/export", importExportSource],
+  ["workspace UI", workspaceUiSource],
+]) {
+  assert.doesNotMatch(source, /\bnormalizeTemplates\b/, `${owner} must use shared template-tree ownership`);
+}
+
+const migrateStorageSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("async function migrateStorage"),
+  serviceWorkerSource.indexOf("function storageValuesEqual"),
+);
+assert.match(migrateStorageSource, /runLocalStorageMigration\(async \(\) =>/);
+assert.doesNotMatch(migrateStorageSource, /runLocalMutation\(async \(\) =>/);
+const storageMigrationSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("function buildStorageMigrationPatch"),
+  serviceWorkerSource.indexOf("function getWorkspace"),
+);
+assert.match(storageMigrationSource, /templateTree\.prepareStoredNodes\(stored\.templates\)/);
+assert.match(storageMigrationSource, /templateTree\.normalizeRecentTemplateIds/);
+assert.match(storageMigrationSource, /templateTree\.normalizeTreeUiState/);
+assert.match(storageMigrationSource, /changes\.templateTreeUiState = normalizedTreeUiState/);
+
+const localQueueSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("function runLocalMutation"),
+  serviceWorkerSource.indexOf("async function currentSettings"),
+);
+assert.match(localQueueSource, /const queued = localMutationQueue\.then\(async \(\) =>/);
+assert.match(localQueueSource, /localMutationQueue = settled\.then\(\(\) => undefined, \(\) => undefined\)/);
+const localMutationSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("async function handleLocalMutation"),
+  serviceWorkerSource.indexOf("async function durableImportMarker"),
+);
+assert.match(localMutationSource, /const guarded = await runLocalMutation\(async \(\) =>/);
+assert.doesNotMatch(localMutationSource, /getWorkspace|broadcastWorkspaceChange|ensureMigrated|ENTITY_FAMILIES/);
+const localTreeTransactionSource = localMutationSource.slice(
+  localMutationSource.indexOf("const stored = await chrome.storage.local.get"),
+);
+assert.match(
+  localTreeTransactionSource,
+  /chrome\.storage\.local\.get\(\[\s*"templates",\s*"recentTemplateIds",\s*"templateTreeUiState",?\s*\]\)/,
+);
+assert.equal(
+  (localTreeTransactionSource.match(/chrome\.storage\.local\.set\(/g) || []).length,
+  1,
+  "a tree mutation performs at most one atomic local-storage set",
+);
+assert.match(localTreeTransactionSource, /chrome\.storage\.local\.set\(changes\)/);
+assert.doesNotMatch(localTreeTransactionSource, /broadcastWorkspaceChange|workspaceInstance|getWorkspace/);
+assert.match(localMutationSource, /message\.type === WORKSPACE_MESSAGES\.TEMPLATE_CREATE/);
+assert.match(localMutationSource, /message\.type === WORKSPACE_MESSAGES\.TEMPLATE_UPDATE/);
+assert.match(localMutationSource, /message\.type === WORKSPACE_MESSAGES\.TEMPLATE_DELETE/);
+assert.match(localMutationSource, /message\.type === WORKSPACE_MESSAGES\.TEMPLATE_REORDER/);
+assert.match(
+  localMutationSource,
+  /draft:\s*\{\s*kind: templateTree\.NODE_KINDS\.TEMPLATE,[\s\S]*iconKey: templateTree\.DEFAULT_TEMPLATE_ICON,[\s\S]*targetParentId: null,[\s\S]*beforeNodeId: null/,
+);
+assert.match(localMutationSource, /current\.kind !== templateTree\.NODE_KINDS\.TEMPLATE/);
+assert.match(localMutationSource, /workspaceContract\.validateTemplatePatch\(message\.patch\)/);
+assert.match(localMutationSource, /mode: "node"/);
+assert.match(localMutationSource, /const reordered = ids\.map\(\(id\) => byId\.get\(id\)\)/);
+assert.match(localMutationSource, /templates\.some\(\(node\) => node\.kind === templateTree\.NODE_KINDS\.FOLDER\)/);
+assert.match(localMutationSource, /code: templateTree\.ERROR_CODES\.RELOAD_REQUIRED/);
+assert.match(localMutationSource, /message\.type === WORKSPACE_MESSAGES\.RECENT_TEMPLATE_TOUCH/);
+assert.match(localMutationSource, /current\.kind !== templateTree\.NODE_KINDS\.TEMPLATE/);
+
+const localMessageRouteSource = contentMessageRouterSource.slice(
+  contentMessageRouterSource.indexOf("if (LOCAL_MUTATION_MESSAGES.has(message.type))"),
+  contentMessageRouterSource.indexOf("let workspaceAvailable"),
+);
+assert.match(localMessageRouteSource, /message\.type === WORKSPACE_MESSAGES\.SETTINGS_UPDATE/);
+assert.match(localMessageRouteSource, /return handleLocalMutation\(message\)/);
+assert.equal(
+  localMessageRouteSource.indexOf("return handleLocalMutation(message)")
+    < localMessageRouteSource.lastIndexOf("if (workspaceRecoveryRequired)"),
+  true,
+  "tree mutations return through the local queue before Workspace recovery/migration routing",
+);
+
+const storageListenerSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("chrome.storage.onChanged.addListener"),
+  contentScriptSource.indexOf("const mountObserver"),
+);
+assert.match(storageListenerSource, /changes\.templateTreeUiState/);
+assert.match(storageListenerSource, /applyStoredTemplateTree/);
+assert.match(storageListenerSource, /closeTemplatePreview\(\)/);
+assert.match(storageListenerSource, /closeRecentPopup\(\)/);
+const templateEditorMarkupSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function iconPickerMarkup"),
+  contentScriptSource.indexOf("function templateDeleteMarkup"),
+);
+const templateEditorFixture = {
+  id: null,
+  kind: templateTree.NODE_KINDS.TEMPLATE,
+  name: "Draft",
+  iconKey: templateTree.DEFAULT_TEMPLATE_ICON,
+  content: "Draft body",
+  autoSend: false,
+  targetParentId: null,
+};
+const editorWithoutErrorMarkup = renderTemplateEditorMarkup(templateEditorFixture, "");
+assert.doesNotMatch(editorWithoutErrorMarkup, /aria-describedby=|id="template-editor-error"/);
+const editorWithErrorMarkup = renderTemplateEditorMarkup(
+  templateEditorFixture,
+  "Заполните название и текст шаблона.",
+);
+assert.match(
+  editorWithErrorMarkup,
+  /<input[^>]*data-field="name"[^>]*aria-describedby="template-editor-error"/,
+);
+assert.match(
+  editorWithErrorMarkup,
+  /<textarea[^>]*data-field="content"[^>]*aria-describedby="template-editor-error"/,
+);
+assert.match(
+  editorWithErrorMarkup,
+  /<div[^>]*class="icon-picker"[^>]*aria-describedby="template-editor-error"/,
+);
+assert.match(
+  editorWithErrorMarkup,
+  /<select[^>]*data-field="parentId"[^>]*aria-describedby="template-editor-error"/,
+);
+assert.match(
+  editorWithErrorMarkup,
+  /<input[^>]*data-field="autoSend"[^>]*aria-describedby="template-editor-error"/,
+);
+assert.match(
+  editorWithErrorMarkup,
+  /<button[^>]*data-action="save-edit"[^>]*aria-describedby="template-editor-error"/,
+);
+assert.match(
+  editorWithErrorMarkup,
+  /<p class="inline-error" id="template-editor-error" role="alert">/,
+);
+assert.equal(
+  (editorWithErrorMarkup.match(/aria-describedby="template-editor-error"/g) || []).length,
+  6,
+  "only the six relevant editor controls/groups reference the active error",
+);
+assert.match(contentScriptSource, /const TEMPLATE_EDITOR_ERROR_ID = "template-editor-error"/);
+assert.match(
+  templateEditorMarkupSource,
+  /const describedBy = state\.editorError[\s\S]*aria-describedby="[\s\S]*TEMPLATE_EDITOR_ERROR_ID/,
+  "an active editor error enables a stable aria-describedby token",
+);
+assert.match(
+  templateEditorMarkupSource,
+  /data-field="name"[\s\S]*maxlength="120"' \+ describedBy/,
+  "the editor name control references the active error",
+);
+assert.match(
+  templateEditorMarkupSource,
+  /data-field="content"[\s\S]*maxlength="200000"' \+ describedBy/,
+  "the editor content control references the active error",
+);
+assert.match(
+  templateEditorMarkupSource,
+  /class="icon-picker"[\s\S]*aria-label="Иконка"' \+ describedBy/,
+  "the icon control group references the active error",
+);
+assert.match(
+  templateEditorMarkupSource,
+  /data-field="parentId"' \+ describedBy/,
+  "the location control references the active error",
+);
+assert.match(
+  templateEditorMarkupSource,
+  /data-field="autoSend"[\s\S]*\+ describedBy \+/,
+  "the auto-send control references the active error",
+);
+assert.match(
+  templateEditorMarkupSource,
+  /class="inline-error" id="' \+ TEMPLATE_EDITOR_ERROR_ID \+ '" role="alert"/,
+  "the active inline editor error renders the stable ID",
+);
+const templateFocusLifecycleSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function boundedTemplateFocusTarget"),
+  contentScriptSource.indexOf("function openSection"),
+);
+assert.match(
+  templateFocusLifecycleSource,
+  /state\.pendingTemplateFocusTarget = boundedTemplateFocusTarget\(value\)/,
+  "pending focus targets pass through the bounded allowlist",
+);
+assert.match(
+  templateFocusLifecycleSource,
+  /for \(const action of TEMPLATE_TOOLBAR_FOCUS_ACTIONS\)[\s\S]*controls\.find/,
+  "a missing original control falls back to a Templates toolbar action",
+);
+assert.match(
+  templateFocusLifecycleSource,
+  /function restorePendingTemplateFocus[\s\S]*state\.pendingTemplateFocusTarget = null[\s\S]*control\.focus\(\)/,
+  "pending focus is consumed and restored after rerender",
+);
+assert.equal(
+  templateFocusLifecycleSource.indexOf("state.body.innerHTML = templatesMarkup()")
+    < templateFocusLifecycleSource.indexOf(
+      'if (state.activeSection === "templates") restorePendingTemplateFocus();',
+    ),
+  true,
+  "Templates rerender precedes focus restoration",
+);
+const restoreTemplateFocusSource = templateFocusLifecycleSource.slice(
+  templateFocusLifecycleSource.indexOf("function restorePendingTemplateFocus"),
+  templateFocusLifecycleSource.indexOf("function renderSection"),
+);
+assert.doesNotMatch(
+  restoreTemplateFocusSource,
+  /state\.editing\s*=|captureEditorInputs/,
+  "focus restoration does not mutate or discard an editor draft",
+);
+let originalTemplateFocusCount = 0;
+let toolbarTemplateFocusCount = 0;
+const templateFocusRuntime = createTemplateFocusRuntime([
+  {
+    dataset: { action: "add-template-in-folder", id: "focus-folder" },
+    isConnected: true,
+    disabled: false,
+    focus() { originalTemplateFocusCount += 1; },
+  },
+  {
+    dataset: { action: "add-template" },
+    isConnected: true,
+    disabled: false,
+    focus() { toolbarTemplateFocusCount += 1; },
+  },
+]);
+assert.deepEqual(
+  templateFocusRuntime.fromAction({
+    dataset: { action: "add-folder", id: undefined },
+  }),
+  { action: "add-folder", nodeId: null },
+  "root creation captures its specific toolbar action with a null node ID",
+);
+assert.equal(
+  templateFocusRuntime.bounded({ action: "run-template", nodeId: "unsafe" }),
+  null,
+  "unapproved actions cannot become pending focus targets",
+);
+templateFocusRuntime.queue({
+  action: "add-template-in-folder",
+  nodeId: "focus-folder",
+});
+assert.equal(templateFocusRuntime.restore(), true);
+assert.equal(originalTemplateFocusCount, 1);
+assert.equal(toolbarTemplateFocusCount, 0);
+assert.equal(templateFocusRuntime.state.pendingTemplateFocusTarget, null);
+templateFocusRuntime.queue({ action: "edit-node", nodeId: "deleted-node" });
+const draftBeforeFocusRestoration = {
+  id: "editing-node",
+  name: "Unsaved draft",
+  content: "Unsaved content",
+};
+templateFocusRuntime.state.editing = clone(draftBeforeFocusRestoration);
+assert.equal(templateFocusRuntime.restore(), true);
+assert.equal(
+  toolbarTemplateFocusCount,
+  1,
+  "a stale/deleted original control restores focus to the Templates toolbar",
+);
+assert.deepEqual(
+  templateFocusRuntime.state.editing,
+  draftBeforeFocusRestoration,
+  "focus restoration leaves an active draft byte-for-byte unchanged",
+);
+const dismissFocusCounts = new Map();
+function dismissFocusControl(action, nodeId) {
+  const key = `${action}:${nodeId || "root"}`;
+  dismissFocusCounts.set(key, 0);
+  return {
+    dataset: { action, ...(nodeId ? { id: nodeId } : {}) },
+    isConnected: true,
+    disabled: false,
+    focus() {
+      dismissFocusCounts.set(key, dismissFocusCounts.get(key) + 1);
+    },
+  };
+}
+const templateDismissRuntime = createTemplateDismissRuntime([
+  dismissFocusControl("add-template", null),
+  dismissFocusControl("add-folder", null),
+  dismissFocusControl("add-template-in-folder", "dismiss-folder"),
+  dismissFocusControl("edit-node", "dismiss-template"),
+  dismissFocusControl("ask-node-delete", "dismiss-template"),
+]);
+function dismissEditorFrom(action, nodeId) {
+  templateDismissRuntime.state.editing = {
+    id: nodeId || null,
+    name: "Intentional cancel draft",
+  };
+  templateDismissRuntime.state.editorReturnFocusTarget = templateDismissRuntime.capture({
+    dataset: { action, ...(nodeId ? { id: nodeId } : {}) },
+  });
+  assert.equal(templateDismissRuntime.dismissEditor(), true);
+  assert.equal(templateDismissRuntime.state.pendingTemplateFocusTarget, null);
+}
+dismissEditorFrom("add-folder", null);
+dismissEditorFrom("add-template-in-folder", "dismiss-folder");
+dismissEditorFrom("edit-node", "dismiss-template");
+templateDismissRuntime.state.templateDeleteId = "dismiss-template";
+templateDismissRuntime.state.deleteReturnFocusTarget = templateDismissRuntime.capture({
+  dataset: { action: "ask-node-delete", id: "dismiss-template" },
+});
+assert.equal(templateDismissRuntime.dismissDelete(), true);
+assert.equal(templateDismissRuntime.state.pendingTemplateFocusTarget, null);
+assert.equal(dismissFocusCounts.get("add-folder:root"), 1);
+assert.equal(dismissFocusCounts.get("add-template-in-folder:dismiss-folder"), 1);
+assert.equal(dismissFocusCounts.get("edit-node:dismiss-template"), 1);
+assert.equal(dismissFocusCounts.get("ask-node-delete:dismiss-template"), 1);
+assert.equal(templateDismissRuntime.renderCount(), 4);
+const templateEditorActionsSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function openNodeEditor"),
+  contentScriptSource.indexOf("async function onShadowChange"),
+);
+assert.match(
+  templateEditorActionsSource,
+  /function openNodeEditor[\s\S]*if \(state\.editing\)[\s\S]*captureEditorInputs\(\)[\s\S]*return false/,
+  "opening another node editor must preserve the existing draft",
+);
+assert.match(
+  templateEditorActionsSource,
+  /action === "ask-node-delete"[\s\S]*if \(state\.editing\)[\s\S]*captureEditorInputs\(\)[\s\S]*return/,
+  "opening delete confirmation must not discard an existing draft",
+);
+assert.doesNotMatch(
+  templateEditorActionsSource.slice(
+    templateEditorActionsSource.indexOf('action === "ask-node-delete"'),
+    templateEditorActionsSource.indexOf('action === "cancel-node-delete"'),
+  ),
+  /state\.editing = null/,
+);
+assert.equal(
+  templateEditorActionsSource.indexOf("state.editorReturnFocusTarget = boundedTemplateFocusTarget")
+    < templateEditorActionsSource.indexOf("state.editing = {"),
+  true,
+  "the editor trigger action/node target is captured before the editor opens",
+);
+assert.match(
+  templateEditorActionsSource,
+  /function dismissTemplateEditorAndRender[\s\S]*queuePendingTemplateFocus\(state\.editorReturnFocusTarget\)[\s\S]*renderSection\(\)/,
+  "Cancel/Escape places the bounded editor return target before rerender",
+);
+assert.match(
+  templateEditorActionsSource,
+  /function dismissTemplateNodeDeleteAndRender[\s\S]*queuePendingTemplateFocus\(state\.deleteReturnFocusTarget\)[\s\S]*renderSection\(\)/,
+  "delete dismissal places the bounded delete return target before rerender",
+);
+assert.match(
+  templateEditorActionsSource,
+  /action === "add-template"[\s\S]*templateFocusTargetFromAction\(actionButton\)[\s\S]*action === "add-folder"[\s\S]*templateFocusTargetFromAction\(actionButton\)/,
+  "root creation retains its corresponding toolbar trigger",
+);
+assert.match(
+  templateEditorActionsSource,
+  /action === "add-template-in-folder"[\s\S]*templateFocusTargetFromAction\(actionButton\)[\s\S]*action === "add-folder-in-folder"[\s\S]*templateFocusTargetFromAction\(actionButton\)/,
+  "folder-context creation retains its row trigger and node ID",
+);
+assert.match(
+  templateEditorActionsSource,
+  /action === "cancel-edit"[\s\S]*dismissTemplateEditorAndRender\(\)/,
+  "editor Cancel uses bounded pending focus restoration",
+);
+assert.match(
+  templateEditorActionsSource,
+  /action === "ask-node-delete"[\s\S]*state\.deleteReturnFocusTarget = templateFocusTargetFromAction\(actionButton\)[\s\S]*action === "cancel-node-delete"[\s\S]*dismissTemplateNodeDeleteAndRender\(\)/,
+  "delete choice captures its trigger and Cancel restores through the pending target",
+);
+
+const dropIntentTemplates = [
+  folderNode("drop-folder", "Folder"),
+  templateNode("drop-nested", "Nested", "Nested body", false, "drop-folder"),
+  templateNode("drop-template", "Template", "Template body"),
+  folderNode("drop-folder-after", "Folder after"),
+  templateNode("drop-drag", "Dragged", "Dragged body"),
+];
+const evaluateTemplateDropIntent = createTemplateDropIntentRuntime(
+  dropIntentTemplates,
+  "drop-drag",
+);
+const rootAppendIntent = {
+  zone: "inside",
+  targetNodeId: null,
+  targetParentId: null,
+  beforeNodeId: null,
+  root: true,
+};
+const explicitRootTarget = {
+  closest(selector) {
+    return selector === "[data-template-root-target]" ? this : null;
+  },
+};
+const explicitRootDescendant = {
+  closest(selector) {
+    return selector === "[data-template-root-target]" ? explicitRootTarget : null;
+  },
+};
+assert.deepEqual(
+  evaluateTemplateDropIntent({ target: explicitRootTarget }),
+  rootAppendIntent,
+  "the explicit root target itself accepts root append intent",
+);
+assert.deepEqual(
+  evaluateTemplateDropIntent({ target: explicitRootDescendant }),
+  rootAppendIntent,
+  "a child of the explicit root target accepts the same root append intent",
+);
+const rootListTarget = {
+  closest(selector) {
+    return selector === ".templates-list" ? this : null;
+  },
+};
+assert.equal(
+  evaluateTemplateDropIntent({ target: rootListTarget }),
+  null,
+  "the direct root-list background is not a root target",
+);
+const nestedChildListTarget = {
+  closest(selector) {
+    if (selector === ".template-children") return this;
+    return selector === ".templates-list" ? rootListTarget : null;
+  },
+};
+assert.equal(
+  evaluateTemplateDropIntent({ target: nestedChildListTarget }),
+  null,
+  "nested child-list background is not a root target",
+);
+const nestedSlotTarget = {};
+const nestedGapTarget = {
+  closest(selector) {
+    if (selector === "[data-template-slot-id]") return nestedSlotTarget;
+    return selector === ".templates-list" ? rootListTarget : null;
+  },
+};
+assert.equal(
+  evaluateTemplateDropIntent({ target: nestedGapTarget }),
+  null,
+  "nested slot or descendant whitespace is not a root target",
+);
+function templateCardDropEvent(nodeId, clientY) {
+  const card = {
+    dataset: { templateNodeId: nodeId },
+    getBoundingClientRect() {
+      return { top: 0, height: 100 };
+    },
+  };
+  return {
+    clientY,
+    target: {
+      closest(selector) {
+        return selector === "[data-template-node-id]" ? card : null;
+      },
+    },
+  };
+}
+assert.deepEqual(
+  evaluateTemplateDropIntent(templateCardDropEvent("drop-template", 20)),
+  {
+    zone: "before",
+    targetNodeId: "drop-template",
+    targetParentId: null,
+    beforeNodeId: "drop-template",
+    root: false,
+  },
+  "template-card upper zone keeps before semantics",
+);
+assert.deepEqual(
+  evaluateTemplateDropIntent(templateCardDropEvent("drop-template", 80)),
+  {
+    zone: "after",
+    targetNodeId: "drop-template",
+    targetParentId: null,
+    beforeNodeId: "drop-folder-after",
+    root: false,
+  },
+  "template-card lower zone keeps after semantics",
+);
+assert.deepEqual(
+  evaluateTemplateDropIntent(templateCardDropEvent("drop-folder", 10)),
+  {
+    zone: "before",
+    targetNodeId: "drop-folder",
+    targetParentId: null,
+    beforeNodeId: "drop-folder",
+    root: false,
+  },
+  "folder-card upper zone keeps before semantics",
+);
+assert.deepEqual(
+  evaluateTemplateDropIntent(templateCardDropEvent("drop-folder", 50)),
+  {
+    zone: "inside",
+    targetNodeId: "drop-folder",
+    targetParentId: "drop-folder",
+    beforeNodeId: null,
+    root: false,
+  },
+  "folder-card middle zone keeps inside semantics",
+);
+assert.deepEqual(
+  evaluateTemplateDropIntent(templateCardDropEvent("drop-folder", 90)),
+  {
+    zone: "after",
+    targetNodeId: "drop-folder",
+    targetParentId: null,
+    beforeNodeId: "drop-template",
+    root: false,
+  },
+  "folder-card lower zone keeps after semantics after the complete subtree",
+);
+
+const idleTemplateDragUi = createTemplateDragUiRuntime(dropIntentTemplates);
+const templateCardDragMarkupSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function templateCardMarkup"),
+  contentScriptSource.indexOf("function folderCardMarkup"),
+);
+const folderCardDragMarkupSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function folderCardMarkup"),
+  contentScriptSource.indexOf("function templateProjectionById"),
+);
+assert.match(
+  templateCardDragMarkupSource,
+  /class="drag-handle" draggable="true" data-template-drag-id="' \+ escapeHtml\(template\.id\)/,
+  "template markup wires its native draggable handle to the structural drag handler",
+);
+assert.match(
+  folderCardDragMarkupSource,
+  /class="drag-handle" draggable="true" data-template-drag-id="' \+ escapeHtml\(folder\.id\)/,
+  "folder markup wires its native draggable handle to the structural drag handler",
+);
+assert.equal(
+  idleTemplateDragUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "idle root target has no visible drag class",
+);
+assert.equal(
+  idleTemplateDragUi.body.classList.contains("is-template-tree-dragging"),
+  false,
+  "idle Templates body has no drag geometry class",
+);
+
+const templateDragUi = createTemplateDragUiRuntime(dropIntentTemplates);
+const templateDragStart = templateDragUi.dragStart("template");
+assert.equal(templateDragStart.prevented, false);
+assert.equal(templateDragStart.dataTransfer.effectAllowed, "move");
+assert.equal(
+  templateDragUi.rootTarget.classList.contains("is-template-drag-visible"),
+  true,
+  "a successful structural template drag reveals the explicit root target",
+);
+assert.equal(
+  templateDragUi.body.classList.contains("is-template-tree-dragging"),
+  true,
+  "a successful structural template drag enables remaining-space flex geometry",
+);
+assert.equal(
+  templateDragUi.templateCard.classList.contains("is-dragging"),
+  true,
+  "the structural drag source keeps its existing drag class",
+);
+
+const folderDragUi = createTemplateDragUiRuntime(dropIntentTemplates);
+const folderDragStart = folderDragUi.dragStart("folder");
+assert.equal(folderDragStart.prevented, false);
+assert.equal(folderDragUi.state.templateTreeDrag.draggingNodeId, "drop-folder");
+assert.equal(
+  folderDragUi.rootTarget.classList.contains("is-template-drag-visible"),
+  true,
+  "a successful structural folder drag reveals the explicit root target",
+);
+
+const blockedTemplateDragUi = createTemplateDragUiRuntime(dropIntentTemplates);
+blockedTemplateDragUi.state.editing = { id: "drop-template" };
+const blockedTemplateDragStart = blockedTemplateDragUi.dragStart("template");
+assert.equal(blockedTemplateDragStart.prevented, true);
+assert.equal(blockedTemplateDragUi.state.templateTreeDrag.draggingNodeId, null);
+assert.equal(
+  blockedTemplateDragUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "a blocked structural drag leaves the root target hidden",
+);
+
+const savedDragUi = createTemplateDragUiRuntime(dropIntentTemplates);
+savedDragUi.dragStart("saved");
+assert.equal(
+  savedDragUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "saved-entry drag does not reveal the Templates root target",
+);
+assert.equal(savedDragUi.state.savedDraggingId, "saved-drag");
+
+const glossaryDragUi = createTemplateDragUiRuntime(dropIntentTemplates);
+glossaryDragUi.dragStart("glossary");
+assert.equal(
+  glossaryDragUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "glossary drag does not reveal the Templates root target",
+);
+assert.equal(glossaryDragUi.state.glossaryDraggingId, "glossary-drag");
+
+const rootTargetDragOver = templateDragUi.dragOver(templateDragUi.rootTarget);
+assert.equal(rootTargetDragOver.prevented, true);
+assert.equal(rootTargetDragOver.dataTransfer.dropEffect, "move");
+assert.deepEqual(rootTargetDragOver.intent, rootAppendIntent);
+const rootChildDragOver = templateDragUi.dragOver(templateDragUi.rootChild);
+assert.equal(rootChildDragOver.prevented, true);
+assert.equal(rootChildDragOver.dataTransfer.dropEffect, "move");
+assert.deepEqual(
+  rootChildDragOver.intent,
+  rootAppendIntent,
+  "root target descendants keep the same valid move dragover contract",
+);
+
+const rootListTransitionUi = createTemplateDragUiRuntime(dropIntentTemplates);
+rootListTransitionUi.dragStart("template");
+rootListTransitionUi.show(rootAppendIntent);
+const rootListTransition = rootListTransitionUi.dragOver(rootListTransitionUi.rootList);
+assert.equal(rootListTransition.prevented, false);
+assert.equal(rootListTransition.dataTransfer.dropEffect, "none");
+assert.equal(rootListTransition.intent, null);
+assert.equal(
+  rootListTransitionUi.rootTarget.classList.contains("is-drop-inside"),
+  false,
+  "moving from root intent onto root-list whitespace clears the stale root highlight",
+);
+assert.equal(
+  rootListTransitionUi.rootTarget.classList.contains("is-template-drag-visible"),
+  true,
+  "invalid whitespace keeps the structural-drag root zone visible but neutral",
+);
+
+const nestedGapTransitionUi = createTemplateDragUiRuntime(dropIntentTemplates);
+const nestedGapTransitionTarget = {
+  closest(selector) {
+    return selector === ".templates-list" ? nestedGapTransitionUi.rootList : null;
+  },
+};
+nestedGapTransitionUi.dragStart("template");
+nestedGapTransitionUi.show(rootAppendIntent);
+const nestedGapTransition = nestedGapTransitionUi.dragOver(nestedGapTransitionTarget);
+assert.equal(nestedGapTransition.prevented, false);
+assert.equal(nestedGapTransition.intent, null);
+assert.equal(
+  nestedGapTransitionUi.rootTarget.classList.contains("is-drop-inside"),
+  false,
+  "moving from root intent onto nested gap whitespace clears the stale root highlight",
+);
+
+templateDragUi.show(rootAppendIntent);
+assert.equal(
+  templateDragUi.rootTarget.classList.contains("is-drop-inside"),
+  true,
+  "root intent applies the root active highlight",
+);
+templateDragUi.show({
+  zone: "before",
+  targetNodeId: "drop-template",
+  targetParentId: null,
+  beforeNodeId: "drop-template",
+  root: false,
+});
+assert.equal(
+  templateDragUi.rootTarget.classList.contains("is-drop-inside"),
+  false,
+  "card intent clears and does not reapply the root active highlight",
+);
+assert.equal(
+  templateDragUi.slot.classList.contains("is-drop-before"),
+  true,
+  "card intent renders only its insertion line",
+);
+templateDragUi.show(rootAppendIntent);
+templateDragUi.cleanup();
+assert.equal(
+  templateDragUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "cleanup removes root target visibility",
+);
+assert.equal(
+  templateDragUi.rootTarget.classList.contains("is-drop-inside"),
+  false,
+  "cleanup removes root active highlight",
+);
+assert.equal(
+  templateDragUi.body.classList.contains("is-template-tree-dragging"),
+  false,
+  "cleanup removes remaining-space drag geometry",
+);
+assert.equal(templateDragUi.templateCard.classList.contains("is-dragging"), false);
+assert.equal(templateDragUi.state.templateTreeDrag.draggingNodeId, null);
+
+const dragEndUi = createTemplateDragUiRuntime(dropIntentTemplates);
+dragEndUi.dragStart("template");
+dragEndUi.show(rootAppendIntent);
+dragEndUi.dragEnd();
+assert.equal(dragEndUi.rootTarget.classList.contains("is-template-drag-visible"), false);
+assert.equal(dragEndUi.rootTarget.classList.contains("is-drop-inside"), false);
+assert.equal(dragEndUi.body.classList.contains("is-template-tree-dragging"), false);
+assert.equal(dragEndUi.state.templateTreeDrag.draggingNodeId, null);
+
+const rootDropUi = createTemplateDragUiRuntime(dropIntentTemplates);
+rootDropUi.dragStart("template");
+rootDropUi.show(rootAppendIntent);
+const rootDrop = rootDropUi.drop(rootDropUi.rootChild);
+assert.equal(rootDrop.prevented, true);
+assert.deepEqual(rootDrop.intent, rootAppendIntent);
+assert.equal(
+  rootDropUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "drop on a child of the explicit target hides the zone before async mutation",
+);
+assert.equal(rootDropUi.rootTarget.classList.contains("is-drop-inside"), false);
+
+const invalidRootMoveUi = createTemplateDragUiRuntime(dropIntentTemplates);
+invalidRootMoveUi.dragStart("template");
+invalidRootMoveUi.state.templateTreeDrag.draggingNodeId = "missing-node";
+invalidRootMoveUi.show(rootAppendIntent);
+const templatesBeforeInvalidRootMove = clone(invalidRootMoveUi.state.templates);
+const invalidRootDrop = invalidRootMoveUi.drop(invalidRootMoveUi.rootTarget);
+assert.equal(invalidRootDrop.prevented, false);
+assert.equal(invalidRootDrop.intent, null);
+assert.deepEqual(invalidRootMoveUi.state.templates, templatesBeforeInvalidRootMove);
+assert.equal(invalidRootMoveUi.state.status.kind, "error");
+assert.equal(
+  invalidRootMoveUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "an invalid root move reports the existing error without mutating the tree or leaving the zone visible",
+);
+
+const rerenderCleanupUi = createTemplateDragUiRuntime(dropIntentTemplates);
+rerenderCleanupUi.dragStart("template");
+rerenderCleanupUi.show(rootAppendIntent);
+rerenderCleanupUi.render();
+assert.equal(
+  rerenderCleanupUi.rootTarget.classList.contains("is-template-drag-visible"),
+  false,
+  "real renderSection cleanup hides an active root zone before DOM replacement",
+);
+assert.equal(rerenderCleanupUi.state.templateTreeDrag.draggingNodeId, null);
+
+const templateDragSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function nextTemplateSiblingId"),
+  contentScriptSource.indexOf("function mount"),
+);
+assert.doesNotMatch(
+  templateDragSource,
+  /closest\?\.\("\.templates-list"\)|target === rootList/,
+  "root append classification has no implicit root-list background path",
+);
+assert.match(
+  templateDragSource,
+  /function showTemplateDropIntent\(intent\)[\s\S]*clearTemplateDropIndicators\(\);[\s\S]*if \(!intent\) return;/,
+  "every indicator update clears stale drop classes before applying the current intent",
+);
+assert.match(
+  templateDragSource,
+  /if \(intent\.root\)[\s\S]*querySelector\("\[data-template-root-target\]"\)[\s\S]*classList\.add\("is-drop-inside"\)/,
+  "root intent renders only the explicit root indicator",
+);
+assert.match(
+  templateDragSource,
+  /function onDragStart\(event\)[\s\S]*setTemplateRootDropZoneVisible\(false\)[\s\S]*dataTransfer\.setData[\s\S]*setTemplateRootDropZoneVisible\(true\)/,
+  "the root zone becomes visible only after the structural drag is initialized",
+);
+assert.match(
+  contentScriptSource,
+  /function cleanupTemplateTreeDrag[\s\S]*setTemplateRootDropZoneVisible\(false\)/,
+  "central drag cleanup always hides the root zone",
+);
+assert.match(
+  templateDragSource,
+  /event\.preventDefault\(\);\s*setTemplateRootDropZoneVisible\(false\);\s*clearTemplateDropIndicators\(\);\s*clearTemplateHoverTimer\(\);/,
+  "a valid drop hides the root zone synchronously before the async move",
+);
+assert.match(
+  templateDragSource,
+  /const intent = templateDropIntent\(event\);[\s\S]*if \(!intent\) \{[\s\S]*clearTemplateDragIntent\(true\);[\s\S]*return;/,
+  "nested whitespace with no intent clears indicators and temporary expansion",
+);
+assert.match(templateDragSource, /function setTemporaryTemplateExpansions/);
+assert.match(
+  templateDragSource,
+  /temporaryRoots = temporaryFolderIds\.filter[\s\S]*ancestorsOf/,
+  "nested temporary expansion renders only topmost roots",
+);
+assert.match(
+  templateDragSource,
+  /temporarilyExpandedFolderIds[\s\S]*filter\(\(folderId\) => relevantPath\.has\(folderId\)\)/,
+  "revealed descendants retain their temporarily expanded ancestor chain",
+);
+assert.match(
+  templateDragSource,
+  /setTemporaryTemplateExpansions\(\[\s*\.\.\.state\.templateTreeDrag\.temporarilyExpandedFolderIds,\s*targetId,/,
+  "nested auto-expand appends instead of replacing its ancestor chain",
+);
+assert.match(
+  templateDragSource,
+  /const expansionSaved = await saveTemplateMutation[\s\S]*if \(!expansionSaved\)[\s\S]*Перемещение сохранено, но раскрытие папки сохранить не удалось/,
+  "inside-drop must not report full success after expansion persistence fails",
+);
+const templateRootVisibilitySource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function setTemplateRootDropZoneVisible"),
+  contentScriptSource.indexOf("function clearTemplateHoverTimer"),
+);
+assert.doesNotMatch(
+  templateRootVisibilitySource,
+  /renderSection\(/,
+  "root-zone visibility uses bounded DOM classes without rerendering the native drag",
+);
+assert.match(
+  contentScriptSource,
+  /function renderSection\(options\)[\s\S]*if \(!options\?\.preserveTemplateDrag[\s\S]*cleanupTemplateTreeDrag\(\)/,
+  "any section rerender cleans an active structural drag before replacing DOM",
+);
+assert.match(
+  contentScriptSource,
+  /\.panel-body\.is-template-tree-dragging \{ display: flex; flex-direction: column; \}/,
+  "Templates drag makes the scroll body a column flex container",
+);
+assert.match(
+  contentScriptSource,
+  /\.template-root-drop \{ display: none;[\s\S]*border: 1px dashed var\(--border\)/,
+  "the idle root target is display-none while retaining neutral dashed drag styling",
+);
+assert.match(
+  contentScriptSource,
+  /\.template-root-drop\.is-template-drag-visible \{ display: flex; min-height: 96px; flex: 1 0 96px; \}/,
+  "the visible root target grows through remaining panel space and retains a 96px minimum",
+);
+assert.match(
+  contentScriptSource,
+  /state\.templates\.length \? rows[\s\S]*statusMarkup\(\),\s*'<div class="template-root-drop" data-template-root-target><span>Переместить в корень<\/span>/,
+  "the explicit root target and its real child element are the final surface after root nodes and status",
+);
+const templateMountSource = contentScriptSource.slice(
+  contentScriptSource.indexOf("function mount"),
+  contentScriptSource.indexOf("function ensureMounted"),
+);
+assert.match(
+  templateMountSource,
+  /function mount\(\)[\s\S]*cleanupTemplateTreeDrag\(\)/,
+  "remount starts by cleaning any structural drag and root-zone classes",
+);
+[
+  ["dragstart", "onDragStart"],
+  ["dragend", "onDragEnd"],
+  ["dragover", "onDragOver"],
+  ["dragleave", "onDragLeave"],
+  ["drop", "onDrop"],
+].forEach(([eventName, handlerName]) => {
+  assert.match(
+    templateMountSource,
+    new RegExp(`shadow\\.addEventListener\\("${eventName}", ${handlerName}\\)`),
+    `${eventName} remains wired to ${handlerName} on remount`,
+  );
+});
+assert.match(
+  contentScriptSource,
+  /\.panel-opener, \.folder-toggle \{[\s\S]*\.folder-toggle:hover/,
+  "folder toggle uses the shared themed button reset",
+);
+
+const dataBackupValidationSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("function assertDataBackupValid"),
+  serviceWorkerSource.indexOf("async function rollbackDataBackup"),
+);
+assert.match(dataBackupValidationSource, /payload\.templateTreeUiState/);
+assert.match(dataBackupValidationSource, /templateTree\.normalizeTreeUiState/);
+assert.match(
+  dataBackupValidationSource,
+  /Object\.prototype\.hasOwnProperty\.call\(payload, "templateTreeUiState"\)/,
+  "backup validation distinguishes rolling Stage-10 backups from Stage-11 backups",
+);
+assert.match(dataBackupValidationSource, /const rollingLegacyBackup = !hasTreeUiState/);
+assert.match(
+  dataBackupValidationSource,
+  /!rollingLegacyBackup[\s\S]*storageValuesEqual\(payload\.recentTemplateIds, normalizedRecentTemplateIds\)/,
+  "legacy backups may normalize stale recent IDs while Stage-11 backups remain strict",
+);
+assert.match(
+  dataBackupValidationSource,
+  /hasTreeUiState[\s\S]*storageValuesEqual\(payload\.templateTreeUiState, normalizedTreeUiState\)/,
+  "a present Stage-11 UI state must exactly match its normalized form",
+);
+assert.match(dataBackupValidationSource, /templateTreeUiState: normalizedTreeUiState/);
+const dataRollbackSource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("async function rollbackDataBackup"),
+  serviceWorkerSource.indexOf("async function recoverPendingImports"),
+);
+assert.match(
+  dataRollbackSource,
+  /chrome\.storage\.local\.set\(\{\s*templates: normalizedBackup\.templates,\s*recentTemplateIds: normalizedBackup\.recentTemplateIds,\s*templateTreeUiState: normalizedBackup\.templateTreeUiState,\s*\}\)/,
+);
+assert.match(dataRollbackSource, /DATA_ROLLBACK_VERIFICATION_FAILED/);
+const dataApplySource = serviceWorkerSource.slice(
+  serviceWorkerSource.indexOf("async function applyDataImport"),
+  serviceWorkerSource.indexOf("function workspaceError"),
+);
+assert.match(
+  dataApplySource,
+  /templateTreeUiState: invalidCurrentTemplateTree[\s\S]*: currentTreeUiState/,
+);
+assert.match(dataApplySource, /plan\.mode === "replace"\s*\?\s*\[\]/);
+assert.match(dataApplySource, /plan\.mode === "replace"\s*\?\s*\{ collapsedFolderIds: \[\] \}/);
 
 assert.equal(
   workspace.normalizeSavedTextKey("  First  \r\n\r\nSecond\t \rThird  "),
@@ -644,12 +2207,20 @@ assert.equal(reducedClosePhase, "closed");
 const recentHistoryFixture = ["missing", ...Array.from({ length: 8 }, (_, index) => `recent-${index + 1}`)];
 const recentTemplatesFixture = Array.from({ length: 8 }, (_, index) => ({
   id: `recent-${index + 1}`,
+  kind: "template",
+  parentId: null,
   name: `Recent ${index + 1}`,
+  iconKey: "document",
   content: `Content ${index + 1}`,
   autoSend: false,
 }));
+recentTemplatesFixture.splice(2, 0, folderNode("recent-folder", "Recent folder"));
 assert.deepEqual(
-  workspaceUi.recentTemplatesForDisplay(recentHistoryFixture, recentTemplatesFixture, 3).map((item) => item.id),
+  workspaceUi.recentTemplatesForDisplay(
+    ["recent-folder", ...recentHistoryFixture],
+    recentTemplatesFixture,
+    3,
+  ).map((item) => item.id),
   ["recent-1", "recent-2", "recent-3"],
 );
 assert.deepEqual(
@@ -657,6 +2228,37 @@ assert.deepEqual(
   ["recent-1", "recent-2", "recent-3", "recent-4", "recent-5", "recent-6"],
 );
 assert.equal(recentHistoryFixture.length, 9);
+assert.deepEqual(Object.keys(workspaceUi.TEMPLATE_ICON_SVGS), templateTree.VALID_ICON_KEYS);
+for (const iconKey of templateTree.VALID_ICON_KEYS) {
+  const svg = workspaceUi.TEMPLATE_ICON_SVGS[iconKey];
+  assert.equal(typeof svg, "string", `trusted SVG exists for ${iconKey}`);
+  assert.match(svg, /^<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">/);
+  assert.doesNotMatch(svg, /(?:script|style|on\w+=|href=|url\(|data:|<foreignObject)/i);
+}
+assert.equal(
+  workspaceUi.trustedTemplateIcon("untrusted-icon", templateTree.NODE_KINDS.FOLDER),
+  workspaceUi.TEMPLATE_ICON_SVGS.folder,
+);
+assert.equal(
+  workspaceUi.trustedTemplateIcon(undefined, templateTree.NODE_KINDS.FOLDER),
+  workspaceUi.TEMPLATE_ICON_SVGS.folder,
+);
+assert.equal(
+  workspaceUi.trustedTemplateIcon("<svg onload=alert(1)>", templateTree.NODE_KINDS.TEMPLATE),
+  workspaceUi.TEMPLATE_ICON_SVGS.document,
+);
+assert.equal(
+  workspaceUi.trustedTemplateIcon(undefined, templateTree.NODE_KINDS.TEMPLATE),
+  workspaceUi.TEMPLATE_ICON_SVGS.document,
+);
+assert.deepEqual([
+  workspaceUi.templateDropZone("folder", 0.24),
+  workspaceUi.templateDropZone("folder", 0.25),
+  workspaceUi.templateDropZone("folder", 0.74),
+  workspaceUi.templateDropZone("folder", 0.75),
+  workspaceUi.templateDropZone("template", 0.49),
+  workspaceUi.templateDropZone("template", 0.5),
+], ["before", "inside", "inside", "after", "before", "after"]);
 assert.deepEqual(
   workspaceUi.previewPosition(
     { left: 700, top: 500, bottom: 540 },
@@ -919,7 +2521,6 @@ assert.deepEqual(workspaceQueryMessages[5], {
   conversationScope: "stable:chatgpt.com:armed-global",
   text: "State and OpenAPI",
 });
-const contentScriptSource = fs.readFileSync(path.join(__dirname, "../src/content-script.js"), "utf8");
 assert.match(contentScriptSource, /await navigator\.clipboard\.writeText\(entry\.text\);/);
 assert.doesNotMatch(contentScriptSource, /navigator\.clipboard\.writeText\([^)]*(?:innerText|textContent)/);
 assert.match(contentScriptSource, /TEMPLATE_PREVIEW_OPEN_DELAY_MS = 350/);
@@ -977,9 +2578,10 @@ const previewLifecycleSource = contentScriptSource.slice(
 );
 assert.match(previewLifecycleSource, /setTimeout\(function openTemplatePreviewAfterDelay/);
 assert.match(previewLifecycleSource, /setTimeout\(function closeTemplatePreviewAfterGrace/);
-assert.match(previewLifecycleSource, /state\.draggingId !== null/);
+assert.match(previewLifecycleSource, /state\.templateTreeDrag\.draggingNodeId !== null/);
 assert.match(previewLifecycleSource, /state\.editing\?\.id === templateId/);
-assert.match(previewLifecycleSource, /state\.confirmingDeleteId === templateId/);
+assert.match(previewLifecycleSource, /state\.templateDeleteId === templateId/);
+assert.match(previewLifecycleSource, /state\.folderDelete\.nodeId === templateId/);
 assert.match(previewLifecycleSource, /workspaceUiModule\.previewAnchorFromTarget\(event\.target\)/);
 assert.match(previewLifecycleSource, /state\.previewLayer\?\.contains\(event\.relatedTarget\)/);
 assert.match(previewLifecycleSource, /scheduleTemplatePreview\(anchor, anchor\.dataset\.previewId, anchor\.dataset\.previewSource, true\)/);
@@ -991,6 +2593,22 @@ assert.equal(escapeLifecycleSource.indexOf("state.analysisUi?.handleEscape()") <
 assert.equal(escapeLifecycleSource.indexOf("closeWorkspaceDeleteAndRender(true)") < escapeLifecycleSource.indexOf("closeTemplatePreview()"), true);
 assert.equal(escapeLifecycleSource.indexOf("closeTemplatePreview()") < escapeLifecycleSource.indexOf("state.editing"), true);
 assert.equal(escapeLifecycleSource.indexOf("state.editing") < escapeLifecycleSource.indexOf("closePanel(true)"), true);
+assert.equal(
+  escapeLifecycleSource.indexOf('state.folderDelete.phase === "confirm-subtree"')
+    < escapeLifecycleSource.indexOf("dismissTemplateNodeDeleteAndRender()"),
+  true,
+  "Escape steps a subtree confirmation back to the delete choice before dismissing it",
+);
+assert.match(
+  escapeLifecycleSource,
+  /state\.templateDeleteId !== null \|\| state\.folderDelete\.nodeId !== null[\s\S]*dismissTemplateNodeDeleteAndRender\(\)/,
+  "Escape dismissal restores the original delete trigger through the pending target",
+);
+assert.match(
+  escapeLifecycleSource,
+  /else if \(state\.editing\)[\s\S]*dismissTemplateEditorAndRender\(\)/,
+  "Escape dismissal restores the original editor trigger through the pending target",
+);
 const outsideWorkspaceDeleteSource = contentScriptSource.slice(
   contentScriptSource.indexOf('document.addEventListener("pointerdown", function handleOutsidePointer'),
   contentScriptSource.indexOf('window.addEventListener("focus", function handleWindowFocus'),
@@ -1983,6 +3601,92 @@ function createInstrumentedDatabase(initialState) {
 
 async function runStoreTests() {
   await Promise.all(asyncBoundaryTests);
+  const templateRuntime = createTemplateMutationRuntime({
+    templates: [],
+    recentTemplateIds: [],
+    templateTreeUiState: { collapsedFolderIds: [] },
+  });
+  const [createdFolder, createdTemplate] = await Promise.all([
+    templateRuntime.handle({
+      type: workspace.MESSAGE_TYPES.TEMPLATE_NODE_CREATE,
+      draft: {
+        kind: templateTree.NODE_KINDS.FOLDER,
+        name: "Runtime folder",
+        iconKey: "folder",
+      },
+      targetParentId: null,
+      beforeNodeId: null,
+    }),
+    templateRuntime.handle({
+      type: workspace.MESSAGE_TYPES.TEMPLATE_NODE_CREATE,
+      draft: {
+        kind: templateTree.NODE_KINDS.TEMPLATE,
+        name: "Runtime template",
+        iconKey: "document",
+        content: "Runtime content",
+        autoSend: false,
+      },
+      targetParentId: null,
+      beforeNodeId: null,
+    }),
+  ]);
+  assert.equal(createdFolder.ok, true);
+  assert.equal(createdTemplate.ok, true);
+  assert.equal(createdFolder.createdNodeId, "folder-runtime-1");
+  assert.equal(createdTemplate.createdNodeId, "template-runtime-2");
+  assert.deepEqual(
+    templateRuntime.storage.templates.map((node) => node.id),
+    [createdFolder.createdNodeId, createdTemplate.createdNodeId],
+    "concurrent creates serialize against the latest stored tree",
+  );
+  const collapsedRuntimeFolder = await templateRuntime.handle({
+    type: workspace.MESSAGE_TYPES.TEMPLATE_TREE_UI_UPDATE,
+    templateTreeUiState: { collapsedFolderIds: [createdFolder.createdNodeId] },
+  });
+  const movedRuntimeTemplate = await templateRuntime.handle({
+    type: workspace.MESSAGE_TYPES.TEMPLATE_NODE_MOVE,
+    nodeId: createdTemplate.createdNodeId,
+    targetParentId: createdFolder.createdNodeId,
+    beforeNodeId: null,
+  });
+  const touchedRuntimeTemplate = await templateRuntime.handle({
+    type: workspace.MESSAGE_TYPES.RECENT_TEMPLATE_TOUCH,
+    templateId: createdTemplate.createdNodeId,
+  });
+  const deletedRuntimeSubtree = await templateRuntime.handle({
+    type: workspace.MESSAGE_TYPES.TEMPLATE_NODE_DELETE,
+    nodeId: createdFolder.createdNodeId,
+    mode: "subtree",
+  });
+  for (const response of [
+    createdFolder,
+    createdTemplate,
+    collapsedRuntimeFolder,
+    movedRuntimeTemplate,
+    touchedRuntimeTemplate,
+    deletedRuntimeSubtree,
+  ]) {
+    assert.equal(response.ok, true);
+    assert.equal(response.changed, true);
+    assert.equal(Array.isArray(response.templates), true);
+    assert.equal(Array.isArray(response.recentTemplateIds), true);
+    assert.equal(Array.isArray(response.templateTreeUiState.collapsedFolderIds), true);
+  }
+  assert.equal(deletedRuntimeSubtree.removedFolderCount, 1);
+  assert.equal(deletedRuntimeSubtree.removedTemplateCount, 1);
+  assert.deepEqual(templateRuntime.storage.templates, []);
+  assert.deepEqual(templateRuntime.storage.recentTemplateIds, []);
+  assert.deepEqual(templateRuntime.storage.templateTreeUiState, {
+    collapsedFolderIds: [],
+  });
+  assert.equal(templateRuntime.setCalls.length, 6);
+  assert.deepEqual(
+    Object.keys(templateRuntime.setCalls.at(-1)).sort(),
+    ["recentTemplateIds", "templateTreeUiState", "templates"],
+    "subtree delete cleans all local keys in one atomic set",
+  );
+  assert.deepEqual(templateRuntime.forbiddenCalls, []);
+
   const coalescedResponses = [];
   const workspaceStatuses = [];
   let coalescedCalls = 0;
@@ -2082,6 +3786,9 @@ async function runStoreTests() {
   });
   const temporary = (id) => ({ kind: "temporary", host: "chatgpt.com", scopeKey: `temporary:${id}` });
 
+  assert.equal(importExport.SETTINGS_SCHEMA_VERSION, 1);
+  assert.equal(importExport.DATA_SCHEMA_VERSION, 2);
+  assert.equal(importExport.SCHEMA_VERSION, undefined);
   const settingsExport = importExport.createSettingsExport({
     theme: "navy",
     wallpaperDataUrl: "data:image/png;base64,AA==",
@@ -2094,6 +3801,7 @@ async function runStoreTests() {
     commands: { mustNotExport: true },
     openRouterKey: "must-not-export",
   }, { exportedAt: "2026-07-18T10:00:00.000Z", extensionVersion: "2.0.0" });
+  assert.equal(settingsExport.envelope.schemaVersion, importExport.SETTINGS_SCHEMA_VERSION);
   assert.equal(settingsExport.text, importExport.canonicalStringify(settingsExport.envelope));
   assert.equal(settingsExport.text.endsWith("\n"), true);
   assert.equal(settingsExport.text.includes("must-not-export"), false);
@@ -2138,7 +3846,7 @@ async function runStoreTests() {
   assert.equal(importExport.validateSettingsText("x".repeat(importExport.SETTINGS_MAX_BYTES + 1)).errors[0].code, "FILE_TOO_LARGE");
 
   const portableState = {
-    templates: [{ id: "template-one", name: "Шаблон", content: "Проверь текст", autoSend: false }],
+    templates: [templateNode("template-one", "Шаблон", "Проверь текст")],
     conversations: [{ id: "conversation-one", kind: "stable", host: "chatgpt.com", remoteConversationId: "conversation-one", createdAt: 10, lastSeenAt: 20, orphanedAt: null }],
     glossaryConcepts: [{ id: "concept-one", displayTerm: "Workflow", createdAt: 10, updatedAt: 20 }],
     glossarySenses: [{ id: "sense-one", conceptId: "concept-one", translation: "процесс", definition: "Последовательность действий.", createdAt: 10, updatedAt: 20 }],
@@ -2148,14 +3856,18 @@ async function runStoreTests() {
   };
   const dataMetadata = { datasetId: "11111111-2222-4333-8444-555555555555", exportedAt: "2026-07-18T10:00:00.000Z", extensionVersion: "2.0.0" };
   const dataExport = importExport.createDataExport(portableState, dataMetadata);
+  assert.equal(dataExport.envelope.schemaVersion, importExport.DATA_SCHEMA_VERSION);
   assert.equal(dataExport.text, importExport.canonicalStringify(dataExport.envelope));
   assert.equal(dataExport.text.includes("closePanelOnOutsideClick"), false);
   assert.equal(dataExport.text.includes("recentTemplatesHoverCount"), false);
+  assert.equal(dataExport.text.includes("recentTemplateIds"), false);
+  assert.equal(dataExport.text.includes("templateTreeUiState"), false);
+  assert.deepEqual(dataExport.envelope.payload.templates, portableState.templates);
   const sortedExport = importExport.createDataExport({
     ...portableState,
     templates: [
-      { id: "template-z", name: "Z", content: "Z", autoSend: false },
-      { id: "template-a", name: "A", content: "A", autoSend: false },
+      templateNode("template-z", "Z", "Z"),
+      templateNode("template-a", "A", "A"),
     ],
   }, dataMetadata);
   assert.deepEqual(sortedExport.envelope.payload.templates.map((item) => item.id), ["template-z", "template-a"]);
@@ -2165,43 +3877,157 @@ async function runStoreTests() {
   );
   const orderedValidation = importExport.validateDataText(sortedExport.text);
   const orderedCurrent = {
-    templates: [{ id: "template-current", name: "Current", content: "Current", autoSend: false }],
+    templates: [templateNode("template-current", "Current", "Current")],
     conversations: [], glossaryConcepts: [], glossarySenses: [], glossaryLinks: [], savedItems: [], savedItemLinks: [],
   };
   const orderedMerge = await importExport.buildDataPlan(orderedCurrent, orderedValidation, "merge", webcrypto);
   assert.deepEqual(orderedMerge.state.templates.map((item) => item.id), ["template-current", "template-z", "template-a"]);
   const orderedRepeatedMerge = await importExport.buildDataPlan(orderedMerge.state, orderedValidation, "merge", webcrypto);
-  assert.deepEqual(orderedRepeatedMerge.state.templates.map((item) => item.id), ["template-current", "template-z", "template-a"]);
+  assert.equal(orderedRepeatedMerge.state.templates.length, 5);
+  assert.deepEqual(
+    orderedRepeatedMerge.state.templates.map((item) => item.name),
+    ["Current", "Z", "A", "Z", "A"],
+    "tree merge never deduplicates nodes by name or content",
+  );
+  assert.equal(new Set(orderedRepeatedMerge.state.templates.map((item) => item.id)).size, 5);
   const orderedReplace = await importExport.buildDataPlan(orderedCurrent, orderedValidation, "replace", webcrypto);
   assert.deepEqual(orderedReplace.state.templates.map((item) => item.id), ["template-z", "template-a"]);
   assert.equal(dataExport.text.includes("scopeKey"), false);
   assert.equal(dataExport.text.includes("normalizedTextKey"), false);
   const validData = importExport.validateDataText(dataExport.text);
   assert.equal(validData.ok, true);
+  const workspaceOnlyData = importExport.validateDataText(importExport.createDataExport({
+    ...portableState,
+    templates: [],
+  }, dataMetadata).text);
   const replaceData = await importExport.buildDataPlan({}, validData, "replace", webcrypto);
   assert.equal(replaceData.preview.aggregateOnly, true);
   assert.equal(replaceData.state.conversations[0].scopeKey, "stable:chatgpt.com:conversation-one");
   assert.equal(replaceData.state.savedItems[0].normalizedTextKey, workspace.normalizeSavedTextKey("Сохранённый текст"));
   const collisionCurrent = {
     ...workspaceStore.createEmptyState(1),
-    templates: [{ id: "template-one", name: "Локальный", content: "Не заменять", autoSend: true }],
+    templates: [templateNode("template-one", "Локальный", "Не заменять", true)],
     conversations: [{ id: "conversation-one", kind: "stable", host: "chatgpt.com", remoteConversationId: "local-conversation", scopeKey: "stable:chatgpt.com:local-conversation", canonicalUrl: "https://chatgpt.com/c/local-conversation", createdAt: 1, lastSeenAt: 2, orphanedAt: null }],
   };
   const firstMerge = await importExport.buildDataPlan(collisionCurrent, validData, "merge", webcrypto);
   assert.equal(firstMerge.preview.remapped >= 2, true);
   assert.equal(collisionCurrent.templates[0].content, "Не заменять");
   const repeatedMerge = await importExport.buildDataPlan(firstMerge.state, validData, "merge", webcrypto);
-  assert.equal(importExport.canonicalDataEqual(firstMerge.state, repeatedMerge.state), true);
-  assert.equal(repeatedMerge.preview.new.templates, 0);
+  assert.equal(importExport.canonicalDataEqual(firstMerge.state, repeatedMerge.state), false);
+  assert.equal(repeatedMerge.preview.new.templates, 1);
+  assert.equal(repeatedMerge.state.templates.length, 3);
   assert.equal(
     await importExport.deterministicRemapId(dataMetadata.datasetId, "templates", "template-one", 0, webcrypto),
     await importExport.deterministicRemapId(dataMetadata.datasetId, "templates", "template-one", 0, webcrypto),
   );
 
+  const v1Envelope = clone(dataExport.envelope);
+  v1Envelope.schemaVersion = 1;
+  v1Envelope.payload.templates = [
+    { id: "legacy-z", name: "Legacy Z", content: "Z", autoSend: false },
+    { id: "legacy-a", name: "Legacy A", content: "A", autoSend: true },
+  ];
+  const validV1Data = importExport.validateDataText(JSON.stringify(v1Envelope));
+  assert.equal(validV1Data.ok, true);
+  assert.deepEqual(validV1Data.envelope.payload.templates, [
+    templateNode("legacy-z", "Legacy Z", "Z"),
+    templateNode("legacy-a", "Legacy A", "A", true),
+  ]);
+
+  function validateV2TemplateFixture(nodes) {
+    const envelope = clone(dataExport.envelope);
+    envelope.schemaVersion = importExport.DATA_SCHEMA_VERSION;
+    envelope.payload.templates = nodes;
+    return importExport.validateDataText(JSON.stringify(envelope));
+  }
+
+  for (const [name, nodes, code] of [
+    ["unknown kind", [{ id: "bad-kind", kind: "other", parentId: null, name: "Bad", iconKey: "document" }], "INVALID_TEMPLATE_NODE"],
+    ["invalid icon", [templateNode("bad-icon", "Bad", "Bad", false, null, "raw-svg")], "INVALID_TEMPLATE_NODE"],
+    ["duplicate ID", [
+      templateNode("duplicate-node", "First", "First"),
+      templateNode("duplicate-node", "Second", "Second"),
+    ], "DUPLICATE_ID"],
+    ["missing parent", [templateNode("orphan-node", "Orphan", "Orphan", false, "missing-folder")], "INVALID_TEMPLATE_PARENT"],
+    ["template parent", [
+      templateNode("parent-template", "Parent", "Parent"),
+      templateNode("child-template", "Child", "Child", false, "parent-template"),
+    ], "INVALID_TEMPLATE_PARENT"],
+    ["folder cycle", [
+      folderNode("cycle-a", "Cycle A", "cycle-b"),
+      folderNode("cycle-b", "Cycle B", "cycle-a"),
+    ], "TEMPLATE_TREE_CYCLE"],
+    ["depth seven", Array.from({ length: 7 }, (_, index) => folderNode(
+      `depth-${index + 1}`,
+      `Depth ${index + 1}`,
+      index === 0 ? null : `depth-${index}`,
+    )), "TEMPLATE_TREE_DEPTH_EXCEEDED"],
+    ["persisted unsafe field", [{ ...templateNode("unsafe-node", "Unsafe", "Unsafe"), rawSvg: "<svg/>" }], "INVALID_TEMPLATE_NODE"],
+    ["non-canonical preorder", [
+      folderNode("ordered-folder", "Folder"),
+      templateNode("unrelated-root", "Root", "Root"),
+      templateNode("ordered-child", "Child", "Child", false, "ordered-folder"),
+    ], "INVALID_TEMPLATE_NODE"],
+  ]) {
+    const validation = validateV2TemplateFixture(nodes);
+    assert.equal(validation.ok, false, `${name} must be rejected by strict data-v2 validation`);
+    assert.equal(validation.errors[0].code, code, name);
+  }
+
+  const incomingCollisionTree = [
+    folderNode("shared-folder", "Same folder"),
+    templateNode("shared-child", "Same template", "Same content", false, "shared-folder"),
+  ];
+  const collisionTreeValidation = importExport.validateDataText(importExport.createDataExport({
+    ...workspaceStore.createEmptyState(1),
+    templates: incomingCollisionTree,
+  }, dataMetadata).text);
+  const collisionTreeCurrent = {
+    ...workspaceStore.createEmptyState(1),
+    templates: [
+      folderNode("shared-folder", "Same folder"),
+      templateNode("shared-child", "Same template", "Same content", false, "shared-folder"),
+      templateNode("local-root", "Local root", "Local root"),
+    ],
+  };
+  const collisionTreeMerge = await importExport.buildDataPlan(
+    collisionTreeCurrent,
+    collisionTreeValidation,
+    "merge",
+    webcrypto,
+  );
+  const remappedFolderId = await importExport.deterministicRemapId(
+    dataMetadata.datasetId,
+    "templates",
+    "shared-folder",
+    0,
+    webcrypto,
+  );
+  const remappedChildId = await importExport.deterministicRemapId(
+    dataMetadata.datasetId,
+    "templates",
+    "shared-child",
+    0,
+    webcrypto,
+  );
+  assert.deepEqual(collisionTreeMerge.state.templates.map((node) => node.id), [
+    "shared-folder",
+    "shared-child",
+    "local-root",
+    remappedFolderId,
+    remappedChildId,
+  ]);
+  assert.equal(
+    collisionTreeMerge.state.templates.find((node) => node.id === remappedChildId).parentId,
+    remappedFolderId,
+    "two-pass ID allocation rewrites the incoming child parent",
+  );
+  assert.equal(collisionTreeMerge.preview.remapped, 2);
+
   const duplicateGraph = {
     templates: [
-      { id: "template-z", name: "Z", content: "Z", autoSend: false },
-      { id: "template-a", name: "A", content: "A", autoSend: false },
+      templateNode("template-z", "Z", "Z"),
+      templateNode("template-a", "A", "A"),
     ],
     conversations: [
       { id: "conversation-a", kind: "stable", host: "chatgpt.com", remoteConversationId: "duplicate", createdAt: 30, lastSeenAt: 31, orphanedAt: null },
@@ -2236,7 +4062,7 @@ async function runStoreTests() {
   };
   const duplicateEnvelope = {
     format: importExport.DATA_FORMAT,
-    schemaVersion: importExport.SCHEMA_VERSION,
+    schemaVersion: importExport.DATA_SCHEMA_VERSION,
     workspaceSchemaVersion: workspace.WORKSPACE_SCHEMA_VERSION,
     datasetId: dataMetadata.datasetId,
     exportedAt: dataMetadata.exportedAt,
@@ -2329,7 +4155,7 @@ async function runStoreTests() {
     savedItems: [{ id: "current-saved", text: "Сохранённый текст", normalizedTextKey: "Сохранённый текст", createdAt: 15, updatedAt: 18 }],
     savedItemLinks: [{ id: "current-saved-link", itemId: "current-saved", conversationId: "current-conversation", linkKey: "current-saved\u001fcurrent-conversation", localOrder: 9, firstSeenAt: 15, lastSeenAt: 18 }],
   };
-  const timestampMerge = await importExport.buildDataPlan(timestampCurrent, validData, "merge", webcrypto);
+  const timestampMerge = await importExport.buildDataPlan(timestampCurrent, workspaceOnlyData, "merge", webcrypto);
   assert.deepEqual(timestampMerge.state.conversations.find((item) => item.id === "current-conversation"), {
     ...timestampCurrent.conversations[0], createdAt: 10, lastSeenAt: 20, orphanedAt: null,
   });
@@ -2355,7 +4181,7 @@ async function runStoreTests() {
   delete currentWithoutDerivedMeaningFields.glossarySenses[0].normalizedDefinition;
   const normalizedContentMerge = await importExport.buildDataPlan(
     currentWithoutDerivedMeaningFields,
-    validData,
+    workspaceOnlyData,
     "merge",
     webcrypto,
   );
@@ -2378,7 +4204,7 @@ async function runStoreTests() {
     /GLOSSARY_IMPORT_CONFLICT/,
   );
   assert.deepEqual(timestampCurrent, timestampBeforeConflict);
-  const timestampRepeated = await importExport.buildDataPlan(timestampMerge.state, validData, "merge", webcrypto);
+  const timestampRepeated = await importExport.buildDataPlan(timestampMerge.state, workspaceOnlyData, "merge", webcrypto);
   assert.equal(importExport.canonicalDataEqual(timestampMerge.state, timestampRepeated.state), true);
   const timestampReplace = await importExport.buildDataPlan(timestampCurrent, validData, "replace", webcrypto);
   assert.equal(timestampReplace.state.glossaryConcepts[0].id, "concept-one");
@@ -2387,16 +4213,16 @@ async function runStoreTests() {
 
   const previewCurrent = {
     templates: [
-      { id: "template-a", name: "A", content: "A", autoSend: false },
-      { id: "template-b", name: "B", content: "B", autoSend: false },
+      templateNode("template-a", "A", "A"),
+      templateNode("template-b", "B", "B"),
     ],
     conversations: [], glossaryConcepts: [], glossarySenses: [], glossaryLinks: [], savedItems: [], savedItemLinks: [],
   };
   const previewIncoming = {
     ...previewCurrent,
     templates: [
-      { id: "template-b", name: "B", content: "B", autoSend: false },
-      { id: "template-c", name: "C", content: "C", autoSend: false },
+      templateNode("template-b", "B", "B"),
+      templateNode("template-c", "C", "C"),
     ],
   };
   const previewValidation = importExport.validateDataText(importExport.createDataExport(previewIncoming, dataMetadata).text);
@@ -2435,7 +4261,11 @@ async function runStoreTests() {
   assert.equal((await importExport.buildDataPlan(previewCurrent, reorderAndContentValidation, "replace", webcrypto)).preview.orderChanged.templates, true);
   assert.equal(identityReplace.preview.orderChanged.templates, true);
   const mergeReorder = await importExport.buildDataPlan(previewCurrent, orderOnlyValidation, "merge", webcrypto);
-  assert.equal(mergeReorder.preview.orderChanged.templates, false);
+  assert.equal(mergeReorder.preview.orderChanged.templates, true);
+  assert.deepEqual(
+    mergeReorder.state.templates.map((node) => node.name),
+    ["A", "B", "B", "A"],
+  );
   const emptyValidation = importExport.validateDataText(importExport.createDataExport({
     templates: [], conversations: [], glossaryConcepts: [], glossarySenses: [], glossaryLinks: [], savedItems: [], savedItemLinks: [],
   }, dataMetadata).text);
@@ -2443,6 +4273,35 @@ async function runStoreTests() {
   assert.equal((await importExport.buildDataPlan(previewCurrent, emptyValidation, "replace", webcrypto)).preview.orderChanged.templates, true);
   assert.equal((await importExport.buildDataPlan({}, emptyValidation, "replace", webcrypto)).preview.orderChanged.templates, false);
   assert.equal((await importExport.buildDataPlan({}, previewValidation, "replace", webcrypto)).preview.created.templates, 2);
+  assert.equal(importExport.canonicalDataEqual(previewCurrent, {
+    ...previewCurrent,
+    templates: [{ ...previewCurrent.templates[0], iconKey: "code" }, previewCurrent.templates[1]],
+  }), false);
+  const canonicalFolderState = {
+    ...previewCurrent,
+    templates: [
+      folderNode("canonical-folder", "Canonical folder"),
+      templateNode("template-a", "A", "A", false, "canonical-folder"),
+      previewCurrent.templates[1],
+    ],
+  };
+  assert.equal(importExport.canonicalDataEqual(canonicalFolderState, {
+    ...canonicalFolderState,
+    templates: [
+      folderNode("canonical-folder", "Canonical folder"),
+      previewCurrent.templates[0],
+      previewCurrent.templates[1],
+    ],
+  }), false);
+  const changedKindState = {
+    ...canonicalFolderState,
+    templates: [
+      folderNode("canonical-folder", "Canonical folder"),
+      folderNode("template-a", "A", "canonical-folder"),
+      previewCurrent.templates[1],
+    ],
+  };
+  assert.equal(importExport.canonicalDataEqual(canonicalFolderState, changedKindState), false);
 
   const brokenReference = JSON.parse(dataExport.text);
   brokenReference.payload.glossaryLinks[0].senseId = "missing-sense";
@@ -2453,7 +4312,13 @@ async function runStoreTests() {
   const futureData = JSON.parse(dataExport.text);
   futureData.schemaVersion += 1;
   assert.equal(importExport.validateDataText(JSON.stringify(futureData)).errors[0].code, "FUTURE_SCHEMA");
-  const largePortable = { ...portableState, templates: Array.from({ length: 1000 }, (_, index) => ({ id: `template-${index}`, name: `Шаблон ${index}`, content: `Текст ${index}`, autoSend: false })) };
+  const largePortable = {
+    ...portableState,
+    templates: Array.from(
+      { length: 1000 },
+      (_, index) => templateNode(`template-${index}`, `Шаблон ${index}`, `Текст ${index}`),
+    ),
+  };
   const largeValidation = importExport.validateDataText(importExport.createDataExport(largePortable, dataMetadata).text);
   const plannerStartedAt = performance.now();
   assert.equal((await importExport.buildDataPlan({}, largeValidation, "merge", webcrypto)).state.templates.length, 1000);

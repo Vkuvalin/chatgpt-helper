@@ -4,10 +4,14 @@
   if (root.ChatGPTHelperImportExport) return;
   const contract = root.ChatGPTHelperWorkspaceContract
     || (typeof require === "function" ? require("./workspace-contract.js") : null);
+  const templateTree = root.ChatGPTHelperTemplateTree
+    || (typeof require === "function" ? require("./template-tree.js") : null);
 
   const SETTINGS_FORMAT = "chatgpt-helper-settings";
   const DATA_FORMAT = "chatgpt-helper-data";
-  const SCHEMA_VERSION = 1;
+  const SETTINGS_SCHEMA_VERSION = 1;
+  const DATA_SCHEMA_VERSION = 2;
+  const SUPPORTED_DATA_SCHEMA_VERSIONS = Object.freeze([1, DATA_SCHEMA_VERSION]);
   const SETTINGS_MAX_BYTES = 10 * 1024 * 1024;
   const DATA_MAX_BYTES = 25 * 1024 * 1024;
   const MAX_TEMPLATE_LENGTH = 200000;
@@ -60,7 +64,7 @@
     });
   }
 
-  function parseText(textValue, maximum, expectedFormat) {
+  function parseText(textValue, maximum, expectedFormat, supportedVersions) {
     const text = String(textValue ?? "");
     if (byteLength(text) > maximum) return { ok: false, errors: [{ code: "FILE_TOO_LARGE" }], warnings: [] };
     let value;
@@ -71,8 +75,10 @@
     }
     if (!plain(value)) return { ok: false, errors: [{ code: "INVALID_ENVELOPE" }], warnings: [] };
     if (value.format !== expectedFormat) return { ok: false, errors: [{ code: "INVALID_FORMAT" }], warnings: [] };
-    if (value.schemaVersion !== SCHEMA_VERSION) {
-      return { ok: false, errors: [{ code: value.schemaVersion > SCHEMA_VERSION ? "FUTURE_SCHEMA" : "UNSUPPORTED_SCHEMA" }], warnings: [] };
+    const supported = Array.isArray(supportedVersions) ? supportedVersions : [supportedVersions];
+    const maximumSupported = Math.max(...supported);
+    if (!supported.includes(value.schemaVersion)) {
+      return { ok: false, errors: [{ code: value.schemaVersion > maximumSupported ? "FUTURE_SCHEMA" : "UNSUPPORTED_SCHEMA" }], warnings: [] };
     }
     if (!validIsoTimestamp(value.exportedAt)) return { ok: false, errors: [{ code: "INVALID_EXPORTED_AT" }], warnings: [] };
     return { ok: true, value, warnings: [], errors: [] };
@@ -152,7 +158,12 @@
   }
 
   function validateSettingsText(text) {
-    const parsed = parseText(text, SETTINGS_MAX_BYTES, SETTINGS_FORMAT);
+    const parsed = parseText(
+      text,
+      SETTINGS_MAX_BYTES,
+      SETTINGS_FORMAT,
+      SETTINGS_SCHEMA_VERSION
+    );
     if (!parsed.ok) return parsed;
     unknownWarnings(parsed.value, ["format", "schemaVersion", "exportedAt", "extensionVersion", "payload"], "envelope", parsed.warnings);
     const validated = validateSettingsPayload(parsed.value.payload, parsed.warnings);
@@ -225,7 +236,7 @@
   function createSettingsExport(settingsValue, metadata) {
     const envelope = {
       format: SETTINGS_FORMAT,
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: SETTINGS_SCHEMA_VERSION,
       exportedAt: metadata?.exportedAt || new Date().toISOString(),
       ...(metadata?.extensionVersion ? { extensionVersion: String(metadata.extensionVersion) } : {}),
       payload: contract.normalizeActiveSettings(settingsValue),
@@ -237,10 +248,16 @@
     return Object.fromEntries(fields.filter((key) => Object.prototype.hasOwnProperty.call(record, key)).map((key) => [key, record[key]]));
   }
 
+  function portableTemplateNode(item) {
+    return item?.kind === templateTree.NODE_KINDS.FOLDER
+      ? recordBase(item, ["id", "kind", "parentId", "name", "iconKey"])
+      : recordBase(item, ["id", "kind", "parentId", "name", "iconKey", "content", "autoSend"]);
+  }
+
   function portablePayloadFromState(value) {
     const source = plain(value) ? value : {};
     return {
-      templates: (Array.isArray(source.templates) ? source.templates : []).map((item) => recordBase(item, ["id", "name", "content", "autoSend"])),
+      templates: (Array.isArray(source.templates) ? source.templates : []).map(portableTemplateNode),
       conversations: (Array.isArray(source.conversations) ? source.conversations : []).map((item) => recordBase(item, ["id", "kind", "host", "remoteConversationId", "createdAt", "lastSeenAt", "orphanedAt"])),
       glossaryConcepts: (Array.isArray(source.glossaryConcepts) ? source.glossaryConcepts : []).map((item) => recordBase(item, ["id", "displayTerm", "createdAt", "updatedAt"])),
       glossarySenses: (Array.isArray(source.glossarySenses) ? source.glossarySenses : []).map((item) => recordBase(item, ["id", "conceptId", "translation", "definition", "createdAt", "updatedAt"])),
@@ -250,9 +267,13 @@
     };
   }
 
-  function dataRecordDefinitions() {
+  function dataRecordDefinitions(schemaVersion) {
     return {
-      templates: { fields: ["id", "name", "content", "autoSend"] },
+      templates: {
+        fields: schemaVersion === 1
+          ? ["id", "name", "content", "autoSend"]
+          : ["id", "kind", "parentId", "name", "iconKey", "content", "autoSend"],
+      },
       conversations: { fields: ["id", "kind", "host", "remoteConversationId", "createdAt", "lastSeenAt", "orphanedAt"] },
       glossaryConcepts: { fields: ["id", "displayTerm", "createdAt", "updatedAt"] },
       glossarySenses: { fields: ["id", "conceptId", "translation", "definition", "createdAt", "updatedAt"] },
@@ -262,9 +283,9 @@
     };
   }
 
-  function sanitizeDataPayload(payloadValue, warnings) {
+  function sanitizeDataPayload(payloadValue, warnings, schemaVersion) {
     const payload = {};
-    const definitions = dataRecordDefinitions();
+    const definitions = dataRecordDefinitions(schemaVersion);
     unknownWarnings(payloadValue, DATA_ARRAYS, "payload", warnings);
     for (const family of DATA_ARRAYS) {
       if (!Array.isArray(payloadValue?.[family])) return { ok: false, errors: [{ code: "MISSING_ARRAY", path: `payload.${family}` }], warnings };
@@ -275,7 +296,9 @@
         const path = `payload.${family}[${index}]`;
         if (!plain(raw)) return { ok: false, errors: [{ code: "INVALID_RECORD", path }], warnings };
         unknownWarnings(raw, definitions[family].fields, path, warnings);
-        const item = recordBase(raw, definitions[family].fields);
+        const item = family === "templates" && schemaVersion === DATA_SCHEMA_VERSION
+          ? clone(raw)
+          : recordBase(raw, definitions[family].fields);
         if (!contract.validEntityId(item.id) || ids.has(item.id)) return { ok: false, errors: [{ code: ids.has(item.id) ? "DUPLICATE_ID" : "INVALID_ID", path: `${path}.id` }], warnings };
         ids.add(item.id);
         payload[family].push(item);
@@ -284,12 +307,36 @@
     return { ok: true, payload, warnings };
   }
 
+  function normalizePortableTemplates(payload, schemaVersion, warnings) {
+    const normalized = schemaVersion === 1
+      ? templateTree.migrateLegacyTemplates(payload.templates)
+      : templateTree.validateTypedNodes(payload.templates);
+    if (!normalized.ok) {
+      return {
+        ok: false,
+        errors: [{
+          code: normalized.error?.code || "INVALID_TEMPLATE_NODE",
+          path: "payload.templates",
+        }],
+        warnings,
+      };
+    }
+    return {
+      ok: true,
+      payload: { ...payload, templates: normalized.nodes },
+      warnings,
+    };
+  }
+
   function validatePortableRecords(payload, warnings) {
     const errors = [];
-    payload.templates.forEach((item, index) => {
-      if (typeof item.name !== "string" || !item.name.trim() || typeof item.content !== "string" || !item.content.trim()
-        || item.content.length > MAX_TEMPLATE_LENGTH || typeof item.autoSend !== "boolean") errors.push({ code: "INVALID_TEMPLATE", path: `payload.templates[${index}]` });
-    });
+    const templateValidation = templateTree.validateTypedNodes(payload.templates);
+    if (!templateValidation.ok) {
+      errors.push({
+        code: templateValidation.error?.code || "INVALID_TEMPLATE_NODE",
+        path: "payload.templates",
+      });
+    }
     payload.conversations.forEach((item, index) => {
       const stable = item.kind === "stable" && contract.isSupportedHost(item.host)
         && typeof item.remoteConversationId === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(item.remoteConversationId);
@@ -381,7 +428,13 @@
 
   function canonicalizeDataPayload(payloadValue) {
     const source = portablePayloadFromState(payloadValue);
+    const templateCanonical = templateTree.canonicalizeNodes(source.templates);
+    if (!templateCanonical.ok) {
+      throw new Error(templateCanonical.error?.code || "INVALID_TEMPLATE_NODE");
+    }
+    source.templates = templateCanonical.nodes;
     const remaps = {
+      templates: new Map(),
       conversations: new Map(),
       glossaryConcepts: new Map(),
       glossarySenses: new Map(),
@@ -458,14 +511,32 @@
   }
 
   function validateDataText(text) {
-    const parsed = parseText(text, DATA_MAX_BYTES, DATA_FORMAT);
+    const parsed = parseText(
+      text,
+      DATA_MAX_BYTES,
+      DATA_FORMAT,
+      SUPPORTED_DATA_SCHEMA_VERSIONS
+    );
     if (!parsed.ok) return parsed;
     unknownWarnings(parsed.value, ["format", "schemaVersion", "workspaceSchemaVersion", "datasetId", "exportedAt", "extensionVersion", "payload"], "envelope", parsed.warnings);
     if (parsed.value.workspaceSchemaVersion !== contract.WORKSPACE_SCHEMA_VERSION) return { ok: false, errors: [{ code: "UNSUPPORTED_WORKSPACE_SCHEMA" }], warnings: parsed.warnings };
     if (!validUuid(parsed.value.datasetId)) return { ok: false, errors: [{ code: "INVALID_DATASET_ID" }], warnings: parsed.warnings };
-    const sanitized = sanitizeDataPayload(parsed.value.payload, parsed.warnings);
+    const sanitized = sanitizeDataPayload(
+      parsed.value.payload,
+      parsed.warnings,
+      parsed.value.schemaVersion
+    );
     if (!sanitized.ok) return sanitized;
-    const validated = validatePortableRecords(sanitized.payload, sanitized.warnings);
+    const normalizedTemplates = normalizePortableTemplates(
+      sanitized.payload,
+      parsed.value.schemaVersion,
+      sanitized.warnings
+    );
+    if (!normalizedTemplates.ok) return normalizedTemplates;
+    const validated = validatePortableRecords(
+      normalizedTemplates.payload,
+      normalizedTemplates.warnings
+    );
     if (!validated.ok) return validated;
     let canonical;
     try {
@@ -533,16 +604,32 @@
     const mode = modeValue === "replace" ? "replace" : "merge";
     const datasetId = validatedValue.envelope.datasetId;
     const source = await hydratePortable(validatedValue.envelope.payload, datasetId, cryptoValue);
+    const sourceTemplates = templateTree.validateTypedNodes(source.templates);
+    const currentTemplates = templateTree.validateTypedNodes(
+      Array.isArray(currentValue?.templates) ? currentValue.templates : []
+    );
+    if (!sourceTemplates.ok || (mode !== "replace" && !currentTemplates.ok)) {
+      throw new Error(
+        sourceTemplates.error?.code
+        || currentTemplates.error?.code
+        || "INVALID_TEMPLATE_NODE"
+      );
+    }
+    source.templates = sourceTemplates.nodes;
     assertOneSensePerConcept(source);
     assertOneSensePerConcept(currentValue);
+    const currentForPreview = {
+      ...currentValue,
+      templates: currentTemplates.ok ? currentTemplates.nodes : [],
+    };
     if (mode === "replace") {
       normalizeLinkOrders(source.glossaryLinks);
       normalizeLinkOrders(source.savedItemLinks);
-      const preview = dataPreview(currentValue, source, mode, validatedValue.canonical);
+      const preview = dataPreview(currentForPreview, source, mode, validatedValue.canonical);
       return { mode, state: source, preview, expectedCanonical: clone(source) };
     }
     const target = clone({
-      templates: Array.isArray(currentValue.templates) ? currentValue.templates : [],
+      templates: currentTemplates.nodes,
       conversations: Array.isArray(currentValue.conversations) ? currentValue.conversations : [],
       glossaryConcepts: Array.isArray(currentValue.glossaryConcepts) ? currentValue.glossaryConcepts : [],
       glossarySenses: Array.isArray(currentValue.glossarySenses) ? currentValue.glossarySenses : [],
@@ -560,28 +647,29 @@
       }
       throw new Error("ID_REMAP_EXHAUSTED");
     }
-    const maps = { conversations: new Map(), glossaryConcepts: new Map(), glossarySenses: new Map(), savedItems: new Map() };
-    const templateById = new Map(target.templates.map((item) => [item.id, item]));
+    const maps = {
+      templates: new Map(),
+      conversations: new Map(),
+      glossaryConcepts: new Map(),
+      glossarySenses: new Map(),
+      savedItems: new Map(),
+    };
     for (const item of source.templates) {
-      const existing = templateById.get(item.id);
-      if (existing && existing.name === item.name && existing.content === item.content && existing.autoSend === item.autoSend) continue;
-      if (existing) {
-        let alreadyImported = false;
-        for (let attempt = 0; attempt < 1000; attempt += 1) {
-          const candidate = await deterministicRemapId(datasetId, "templates", item.id, attempt, cryptoValue);
-          const remapped = templateById.get(candidate);
-          if (!remapped) break;
-          if (remapped.name === item.name && remapped.content === item.content && remapped.autoSend === item.autoSend) {
-            alreadyImported = true;
-            break;
-          }
-        }
-        if (alreadyImported) continue;
-      }
-      const id = existing ? await allocate("templates", item.id) : (used.templates.add(item.id), item.id);
-      const added = { ...item, id };
-      target.templates.push(added); templateById.set(id, added);
+      maps.templates.set(item.id, await allocate("templates", item.id));
     }
+    const incomingTemplates = source.templates.map((item) => ({
+      ...item,
+      id: maps.templates.get(item.id),
+      parentId: item.parentId === null ? null : maps.templates.get(item.parentId),
+    }));
+    const mergedTemplates = templateTree.canonicalizeNodes([
+      ...target.templates,
+      ...incomingTemplates,
+    ]);
+    if (!mergedTemplates.ok) {
+      throw new Error(mergedTemplates.error?.code || "INVALID_TEMPLATE_NODE");
+    }
+    target.templates = mergedTemplates.nodes;
     const conversationIdentity = new Map(target.conversations.filter((item) => item.kind === "stable").map((item) => [`${item.host}\u0000${item.remoteConversationId}`, item]));
     const temporaryIdentity = new Map(target.conversations.filter((item) => item.kind === "temporary" && typeof item.scopeKey === "string")
       .map((item) => [item.scopeKey, item]));
@@ -702,6 +790,11 @@
 
   function canonicalDataState(value) {
     const payload = portablePayloadFromState(value);
+    const templates = templateTree.canonicalizeNodes(payload.templates);
+    if (!templates.ok) {
+      throw new Error(templates.error?.code || "INVALID_TEMPLATE_NODE");
+    }
+    payload.templates = templates.nodes;
     ["conversations", "glossaryConcepts", "glossarySenses", "savedItems"].forEach((family) => payload[family].sort((a, b) => a.id.localeCompare(b.id)));
     ["glossaryLinks", "savedItemLinks"].forEach((family) => payload[family].sort((a, b) => a.conversationId.localeCompare(b.conversationId) || a.localOrder - b.localOrder || a.id.localeCompare(b.id)));
     return payload;
@@ -736,7 +829,15 @@
     const savedById = new Map(arrays.savedItems.map((item) => [item.id,
       item.normalizedTextKey || contract.normalizeSavedTextKey(item.text)]));
     return {
-      templates: new Set(arrays.templates.map((item) => JSON.stringify([item.id, item.name, item.content, item.autoSend === true]))),
+      templates: new Set(arrays.templates.map((item) => JSON.stringify([
+        item.id,
+        item.kind,
+        item.parentId,
+        item.name,
+        item.iconKey,
+        item.kind === templateTree.NODE_KINDS.TEMPLATE ? item.content : null,
+        item.kind === templateTree.NODE_KINDS.TEMPLATE ? item.autoSend === true : null,
+      ]))),
       conversations: new Set(conversationById.values()),
       glossaryConcepts: new Set(conceptById.values()),
       glossarySenses: new Set(senseById.values()),
@@ -783,7 +884,7 @@
   function createDataExport(stateValue, metadata) {
     const envelope = {
       format: DATA_FORMAT,
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: DATA_SCHEMA_VERSION,
       workspaceSchemaVersion: contract.WORKSPACE_SCHEMA_VERSION,
       datasetId: metadata?.datasetId || root.crypto?.randomUUID?.(),
       exportedAt: metadata?.exportedAt || new Date().toISOString(),
@@ -798,7 +899,8 @@
   }
 
   const api = Object.freeze({
-    SETTINGS_FORMAT, DATA_FORMAT, SCHEMA_VERSION, SETTINGS_MAX_BYTES, DATA_MAX_BYTES,
+    SETTINGS_FORMAT, DATA_FORMAT, SETTINGS_SCHEMA_VERSION, DATA_SCHEMA_VERSION,
+    SETTINGS_MAX_BYTES, DATA_MAX_BYTES,
     MAX_TEMPLATE_LENGTH, DATA_ARRAYS, byteLength, canonicalStringify, validIsoTimestamp, validUuid,
     validateSettingsPayload, validateSettingsText, buildSettingsPlan, createSettingsExport, redactSettings,
     portablePayloadFromState, validateDataText, canonicalizeDataPayload, deterministicRemapId,
