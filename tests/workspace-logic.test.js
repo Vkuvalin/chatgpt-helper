@@ -21,6 +21,12 @@ const workspaceUiSource = fs.readFileSync(path.join(__dirname, "../src/workspace
 const optionsHtmlSource = fs.readFileSync(path.join(__dirname, "../src/options.html"), "utf8");
 const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8"));
 const packageLock = JSON.parse(fs.readFileSync(path.join(__dirname, "../package-lock.json"), "utf8"));
+const OBSERVED_WALLPAPER_DATA_URL = "data:image/jpeg;base64,iVBORw0KGgo"
+  + "A".repeat(8_146_944 - "iVBORw0KGgo".length);
+const WALLPAPER_COMPATIBILITY_FIXTURE = "DaTa:ImAgE/JpEg;BaSe64,=\u00a0A===Z";
+const ECMASCRIPT_WHITESPACE = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680"
+  + "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+  + "\u2028\u2029\u202f\u205f\u3000\ufeff";
 
 const translationHandlerSource = serviceWorkerSource.slice(
   serviceWorkerSource.indexOf("async function handleTranslation"),
@@ -56,6 +62,60 @@ assert.doesNotMatch(
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function createContentStorageListenerHarness(initialSettings) {
+  let storageListener = null;
+  const calls = [];
+  const state = {
+    settings: workspace.normalizeActiveSettings(initialSettings),
+    templates: [],
+    templateTreeUiState: { collapsedFolderIds: [] },
+    recentTemplateIds: [],
+    sidebarWidthCommitPending: false,
+    sidebarResizing: false,
+    sidebarPreferredWidth: null,
+  };
+  const chrome = {
+    storage: {
+      onChanged: {
+        addListener(listener) { storageListener = listener; },
+      },
+    },
+  };
+  const context = vm.createContext({
+    chrome,
+    state,
+    workspaceContract: workspace,
+    templateTree,
+    closeTemplatePreview() { calls.push("closeTemplatePreview"); },
+    cleanupTemplateTreeDrag() { calls.push("cleanupTemplateTreeDrag"); },
+    applyStoredTemplateTree() { calls.push("applyStoredTemplateTree"); },
+    normalizeRecentTemplateIds() { calls.push("normalizeRecentTemplateIds"); return []; },
+    closeRecentPopup() { calls.push("closeRecentPopup"); },
+    renderSection() { calls.push("renderSection"); },
+  });
+  const normalizeSettingsSource = contentScriptSource.slice(
+    contentScriptSource.indexOf("function normalizeSettings"),
+    contentScriptSource.indexOf("function normalizeRecentTemplateIds"),
+  );
+  const listenerSource = contentScriptSource.slice(
+    contentScriptSource.indexOf("chrome.storage.onChanged.addListener"),
+    contentScriptSource.indexOf("const mountObserver"),
+  );
+  assert.equal(normalizeSettingsSource.trim().length > 0, true);
+  assert.equal(listenerSource.trim().length > 0, true);
+  vm.runInContext(`${normalizeSettingsSource}\n${listenerSource}`, context, {
+    filename: "content-script-storage-listener.test.js",
+  });
+  assert.equal(typeof storageListener, "function");
+  return {
+    state,
+    calls,
+    handleStorageChange(changes, areaName = "local") {
+      return storageListener(changes, areaName);
+    },
+  };
 }
 
 function folderNode(id, name, parentId = null, iconKey = templateTree.DEFAULT_FOLDER_ICON) {
@@ -1028,6 +1088,32 @@ assert.match(storageListenerSource, /changes\.templateTreeUiState/);
 assert.match(storageListenerSource, /applyStoredTemplateTree/);
 assert.match(storageListenerSource, /closeTemplatePreview\(\)/);
 assert.match(storageListenerSource, /closeRecentPopup\(\)/);
+const contentStorageHarness = createContentStorageListenerHarness();
+const observedStorageSettings = {
+  ...workspace.DEFAULT_ACTIVE_SETTINGS,
+  theme: "gold",
+  wallpaperDataUrl: OBSERVED_WALLPAPER_DATA_URL,
+  recentTemplatesHoverCount: 7.6,
+};
+assert.doesNotThrow(() => contentStorageHarness.handleStorageChange({
+  settings: {
+    oldValue: workspace.DEFAULT_ACTIVE_SETTINGS,
+    newValue: observedStorageSettings,
+  },
+}));
+assert.equal(contentStorageHarness.state.settings.theme, "gold");
+assert.equal(contentStorageHarness.state.settings.wallpaperDataUrl, OBSERVED_WALLPAPER_DATA_URL);
+assert.equal(contentStorageHarness.state.settings.recentTemplatesHoverCount, 8);
+assert.equal(
+  contentStorageHarness.state.sidebarPreferredWidth,
+  workspace.DEFAULT_ACTIVE_SETTINGS.layout.sidebarWidth,
+);
+assert.deepEqual(contentStorageHarness.calls, [
+  "closeTemplatePreview",
+  "cleanupTemplateTreeDrag",
+  "closeRecentPopup",
+  "renderSection",
+]);
 const templateEditorMarkupSource = contentScriptSource.slice(
   contentScriptSource.indexOf("function iconPickerMarkup"),
   contentScriptSource.indexOf("function templateDeleteMarkup"),
@@ -1913,6 +1999,61 @@ assert.equal(largeNormalizerInput.length, 200000);
 const normalizerStartedAt = Date.now();
 assert.equal(workspace.normalizeComposerText(largeNormalizerInput).text.length > 0, true);
 assert.equal(Date.now() - normalizerStartedAt < 2000, true, "200k composer normalization remains linear-time in the sanity fixture");
+
+assert.equal(
+  OBSERVED_WALLPAPER_DATA_URL.length - "data:image/jpeg;base64,".length,
+  8_146_944,
+);
+assert.doesNotThrow(() => {
+  assert.equal(workspace.isAllowedWallpaperDataUrl(OBSERVED_WALLPAPER_DATA_URL), true);
+});
+assert.doesNotThrow(() => {
+  const invalidAtEnd = `${OBSERVED_WALLPAPER_DATA_URL.slice(0, -1)}!`;
+  assert.equal(workspace.isAllowedWallpaperDataUrl(invalidAtEnd), false);
+});
+for (const mime of ["png", "jpg", "jpeg", "gif", "webp"]) {
+  assert.equal(workspace.isAllowedWallpaperDataUrl(`data:image/${mime};base64,A`), true);
+}
+assert.equal(workspace.isAllowedWallpaperDataUrl("DaTa:ImAgE/WeBp;BaSe64,A"), true);
+assert.equal(workspace.isAllowedWallpaperDataUrl(null), true);
+for (const nonStringValue of [undefined, false, 0, {}, []]) {
+  assert.equal(workspace.isAllowedWallpaperDataUrl(nonStringValue), false);
+}
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,"), false);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/bmp;base64,A"), false);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,!A"), false);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,A!A"), false);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,AA!"), false);
+assert.equal(
+  workspace.isAllowedWallpaperDataUrl(`data:image/png;base64,A${ECMASCRIPT_WHITESPACE}Z`),
+  true,
+);
+assert.equal(
+  workspace.isAllowedWallpaperDataUrl(`data:image/png;base64,${ECMASCRIPT_WHITESPACE}`),
+  true,
+);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,A"), true);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,=A====B=="), true);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,AA==MORE"), true);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/png;base64,A+/="), true);
+assert.equal(workspace.isAllowedWallpaperDataUrl("data:image/jpeg;base64,iVBORw0KGgo"), true);
+assert.equal(workspace.isAllowedWallpaperDataUrl(WALLPAPER_COMPATIBILITY_FIXTURE), true);
+assert.equal(
+  workspace.normalizeActiveSettings({ wallpaperDataUrl: WALLPAPER_COMPATIBILITY_FIXTURE }).wallpaperDataUrl,
+  WALLPAPER_COMPATIBILITY_FIXTURE,
+);
+assert.deepEqual(
+  workspace.validateActiveSettingsPatch({ wallpaperDataUrl: WALLPAPER_COMPATIBILITY_FIXTURE }),
+  { ok: true, patch: { wallpaperDataUrl: WALLPAPER_COMPATIBILITY_FIXTURE } },
+);
+assert.equal(
+  workspace.normalizeActiveSettings({ wallpaperDataUrl: "data:image/png;base64,A!" }).wallpaperDataUrl,
+  null,
+);
+assert.equal(
+  workspace.validateActiveSettingsPatch({ wallpaperDataUrl: "data:image/png;base64,A!" }).ok,
+  false,
+);
 
 assert.deepEqual(workspace.normalizeActiveSettings({
   theme: "gold",
@@ -3808,6 +3949,32 @@ async function runStoreTests() {
   const validSettings = importExport.validateSettingsText(settingsExport.text);
   assert.equal(validSettings.ok, true);
   assert.equal(validSettings.imported.recentTemplatesHoverCount, 7);
+  const compatibilitySettingsExport = importExport.createSettingsExport({
+    ...workspace.DEFAULT_ACTIVE_SETTINGS,
+    wallpaperDataUrl: WALLPAPER_COMPATIBILITY_FIXTURE,
+  }, { exportedAt: "2026-07-18T10:00:00.000Z", extensionVersion: "2.0.0" });
+  const compatibilitySettingsValidation = importExport.validateSettingsText(
+    compatibilitySettingsExport.text,
+  );
+  assert.equal(compatibilitySettingsValidation.ok, true);
+  assert.equal(
+    compatibilitySettingsValidation.imported.wallpaperDataUrl,
+    WALLPAPER_COMPATIBILITY_FIXTURE,
+  );
+  assert.equal(
+    importExport.buildSettingsPlan(
+      workspace.DEFAULT_ACTIVE_SETTINGS,
+      compatibilitySettingsValidation,
+      "merge",
+    ).settings.wallpaperDataUrl,
+    WALLPAPER_COMPATIBILITY_FIXTURE,
+  );
+  const invalidWallpaperImport = JSON.parse(compatibilitySettingsExport.text);
+  invalidWallpaperImport.payload.wallpaperDataUrl = "data:image/png;base64,A!";
+  assert.equal(
+    importExport.validateSettingsText(JSON.stringify(invalidWallpaperImport)).errors[0].code,
+    "INVALID_WALLPAPER",
+  );
   const settingsMerge = importExport.buildSettingsPlan(workspace.DEFAULT_ACTIVE_SETTINGS, validSettings, "merge");
   assert.equal(settingsMerge.settings.theme, "navy");
   assert.equal(settingsMerge.settings.closePanelOnOutsideClick, false);

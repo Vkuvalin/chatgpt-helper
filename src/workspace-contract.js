@@ -566,8 +566,45 @@
   }
 
   function isAllowedWallpaperDataUrl(value) {
-    return value === null || (typeof value === "string"
-      && /^data:image\/(?:png|jpe?g|gif|webp);base64,[A-Za-z0-9+/=\s]+$/i.test(value));
+    if (value === null) return true;
+    if (typeof value !== "string") return false;
+
+    const boundedPrefix = value.slice(0, 23).toLowerCase();
+    let payloadOffset;
+    if (boundedPrefix.startsWith("data:image/png;base64,")
+      || boundedPrefix.startsWith("data:image/jpg;base64,")
+      || boundedPrefix.startsWith("data:image/gif;base64,")) {
+      payloadOffset = 22;
+    } else if (boundedPrefix.startsWith("data:image/jpeg;base64,")
+      || boundedPrefix.startsWith("data:image/webp;base64,")) {
+      payloadOffset = 23;
+    } else {
+      return false;
+    }
+    if (value.length === payloadOffset) return false;
+
+    for (let index = payloadOffset; index < value.length; index += 1) {
+      const codeUnit = value.charCodeAt(index);
+      const base64Character = (codeUnit >= 0x41 && codeUnit <= 0x5a)
+        || (codeUnit >= 0x61 && codeUnit <= 0x7a)
+        || (codeUnit >= 0x30 && codeUnit <= 0x39)
+        || codeUnit === 0x2b
+        || codeUnit === 0x2f
+        || codeUnit === 0x3d;
+      const whitespaceCharacter = (codeUnit >= 0x0009 && codeUnit <= 0x000d)
+        || codeUnit === 0x0020
+        || codeUnit === 0x00a0
+        || codeUnit === 0x1680
+        || (codeUnit >= 0x2000 && codeUnit <= 0x200a)
+        || codeUnit === 0x2028
+        || codeUnit === 0x2029
+        || codeUnit === 0x202f
+        || codeUnit === 0x205f
+        || codeUnit === 0x3000
+        || codeUnit === 0xfeff;
+      if (!base64Character && !whitespaceCharacter) return false;
+    }
+    return true;
   }
 
   function clampPreferredWidth(name, value) {

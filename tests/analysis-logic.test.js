@@ -29,6 +29,8 @@ const optionsHtmlSource = fs.readFileSync(path.join(__dirname, "../src/options.h
 const optionsScriptSource = fs.readFileSync(path.join(__dirname, "../src/options.js"), "utf8");
 const optionsStylesSource = fs.readFileSync(path.join(__dirname, "../src/options.css"), "utf8");
 const manifestSource = fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8");
+const OBSERVED_WALLPAPER_DATA_URL = "data:image/jpeg;base64,iVBORw0KGgo"
+  + "A".repeat(8_146_944 - "iVBORw0KGgo".length);
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -4124,6 +4126,53 @@ async function runAsyncTests() {
   ]);
   assert.equal(recentQueueHarness.storage.templates.some((item) => item.id === "recent-c"), true);
   assert.deepEqual(recentQueueHarness.storage.recentTemplateIds, ["recent-c", "recent-b", "recent-a"]);
+
+  assert.equal(
+    OBSERVED_WALLPAPER_DATA_URL.length - "data:image/jpeg;base64,".length,
+    8_146_944,
+  );
+  const largeWallpaperProviderCalls = [];
+  const largeWallpaperHarness = createServiceWorkerHarness(validStorage({
+    settings: {
+      ...workspaceContract.DEFAULT_ACTIVE_SETTINGS,
+      wallpaperDataUrl: OBSERVED_WALLPAPER_DATA_URL,
+    },
+  }), {
+    openRouterClient: new Proxy({}, {
+      get(_target, property) {
+        return async () => {
+          largeWallpaperProviderCalls.push(String(property));
+          throw new Error("PROVIDER_CALL_FORBIDDEN");
+        };
+      },
+    }),
+  });
+  await largeWallpaperHarness.waitForMigration();
+  const repeatedWallpaperThemes = ["gold", "navy", "violet", "graphite"];
+  for (const theme of repeatedWallpaperThemes) {
+    const response = await largeWallpaperHarness.handleMessage({
+      type: workspaceContract.MESSAGE_TYPES.SETTINGS_UPDATE,
+      patch: { theme },
+    }, queueSender);
+    assert.equal(response.ok, true);
+    assert.equal(response.settings.theme, theme);
+    assert.equal(response.settings.wallpaperDataUrl, OBSERVED_WALLPAPER_DATA_URL);
+    assert.equal(largeWallpaperHarness.storage.settings.theme, theme);
+    assert.equal(
+      largeWallpaperHarness.storage.settings.wallpaperDataUrl,
+      OBSERVED_WALLPAPER_DATA_URL,
+    );
+  }
+  const largeWallpaperWrites = largeWallpaperHarness.setCalls
+    .filter((changes) => Object.prototype.hasOwnProperty.call(changes, "settings"));
+  assert.equal(largeWallpaperWrites.length, repeatedWallpaperThemes.length);
+  assert.equal(
+    largeWallpaperWrites.every((changes) => (
+      changes.settings.wallpaperDataUrl === OBSERVED_WALLPAPER_DATA_URL
+    )),
+    true,
+  );
+  assert.deepEqual(largeWallpaperProviderCalls, []);
 
   const settingsQueueHarness = createServiceWorkerHarness(validStorage({
     settings: { ...workspaceContract.DEFAULT_ACTIVE_SETTINGS, theme: "graphite", wallpaperDataUrl: "data:image/png;base64,AA==" },
