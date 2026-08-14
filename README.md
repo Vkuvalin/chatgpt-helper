@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./icons/chatgpt-helper-128.png" alt="ChatGPT-Helper">
+</p>
+
 <div align="center">
 
 # ChatGPT Helper
