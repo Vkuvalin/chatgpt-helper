@@ -80,35 +80,39 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
 ---
 
 
-## 📸 Демонстрация возможностей
+## Демонстрация возможностей
 
-<details><summary><Strong>📸 Галерея </Strong></summary>
-  
-### Меню шаблонов
+<details><summary><Strong> Меню шаблонов </Strong></summary>
 
 <p float="left">
   <img src="https://github.com/user-attachments/assets/6b768239-4715-4a46-ac99-b3bfeff8b425" width="48%" />
   <img src="https://github.com/user-attachments/assets/efa2539f-8f2f-4506-b059-c9b0b9f4058a" width="48%" />
 </p>
 
+</details>
+
 ---
 
-### Кнопка выдвижения бокового меню и быстрого запуска следующего действия
+<details><summary><Strong> Кнопка выдвижения бокового меню и быстрого запуска следующего действия </Strong></summary>
 
 <p float="left">
   <img src="https://github.com/user-attachments/assets/6bc9a77f-3197-4338-9b75-3e64780d4080" width="48%" />
   <img src="https://github.com/user-attachments/assets/06aa87bc-75ff-4efe-98f3-512f8607cad7" width="48%" />
 </p>
 
+</details>
+
 ---
 
-### Сохранённый текст с привязкой к чату
+<details><summary><Strong> Сохранённый текст с привязкой к чату </Strong></summary>
 
 <img width="801" height="1918" alt="save" src="https://github.com/user-attachments/assets/556008cd-4157-4126-9ddb-aa730c7ae152" />
 
+</details>
+
 ---
 
-### Настройки
+<details><summary><Strong> Настройки </Strong></summary>
 
 <p float="left">
   <img src="https://github.com/user-attachments/assets/76e66acd-2446-4990-8b25-9cfac6e3b222" width="32%" />
@@ -116,9 +120,11 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
   <img src="https://github.com/user-attachments/assets/01e7ff02-c656-471d-bb09-4c9c2b24b4b3" width="32%" />
 </p>
 
+</details>
+
 ---
 
-### Всплывающее окно и словарь
+<details><summary><Strong> Всплывающее окно и словарь </Strong></summary>
 
 <p float="left">
   <img src="https://github.com/user-attachments/assets/8e283075-62ea-4336-afb4-d8861b9c6346" width="32%" />
@@ -126,9 +132,11 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
   <img src="https://github.com/user-attachments/assets/c70e282b-e7f7-4aa8-a571-351b4b3df892" width="32%" />
 </p>
 
+</details>
+
 ---
 
-### Анализ текст
+<details><summary><Strong> Анализ текст </Strong></summary>
 
 <p float="left">
   <img src="https://github.com/user-attachments/assets/cdb1ae8d-4660-49c1-b84b-9f3636f19722" width="32%" />
@@ -136,10 +144,12 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
   <img src="https://github.com/user-attachments/assets/77257a2d-418c-4d43-9d0d-455dac8196e0" width="32%" />
 </p>
 
+</details>
+
 ---
 
-### Перевод текста
-
+<details><summary><Strong> Перевод текста </Strong></summary>
+  
 <p float="left">
   <img src="https://github.com/user-attachments/assets/b7f08c9c-7d84-4c38-9566-100e4d9a2042" width="48%" />
   <img src="https://github.com/user-attachments/assets/0a09b47b-832a-4ff0-a28e-8f5987345c9c" width="48%" />
