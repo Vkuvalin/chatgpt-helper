@@ -80,9 +80,10 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
 ---
 
 
-## Демонстрация возможностей
+## 📸 Демонстрация возможностей
 
 <details><summary><Strong>📸 Галерея </Strong></summary>
+  
 ### Меню шаблонов
 
 <p float="left">
@@ -145,6 +146,7 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
 </p>
 
 </details>
+
 ---
 
 ## Быстрый старт
