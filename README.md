@@ -16,7 +16,17 @@
 
 </div>
 
+## Демонстрация
+
+Видео работы расширения и примеры его интерфейса.
+
 [Смотреть видео](https://github.com/user-attachments/assets/6add510f-475d-46b2-8276-0538c57d95ee)
+
+**Пример анализа:** выделенный текст преобразуется в термины с переводами и определениями.
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/685ba178-d297-4682-89be-7b2315004e51" alt="Результат анализа выделенного текста в ChatGPT Helper" width="520" />
+</p>
 
 
 ---
@@ -80,80 +90,135 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
 ---
 
 
-## 📸 Демонстрация возможностей
+## Скриншоты возможностей
 
-<details><summary><Strong> Меню шаблонов </Strong></summary>
+Раскройте нужный раздел. Для подробного просмотра откройте изображение в полном размере.
 
-<p float="left">
-  <img src="https://github.com/user-attachments/assets/6b768239-4715-4a46-ac99-b3bfeff8b425" width="48%" />
-  <img src="https://github.com/user-attachments/assets/efa2539f-8f2f-4506-b059-c9b0b9f4058a" width="48%" />
+<details>
+<summary><strong>Шаблоны и папки</strong></summary>
+
+Дерево папок и редактор шаблона.
+
+<table>
+<tr>
+<td valign="top" width="50%">
+<img src="https://github.com/user-attachments/assets/6b768239-4715-4a46-ac99-b3bfeff8b425" alt="Дерево шаблонов и вложенных папок" width="100%" />
+</td>
+<td valign="top" width="50%">
+<img src="https://github.com/user-attachments/assets/efa2539f-8f2f-4506-b059-c9b0b9f4058a" alt="Редактор шаблона" width="100%" />
+</td>
+</tr>
+</table>
+
+</details>
+
+<details>
+<summary><strong>Быстрый доступ к панели</strong></summary>
+
+Открытие меню и запуск следующего действия.
+
+<table>
+<tr>
+<td valign="top" width="50%">
+<img src="https://github.com/user-attachments/assets/6bc9a77f-3197-4338-9b75-3e64780d4080" alt="Кнопка открытия панели шаблонов" width="100%" />
+</td>
+<td valign="top" width="50%">
+<img src="https://github.com/user-attachments/assets/06aa87bc-75ff-4efe-98f3-512f8607cad7" alt="Быстрое действие «Далее»" width="100%" />
+</td>
+</tr>
+</table>
+
+</details>
+
+<details>
+<summary><strong>Сохранённые фрагменты</strong></summary>
+
+Текст, сохранённый с привязкой к разговору.
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/556008cd-4157-4126-9ddb-aa730c7ae152" alt="Сохранённый текст в текущем разговоре" width="520" />
 </p>
 
 </details>
 
----
+<details>
+<summary><strong>Настройки и оформление</strong></summary>
 
-<details><summary><Strong> Кнопка выдвижения бокового меню и быстрого запуска следующего действия </Strong></summary>
+Параметры панели, темы и настройки расширения.
 
-<p float="left">
-  <img src="https://github.com/user-attachments/assets/6bc9a77f-3197-4338-9b75-3e64780d4080" width="48%" />
-  <img src="https://github.com/user-attachments/assets/06aa87bc-75ff-4efe-98f3-512f8607cad7" width="48%" />
-</p>
-
-</details>
-
----
-
-<details><summary><Strong> Сохранённый текст с привязкой к чату </Strong></summary>
-
-<img width="801" height="1918" alt="save" src="https://github.com/user-attachments/assets/556008cd-4157-4126-9ddb-aa730c7ae152" />
-
-</details>
-
----
-
-<details><summary><Strong> Настройки </Strong></summary>
-
-<p float="left">
-  <img src="https://github.com/user-attachments/assets/76e66acd-2446-4990-8b25-9cfac6e3b222" width="32%" />
-  <img src="https://github.com/user-attachments/assets/d32957d2-0da7-4878-820f-c8536b74821f" width="32%" />
-  <img src="https://github.com/user-attachments/assets/01e7ff02-c656-471d-bb09-4c9c2b24b4b3" width="32%" />
-</p>
+<table>
+<tr>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/76e66acd-2446-4990-8b25-9cfac6e3b222" alt="Настройки расширения" width="100%" />
+</td>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/d32957d2-0da7-4878-820f-c8536b74821f" alt="Выбор темы оформления" width="100%" />
+</td>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/01e7ff02-c656-471d-bb09-4c9c2b24b4b3" alt="Дополнительные настройки расширения" width="100%" />
+</td>
+</tr>
+</table>
 
 </details>
 
----
+<details>
+<summary><strong>Словарь выделенного текста</strong></summary>
 
-<details><summary><Strong> Всплывающее окно и словарь </Strong></summary>
+Всплывающие действия и поиск по сохранённому словарю.
 
-<p float="left">
-  <img src="https://github.com/user-attachments/assets/8e283075-62ea-4336-afb4-d8861b9c6346" width="32%" />
-  <img src="https://github.com/user-attachments/assets/f7f293bb-ccc3-4da8-b718-6ae3872b796c" width="32%" />
-  <img src="https://github.com/user-attachments/assets/c70e282b-e7f7-4aa8-a571-351b4b3df892" width="32%" />
-</p>
-
-</details>
-
----
-
-<details><summary><Strong> Анализ текст </Strong></summary>
-
-<p float="left">
-  <img src="https://github.com/user-attachments/assets/cdb1ae8d-4660-49c1-b84b-9f3636f19722" width="32%" />
-  <img src="https://github.com/user-attachments/assets/685ba178-d297-4682-89be-7b2315004e51" width="32%" />
-  <img src="https://github.com/user-attachments/assets/77257a2d-418c-4d43-9d0d-455dac8196e0" width="32%" />
-</p>
+<table>
+<tr>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/8e283075-62ea-4336-afb4-d8861b9c6346" alt="Действия для выделенного текста" width="100%" />
+</td>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/f7f293bb-ccc3-4da8-b718-6ae3872b796c" alt="Словарная запись" width="100%" />
+</td>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/c70e282b-e7f7-4aa8-a571-351b4b3df892" alt="Быстрый поиск по словарю" width="100%" />
+</td>
+</tr>
+</table>
 
 </details>
 
----
+<details>
+<summary><strong>Анализ текста</strong></summary>
 
-<details><summary><Strong> Перевод текста </Strong></summary>
-  
-<p float="left">
-  <img src="https://github.com/user-attachments/assets/b7f08c9c-7d84-4c38-9566-100e4d9a2042" width="48%" />
-  <img src="https://github.com/user-attachments/assets/0a09b47b-832a-4ff0-a28e-8f5987345c9c" width="48%" />
-</p>
+Запуск анализа, результат и словарь терминов.
+
+<table>
+<tr>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/cdb1ae8d-4660-49c1-b84b-9f3636f19722" alt="Запуск анализа выделенного текста" width="100%" />
+</td>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/685ba178-d297-4682-89be-7b2315004e51" alt="Результат анализа терминов" width="100%" />
+</td>
+<td valign="top" width="33%">
+<img src="https://github.com/user-attachments/assets/77257a2d-418c-4d43-9d0d-455dac8196e0" alt="Термины в локальном словаре" width="100%" />
+</td>
+</tr>
+</table>
+
+</details>
+
+<details>
+<summary><strong>Перевод текста</strong></summary>
+
+Выделение текста и результат перевода на русский.
+
+<table>
+<tr>
+<td valign="top" width="50%">
+<img src="https://github.com/user-attachments/assets/b7f08c9c-7d84-4c38-9566-100e4d9a2042" alt="Запуск перевода выделенного текста" width="100%" />
+</td>
+<td valign="top" width="50%">
+<img src="https://github.com/user-attachments/assets/0a09b47b-832a-4ff0-a28e-8f5987345c9c" alt="Результат перевода" width="100%" />
+</td>
+</tr>
+</table>
 
 </details>
 
@@ -177,7 +242,7 @@ git clone https://github.com/Vkuvalin/chatgpt-helper.git
 4. Укажите каталог проекта, в котором находится `manifest.json`.
 5. Откройте или обновите вкладку ChatGPT.
 
-Сборка и `npm install` не требуются.
+Сборка и `npm install` не требуются. Шаблоны, папки и сохранённые фрагменты работают без API key; для анализа и перевода нужен ключ OpenRouter.
 
 Подробная установка, настройка OpenRouter и описание всех пользовательских сценариев находятся в [руководстве пользователя](docs/USER_GUIDE.md).
 
@@ -222,7 +287,7 @@ https://chat.openai.com/*
 
 ## Статус
 
-Проект находится в активной разработке и используется как локально загружаемое расширение.
+Рабочая версия для локального использования как unpacked extension. Основной функциональный объём завершён; развитие новых возможностей отложено.
 
 Текущая версия:
 
