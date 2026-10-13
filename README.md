@@ -16,9 +16,8 @@
 
 </div>
 
-> **Место для основного GIF или скриншота**
->
-> Добавьте сюда короткую демонстрацию: открытие панели, запуск шаблона, анализ или перевод текста.
+[Смотреть видео](https://github.com/user-attachments/assets/6add510f-475d-46b2-8276-0538c57d95ee)
+
 
 ---
 
@@ -82,21 +81,61 @@ ChatGPT Helper добавляет поверх интерфейса ChatGPT ло
 
 ## Демонстрация
 
-| Шаблоны и папки | Анализ и перевод | Темы и настройки |
-|---|---|---|
-| _Добавьте скриншот дерева шаблонов_ | _Добавьте GIF или скриншот результата_ | _Добавьте скриншот оформления_ |
 
-<!--
-Рекомендуемая структура media-файлов:
+### Меню шаблонов
 
-docs/media/
-├── overview.gif
-├── templates.png
-├── analysis.png
-└── themes.png
+<p float="left">
+  <img src="https://github.com/user-attachments/assets/6b768239-4715-4a46-ac99-b3bfeff8b425" width="48%" />
+  <img src="https://github.com/user-attachments/assets/efa2539f-8f2f-4506-b059-c9b0b9f4058a" width="48%" />
+</p>
 
-После добавления материалов замените заглушки выше на реальные изображения.
--->
+
+### Кнопка выдвижения бокового меню и быстрого запуска следующего действия
+
+<p float="left">
+  <img src="https://github.com/user-attachments/assets/6bc9a77f-3197-4338-9b75-3e64780d4080" width="48%" />
+  <img src="https://github.com/user-attachments/assets/06aa87bc-75ff-4efe-98f3-512f8607cad7" width="48%" />
+</p>
+
+
+### Сохранённый текст с привязкой к чату
+
+<img width="801" height="1918" alt="save" src="https://github.com/user-attachments/assets/556008cd-4157-4126-9ddb-aa730c7ae152" />
+
+
+### Настройки
+
+<p float="left">
+  <img src="https://github.com/user-attachments/assets/76e66acd-2446-4990-8b25-9cfac6e3b222" width="32%" />
+  <img src="https://github.com/user-attachments/assets/d32957d2-0da7-4878-820f-c8536b74821f" width="32%" />
+  <img src="https://github.com/user-attachments/assets/01e7ff02-c656-471d-bb09-4c9c2b24b4b3" width="32%" />
+</p>
+
+
+### Всплывающее окно и словарь
+
+<p float="left">
+  <img src="https://github.com/user-attachments/assets/8e283075-62ea-4336-afb4-d8861b9c6346" width="32%" />
+  <img src="https://github.com/user-attachments/assets/f7f293bb-ccc3-4da8-b718-6ae3872b796c" width="32%" />
+  <img src="https://github.com/user-attachments/assets/c70e282b-e7f7-4aa8-a571-351b4b3df892" width="32%" />
+</p>
+
+
+### Анализ текст
+
+<p float="left">
+  <img src="https://github.com/user-attachments/assets/cdb1ae8d-4660-49c1-b84b-9f3636f19722" width="32%" />
+  <img src="https://github.com/user-attachments/assets/685ba178-d297-4682-89be-7b2315004e51" width="32%" />
+  <img src="https://github.com/user-attachments/assets/77257a2d-418c-4d43-9d0d-455dac8196e0" width="32%" />
+</p>
+
+
+### Перевод текста
+
+<p float="left">
+  <img src="https://github.com/user-attachments/assets/b7f08c9c-7d84-4c38-9566-100e4d9a2042" width="48%" />
+  <img src="https://github.com/user-attachments/assets/0a09b47b-832a-4ff0-a28e-8f5987345c9c" width="48%" />
+</p>
 
 ---
 
