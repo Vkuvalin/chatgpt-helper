@@ -439,7 +439,7 @@ OpenRouter используется для:
 3. проверки API key.
 
 ```text
-Analysis model:    openai/gpt-4.1-mini
+Analysis model:    openai/gpt-5.6-luna
 Translation model: openai/gpt-5.6-luna
 Timeout:           25 seconds
 ```
@@ -449,10 +449,11 @@ Timeout:           25 seconds
 Analysis:
 
 ```text
-temperature: 0
-max_tokens:  2500
-response:    strict JSON schema
-terms:       up to 40
+reasoning.effort:  low
+temperature:       не передаётся
+max_tokens:        5000
+response:          strict JSON schema
+terms:             up to 40
 ```
 
 Translation:
@@ -466,6 +467,8 @@ renderer:          bounded Markdown; HTML не парсится
 ```
 
 Промпт требует полного естественного русского перевода обычной речи и составных технических понятий, включая смешанный русский и английский текст. Имена продуктов, сокращения, идентификаторы, код, URL и пути сохраняются дословно; исходный текст рассматривается только как данные.
+
+Лимит `max_tokens` включает рассуждения модели и видимый ответ. Для анализа предусмотрен запас на JSON-словарь; ограничение в 40 терминов сохраняется.
 
 Provider configuration:
 

@@ -5,8 +5,7 @@
     || (typeof require === "function" ? require("./analysis-contract.js") : null);
   const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
   const KEY_STATUS_ENDPOINT = "https://openrouter.ai/api/v1/key";
-  const MODEL = "openai/gpt-4.1-mini";
-  const TRANSLATION_MODEL = "openai/gpt-5.6-luna";
+  const MODEL = "openai/gpt-5.6-luna";
   const REQUEST_TIMEOUT_MS = 25000;
 
   const TERMS_RESPONSE_FORMAT = Object.freeze({
@@ -283,8 +282,8 @@
   function requestBody(selectedText) {
     return {
       model: MODEL,
-      temperature: 0,
-      max_tokens: 2500,
+      reasoning: { effort: "low" },
+      max_tokens: 5000,
       stream: false,
       response_format: TERMS_RESPONSE_FORMAT,
       provider: {
@@ -301,7 +300,7 @@
 
   function translationRequestBody(selectedText) {
     return {
-      model: TRANSLATION_MODEL,
+      model: MODEL,
       reasoning: { effort: "low" },
       max_tokens: 10000,
       stream: false,

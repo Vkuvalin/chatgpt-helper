@@ -2344,8 +2344,10 @@ assert.equal(secretStore.validateKey("x".repeat(24)).ok, true);
 assert.equal(secretStore.validateKey(`x${"y".repeat(20)} z`).ok, false);
 
 const body = openRouter.requestBody("selected text");
-assert.equal(body.model, "openai/gpt-4.1-mini");
-assert.equal(body.temperature, 0);
+assert.equal(body.model, "openai/gpt-5.6-luna");
+assert.deepEqual(body.reasoning, { effort: "low" });
+assert.equal(Object.prototype.hasOwnProperty.call(body, "temperature"), false);
+assert.equal(body.max_tokens, 5000);
 assert.equal(body.stream, false);
 assert.equal(body.provider.data_collection, "deny");
 assert.equal(body.provider.require_parameters, true);
@@ -2735,7 +2737,80 @@ async function runOptionsPageBehaviorTests() {
   ]);
 }
 
+async function runOpenRouterAnalysisTests() {
+  const originalFetch = globalThis.fetch;
+  const providerCalls = [];
+  let providerResponse = {
+    choices: [{
+      finish_reason: "stop",
+      message: {
+        reasoning: "Internal reasoning is separate from the glossary.",
+        content: JSON.stringify({
+          terms: [{
+            term: "source of truth",
+            translation: "источник истины",
+            definition: "Единый достоверный источник данных",
+          }],
+        }),
+      },
+    }],
+  };
+  try {
+    globalThis.fetch = async (url, options) => {
+      providerCalls.push({ url, method: options.method, body: JSON.parse(options.body) });
+      return {
+        ok: true,
+        status: 200,
+        headers: { get() { return null; } },
+        async text() { return JSON.stringify(providerResponse); },
+      };
+    };
+    const sourceText = "Use source of truth for configuration.";
+    assert.deepEqual(await openRouter.analyze(sourceText, "test-key"), {
+      ok: true,
+      terms: [{
+        term: "source of truth",
+        normalizedTerm: "source of truth",
+        translation: "источник истины",
+        definition: "Единый достоверный источник данных.",
+      }],
+    });
+    assert.equal(providerCalls.length, 1);
+    assert.equal(providerCalls[0].url, openRouter.ENDPOINT);
+    assert.equal(providerCalls[0].method, "POST");
+    assert.equal(providerCalls[0].body.model, "openai/gpt-5.6-luna");
+    assert.deepEqual(providerCalls[0].body.reasoning, { effort: "low" });
+    assert.deepEqual(providerCalls[0].body.response_format, openRouter.TERMS_RESPONSE_FORMAT);
+    assert.deepEqual(JSON.parse(providerCalls[0].body.messages[1].content), { source_text: sourceText });
+
+    for (const [response, expectedCode] of [
+      [{
+        choices: [{
+          finish_reason: "length",
+          message: { content: "", reasoning: "The reasoning consumed the output budget." },
+        }],
+      }, "OUTPUT_TRUNCATED"],
+      [{
+        choices: [{
+          finish_reason: "stop",
+          message: { content: JSON.stringify({ terms: [], commentary: "unexpected" }) },
+        }],
+      }, "INVALID_RESPONSE_FORMAT"],
+    ]) {
+      providerResponse = response;
+      const callsBefore = providerCalls.length;
+      const result = await openRouter.analyze(sourceText, "test-key");
+      assert.equal(result.ok, false);
+      assert.equal(result.error.code, expectedCode);
+      assert.equal(providerCalls.length, callsBefore + 1, "analysis performs one request and no retry");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function runAsyncTests() {
+  await runOpenRouterAnalysisTests();
   await runOptionsPageBehaviorTests();
 
   function inlineBatchResponse(candidate, entries) {
